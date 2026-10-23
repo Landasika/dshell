@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-pack:
+    name: Verify and pack release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: ./scripts/verify-pack.sh
+      - name: Pack release artifact
+        run: |
+          mkdir -p dist/release
+          pnpm pack --pack-destination dist/release
+          cd dist/release
+          sha256sum landasika-dshell-*.tgz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dshell-release
+          path: |
+            dist/release/*.tgz
+            dist/release/SHA256SUMS
+          if-no-files-found: error

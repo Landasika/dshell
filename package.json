@@ -52,5 +52,24 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
+  },
+  "keywords": [
+    "deepseek",
+    "dsh",
+    "cli",
+    "tui",
+    "agent",
+    "terminal"
+  ],
+  "homepage": "https://github.com/Landasika/dshell#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Landasika/dshell.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Landasika/dshell/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
