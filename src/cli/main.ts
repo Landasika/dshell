@@ -1,8 +1,9 @@
-import { DshellError, HostConnection } from '../client/socket-client.js'
-import type { ServerMessage, SessionEvent, SessionsMessage, AttachedMessage } from '../protocol/index.js'
+import { DshellError } from '../client/socket-client.js'
+import { BackendError, SocketBackend, type SessionView } from '../backend/index.js'
+import type { SessionEvent } from '../protocol/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
 import { packageVersion } from '../shared/package.js'
-import { printAttached, printEvent, printSessions, isTurnEnd, turnFailed } from './output.js'
+import { printEvent, printSessions, isTurnEnd, turnFailed } from './output.js'
 import { runDoctor } from './doctor.js'
 
 interface Options {
@@ -127,51 +128,44 @@ function waitForInterrupt(): Promise<void> {
 }
 
 async function list(socketPath: string): Promise<void> {
-  const connection = await HostConnection.connect(socketPath)
+  const backend = new SocketBackend(socketPath)
   try {
-    connection.send({ type: 'list' })
-    const message = await connection.waitFor<SessionsMessage>(
-      (candidate) => candidate.type === 'sessions',
-      10_000,
-    )
-    printSessions(message.sessions)
+    await backend.connect()
+    printSessions(await backend.listSessions())
   } finally {
-    connection.close()
+    await backend.disconnect()
   }
 }
 
-async function attach(socketPath: string, sessionId: string, verbose: boolean): Promise<void> {
-  const connection = await HostConnection.connect(socketPath)
-  let attachedSeen = false
-  const pending: ServerMessage[] = []
-  const off = connection.onMessage((message) => {
-    if (!attachedSeen) {
-      pending.push(message)
-      return
-    }
-    if (message.type === 'event') printEvent(message.event, verbose)
-    else if (message.type === 'status' && verbose) console.log(`[status] ${message.status}`)
-  })
+function printViewHeader(view: SessionView): void {
+  console.log(`\n[attached] ${view.sessionId} cursor=${view.cursor} history=${view.events.length}`)
+}
 
+async function attach(socketPath: string, sessionId: string, verbose: boolean): Promise<void> {
+  const backend = new SocketBackend(socketPath)
+  let handle = undefined as Awaited<ReturnType<SocketBackend['openSession']>> | undefined
   try {
-    connection.send({ type: 'attach', sessionId })
-    const attached = await connection.waitFor<AttachedMessage>(
-      (candidate) => candidate.type === 'attached',
-      10_000,
-    )
-    printAttached(attached, verbose)
-    attachedSeen = true
-    for (const message of pending) {
-      if (message.type === 'event' && message.event.seq > attached.cursor) {
-        printEvent(message.event, verbose)
+    await backend.connect()
+    handle = await backend.openSession(sessionId)
+    const initial = handle.snapshot()
+    printViewHeader(initial)
+    for (const event of initial.events) printEvent(event, verbose)
+    let lastSeq = initial.cursor
+
+    const off = handle.subscribe((view) => {
+      for (const event of view.events) {
+        if (event.seq <= lastSeq) continue
+        printEvent(event, verbose)
+        lastSeq = event.seq
       }
-    }
-    pending.length = 0
+      if (verbose && view.status !== 'unknown') console.log(`[status] ${view.status}`)
+    })
     console.log('[attached] listening; press Ctrl-C to exit')
     await waitForInterrupt()
-  } finally {
     off()
-    connection.close()
+  } finally {
+    handle?.dispose()
+    await backend.disconnect()
   }
 }
 
@@ -182,29 +176,33 @@ async function prompt(
   timeoutMs: number,
   verbose: boolean,
 ): Promise<void> {
-  const connection = await HostConnection.connect(socketPath)
-  let settle: ((event: SessionEvent) => void) | undefined
-  let fail: ((error: Error) => void) | undefined
-  const turnDone = new Promise<SessionEvent>((resolve, reject) => {
-    settle = resolve
-    fail = reject
-  })
-
-  const off = connection.onMessage((message: ServerMessage) => {
-    if (message.type === 'event') {
-      printEvent(message.event, verbose)
-      if (isTurnEnd(message.event)) settle?.(message.event)
-    } else if (message.type === 'accepted') {
-      console.log(`[accepted] ${message.requestId}`)
-    } else if (message.type === 'error') {
-      fail?.(new DshellError(message.code, message.message, message.action))
-    } else if (message.type === 'status' && verbose) {
-      console.log(`[status] ${message.status}`)
-    }
-  })
-
+  const backend = new SocketBackend(socketPath)
+  let handle = undefined as Awaited<ReturnType<SocketBackend['openSession']>> | undefined
+  let off: (() => void) | undefined
   try {
-    connection.send({ type: 'prompt', sessionId, text })
+    await backend.connect()
+    handle = await backend.openSession(sessionId)
+    const initial = handle.snapshot()
+    let lastSeq = initial.cursor
+    let settle: ((event: SessionEvent) => void) | undefined
+    let fail: ((error: Error) => void) | undefined
+    const turnDone = new Promise<SessionEvent>((resolve, reject) => {
+      settle = resolve
+      fail = reject
+    })
+
+    off = handle.subscribe((view) => {
+      for (const event of view.events) {
+        if (event.seq <= lastSeq) continue
+        printEvent(event, verbose)
+        lastSeq = event.seq
+        if (isTurnEnd(event)) settle?.(event)
+      }
+      if (verbose && view.status !== 'unknown') console.log(`[status] ${view.status}`)
+    })
+
+    const receipt = await handle.send(text)
+    console.log(`[accepted] ${receipt.requestId}`)
     const end = await withTimeout(
       turnDone,
       timeoutMs,
@@ -212,8 +210,9 @@ async function prompt(
     )
     if (turnFailed(end)) process.exitCode = 1
   } finally {
-    off()
-    connection.close()
+    off?.()
+    handle?.dispose()
+    await backend.disconnect()
   }
 }
 
@@ -269,7 +268,7 @@ export async function main(argv: string[]): Promise<void> {
         throw new DshellError('BAD_REQUEST', `unknown command: ${options.command}`)
     }
   } catch (error) {
-    if (error instanceof DshellError) {
+    if (error instanceof DshellError || error instanceof BackendError) {
       console.error(`dshell: ${error.message}`)
       if (error.action !== undefined) console.error(`       ${error.action}`)
       process.exitCode = 1
