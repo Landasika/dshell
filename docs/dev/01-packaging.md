@@ -3,6 +3,7 @@
 - 状态：**完成（scaffold + 可安装 tarball）**
 - 完成时间：2026-10-23
 - 原始计划：[`docs/development/01-packaging.md`](../development/01-packaging.md)
+- PR：[Gitea #2](http://192.168.8.77:3000/Landasika/dshell/pulls/2)
 - 设计记录：[`find/p1-revision.md`](../../find/p1-revision.md)
 - 验收记录：[`find/p1-implementation.md`](../../find/p1-implementation.md)
 
