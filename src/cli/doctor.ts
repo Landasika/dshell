@@ -3,6 +3,7 @@ import { existsSync, statSync } from 'node:fs'
 import { DshellError, HostConnection } from '../client/socket-client.js'
 import { PROTOCOL_VERSION, type Capability } from '../protocol/index.js'
 import { resolveDshHome } from '../shared/paths.js'
+import { TESTED_DSH_VERSION, dshVersionNote } from '../shared/compat.js'
 
 type CheckStatus = 'ok' | 'warn' | 'error'
 
@@ -101,7 +102,9 @@ export async function runDoctor(socketPath: string): Promise<number> {
     }
 
     if (welcome.dshVersion === 'unknown') {
-      line('warn', 'dsh version', 'unknown (plugin could not infer it)')
+      line('warn', 'dsh version', dshVersionNote(welcome.dshVersion))
+    } else if (welcome.dshVersion !== TESTED_DSH_VERSION) {
+      line('warn', 'dsh version', dshVersionNote(welcome.dshVersion))
     }
   } finally {
     connection.close()

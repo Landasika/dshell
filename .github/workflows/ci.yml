@@ -29,3 +29,4 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm pack
+      - run: ./scripts/verify-pack.sh
