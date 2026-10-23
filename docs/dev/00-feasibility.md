@@ -4,6 +4,7 @@
 - 完成时间：2026-10-23
 - 验收结论：**Conditional Go**
 - 原始计划：[`docs/development/00-feasibility.md`](../development/00-feasibility.md)
+- PR：[Gitea #1](http://192.168.8.77:3000/Landasika/dshell/pulls/1)
 - 证据索引：[`find/P0.md`](../../find/P0.md)、[`find/p0-report.md`](../../find/p0-report.md)、[`find/dsh-api-inventory.md`](../../find/dsh-api-inventory.md)、[`find/compatibility-risks.md`](../../find/compatibility-risks.md)
 
 ## 1. 环境
