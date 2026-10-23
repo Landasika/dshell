@@ -47,6 +47,7 @@ export interface FakeSessionSeed {
 export class FakeBackend implements DshellBackend {
   private readonly sessions = new Map<string, FakeSession>()
   private readonly workspaces = new Map<string, WorkspaceSummary>()
+  private readonly handles = new Set<FakeSessionHandle>()
   private isConnected = false
   private nextId = 1
 
@@ -110,7 +111,9 @@ export class FakeBackend implements DshellBackend {
       streamText: '',
     })
     this.ensureWorkspace(cwd)
-    return new FakeSessionHandle(sessionId, this, this.sessions.get(sessionId) as FakeSession)
+    const handle = new FakeSessionHandle(sessionId, this, this.sessions.get(sessionId) as FakeSession)
+    this.handles.add(handle)
+    return handle
   }
 
   async openSession(sessionId: string): Promise<SessionHandle> {
@@ -119,7 +122,9 @@ export class FakeBackend implements DshellBackend {
     if (session === undefined) {
       throw new BackendError('SESSION_NOT_FOUND', `session "${sessionId}" was not found`)
     }
-    return new FakeSessionHandle(sessionId, this, session)
+    const handle = new FakeSessionHandle(sessionId, this, session)
+    this.handles.add(handle)
+    return handle
   }
 
   /** Test/presentation helper: append a durable event as the Host would. */
@@ -136,6 +141,7 @@ export class FakeBackend implements DshellBackend {
     const session = this.requireSession(sessionId)
     session.pendingApproval = question
     session.status = 'running'
+    for (const handle of this.handles) handle.notify()
   }
 
   requireSession(sessionId: string): FakeSession {
@@ -175,6 +181,10 @@ export class FakeBackend implements DshellBackend {
   private workspaceFor(cwd: string | undefined): WorkspaceSummary | undefined {
     if (cwd === undefined) return undefined
     return [...this.workspaces.values()].find((workspace) => workspace.path === cwd)
+  }
+
+  forget(handle: FakeSessionHandle): void {
+    this.handles.delete(handle)
   }
 
   private assertConnected(): void {
@@ -300,10 +310,15 @@ class FakeSessionHandle implements SessionHandle {
   dispose(): void {
     this.disposed = true
     this.listeners.clear()
+    this.backend.forget(this)
   }
 
   private append(event: SessionEvent): void {
     this.backend.emit(this.id, event)
+    this.emitChange()
+  }
+
+  notify(): void {
     this.emitChange()
   }
 

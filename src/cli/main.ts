@@ -8,6 +8,7 @@ import { resolveSocketPath } from '../shared/paths.js'
 import { packageVersion } from '../shared/package.js'
 import { printEvent, printSessions, printWorkspaces, isTurnEnd, turnFailed } from './output.js'
 import { runDoctor } from './doctor.js'
+import { runTui } from '../tui/app.js'
 
 interface Options {
   command: string
@@ -15,11 +16,15 @@ interface Options {
   socket?: string
   timeoutMs: number
   verbose: boolean
+  resume?: string
+  color?: boolean
 }
 
 const HELP = `dshell ${packageVersion()}
 
 Usage:
+  dshell                  interactive TUI (same as 'dshell tui')
+  dshell tui [--resume <sessionId>]
   dshell doctor
   dshell workspaces
   dshell list [workspaceId]
@@ -33,6 +38,8 @@ Options:
   --socket <path>     override the control socket
   --timeout <ms>      prompt/turn timeout (default: 120000)
   --verbose           print context and lifecycle events
+  --resume <id>, -r   open a session directly in the TUI
+  --no-color          disable ANSI colors
   -h, --help          show this help
   -V, --version       show the version
 
@@ -50,6 +57,8 @@ function parseArgs(argv: string[]): Options {
   let socket: string | undefined
   let timeoutMs = 120_000
   let verbose = false
+  let resume: string | undefined
+  let color: boolean | undefined
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -69,6 +78,21 @@ function parseArgs(argv: string[]): Options {
     }
     if (arg === '--verbose') {
       verbose = true
+      continue
+    }
+    if (arg === '--no-color') {
+      color = false
+      continue
+    }
+    if (arg === '--color') {
+      color = true
+      continue
+    }
+    if (arg === '--resume' || arg === '-r') {
+      const value = argv[index + 1]
+      if (value === undefined) throw new DshellError('BAD_REQUEST', `${arg} requires a sessionId`)
+      resume = value
+      index += 1
       continue
     }
     if (arg === '--socket') {
@@ -96,11 +120,13 @@ function parseArgs(argv: string[]): Options {
   }
 
   return {
-    command: command ?? 'help',
+    command: command ?? (argv.length === 0 ? 'tui' : 'help'),
     args,
     socket,
     timeoutMs,
     verbose,
+    ...(resume === undefined ? {} : { resume }),
+    ...(color === undefined ? {} : { color }),
   }
 }
 
@@ -393,6 +419,26 @@ export async function main(argv: string[]): Promise<void> {
 
   try {
     switch (options.command) {
+      case 'tui':
+      case 'interactive': {
+        if (!output.isTTY) {
+          console.log(HELP)
+          return
+        }
+        const backend = new SocketBackend(socketPath)
+        try {
+          await backend.connect()
+          process.exitCode = await runTui(backend, {
+            cwd: process.cwd(),
+            ...(options.resume === undefined ? {} : { resume: options.resume }),
+            verbose: options.verbose,
+            ...(options.color === undefined ? {} : { color: options.color }),
+          })
+        } finally {
+          await backend.disconnect()
+        }
+        return
+      }
       case 'doctor':
         process.exitCode = await runDoctor(socketPath)
         return

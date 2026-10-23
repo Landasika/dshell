@@ -11,6 +11,7 @@ async function socketServer(handler) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-backend-'))
   const socketPath = join(directory, 'dshell.sock')
   const server = createServer((socket) => {
+    socket.on('error', () => undefined)
     socket.setEncoding('utf8')
     let buffer = ''
     socket.on('data', (chunk) => {
@@ -38,7 +39,13 @@ async function socketServer(handler) {
 }
 
 function write(socket, message) {
-  socket.write(`${JSON.stringify(message)}\n`)
+  if (socket.destroyed || !socket.writable) return
+  try {
+    socket.write(`${JSON.stringify(message)}\n`)
+  } catch {
+    // The client may close immediately after a cancel; the fake host must not
+    // turn that into an unhandled EPIPE.
+  }
 }
 
 test('FakeBackend exposes workspaces, sessions, streaming, and approval', async () => {

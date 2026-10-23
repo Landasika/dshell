@@ -13,8 +13,9 @@ V1 supports **Linux only**. macOS and Windows are out of scope for now.
 
 ## Status
 
-This repository has completed **P0–P3** (session core):
+This repository has completed **P0–P4** (session core + TUI):
 
+- default `dshell` opens a Claude Code-style full-screen TUI;
 - CLI: `doctor`, `workspaces`, `list`, `new`, `attach`, `prompt`, `steer`,
   `cancel`;
 - Host plugin: `dshell-host`, mounted through a DSH profile bundle;
@@ -24,8 +25,8 @@ This repository has completed **P0–P3** (session core):
 - approval bridge: CLI and Web can answer the same request; first answer wins,
   timeout/disconnect fail closed.
 
-P4 (full TUI), P5 (product CLI / `-p` / JSON) and P6 (compatibility/release)
-are still ahead. The `poc/` directory contains earlier probes and the M1 spike.
+P5 (product CLI / `-p` / JSON) and P6 (compatibility/release) are still ahead.
+The `poc/` directory contains earlier probes and the M1 spike.
 
 ## Requirements
 
@@ -84,6 +85,8 @@ Look for:
 ## Use the CLI
 
 ```bash
+dshell                         # full-screen TUI
+dshell --resume <sessionId>    # open a session directly
 dshell doctor
 dshell workspaces
 dshell list [workspaceId]
@@ -142,6 +145,7 @@ Stage docs:
 - [`docs/dev/01-packaging.md`](./docs/dev/01-packaging.md)
 - [`docs/dev/02-adapter.md`](./docs/dev/02-adapter.md)
 - [`docs/dev/03-session-core.md`](./docs/dev/03-session-core.md)
+- [`docs/dev/04-tui.md`](./docs/dev/04-tui.md)
 
 Findings:
 

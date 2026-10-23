@@ -200,7 +200,9 @@ export class HostConnection {
   close(): void {
     if (this.closed) return
     this.closed = true
-    this.socket.end()
+    // Destroy rather than only half-closing: a viewer may quit while the Host
+    // is still writing, and an `end()` can leave the client process alive.
+    this.socket.destroy()
     for (const waiter of this.waiters) {
       waiter.reject(new DshellError('HOST_NOT_RUNNING', 'dshell-host connection is closed'))
     }
