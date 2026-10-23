@@ -147,6 +147,14 @@ attach(sessionId)
 
 不能在 Web 已经 live 的情况下再 `resume` 同一个 id；`dsh-agent` 会拒绝重复 live id。所以顺序必须是“先 get，再 resume”。
 
+## 平台范围
+
+V1 只支持 **Linux**：
+
+- Unix domain socket、`0600` 权限、stale socket 行为只在 Linux 上验证；
+- 不承诺 macOS、Windows；
+- Windows named pipe 和 macOS 兼容放到后续版本。
+
 ## 安全
 
 - socket 权限 `0600`，只允许同一 UID；

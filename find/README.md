@@ -9,6 +9,7 @@
 | [`dsh-api-inventory.md`](./dsh-api-inventory.md) | 认证、RPC/stream envelope、endpoint、event、错误码 |
 | [`compatibility-risks.md`](./compatibility-risks.md) | 风险分级、证据、缓解方案 |
 | [`architecture.md`](./architecture.md) | 一个 Host + Web/CLI 两个前端的架构、socket 协议、里程碑 |
+| [`p1-revision.md`](./p1-revision.md) | P1 修订：Linux 优先、单包双入口、插件安装与 attach 契约 |
 
 配套 PoC 在仓库根目录的 `poc/`：
 
