@@ -85,7 +85,7 @@ export interface AcceptedMessage {
   type: 'accepted'
   sessionId: string
   requestId: string
-  mode: 'queue'
+  mode: 'queue' | 'steer'
 }
 
 export interface EventMessage {
@@ -119,7 +119,7 @@ export type ClientMessage =
   | { type: 'list' }
   | { type: 'attach'; sessionId: string }
   | { type: 'detach' }
-  | { type: 'prompt'; sessionId: string; text: string; mode?: 'queue'; requestId?: string }
+  | { type: 'prompt'; sessionId: string; text: string; mode?: 'queue' | 'steer'; requestId?: string }
 
 export type ServerMessage =
   | WelcomeMessage
