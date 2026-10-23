@@ -33,3 +33,6 @@ pnpm-debug.log*
 
 # Packed npm tarballs
 *.tgz
+
+# CI/local npm cache
+.cache/
