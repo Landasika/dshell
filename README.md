@@ -49,11 +49,19 @@ The package has two consumers:
 1. the global CLI binary;
 2. the DSH profile that loads the Host plugin.
 
-For local development, build first and install the package into the profile:
+Until `@landasika/dshell` is published, use the local package. Build first, then
+install it into the profile:
 
 ```bash
 pnpm build
 dsh plugin --profile web add "$PWD"
+```
+
+After publishing, the same two steps are:
+
+```bash
+npm install -g @landasika/dshell
+dsh plugin --profile web add @landasika/dshell
 ```
 
 The plugin is a DSH bundle (`package.json:dsh.bundle.patch`), so `dsh plugin`
@@ -93,6 +101,10 @@ DSH_HOME            DSH home (default: ~/.dsh)
 DSHELL_SOCKET       control socket override
 ```
 
+`dshell attach` replays the current snapshot and then prints live events; it
+does not resume a cold Agent just to read history. `dshell prompt` resumes a
+cold session when needed, using the session's preset and model selection.
+
 `dshell` never starts a second Host. If the socket is missing it prints an
 actionable error and exits.
 
@@ -112,4 +124,5 @@ See:
 
 - [`find/architecture.md`](./find/architecture.md)
 - [`find/p1-revision.md`](./find/p1-revision.md)
+- [`find/p1-implementation.md`](./find/p1-implementation.md)
 - [`find/P0.md`](./find/P0.md)
