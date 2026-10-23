@@ -4,7 +4,7 @@
 - 完成时间：2026-10-23
 - 原始计划：[`docs/development/06-compatibility-release.md`](../development/06-compatibility-release.md)
 - 前置阶段：[P0](./00-feasibility.md) · [P1](./01-packaging.md) · [P2](./02-adapter.md) · [P3](./03-session-core.md) · [P4](./04-tui.md) · [P5](./05-product-cli.md)
-- PR：待创建（`stage/p6-release`）
+- PR：[Gitea #7](http://192.168.8.77:3000/Landasika/dshell/pulls/7)
 - 证据：`find/p6-evidence.md`
 
 ## 1. 版本矩阵
