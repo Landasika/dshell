@@ -46,7 +46,8 @@
     "test": "pnpm build && node --test tests/*.test.mjs",
     "clean": "rm -rf dist",
     "prepack": "pnpm build",
-    "pack": "pnpm build && npm pack"
+    "pack": "pnpm build && npm pack",
+    "lint": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
