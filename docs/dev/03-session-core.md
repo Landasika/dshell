@@ -7,7 +7,7 @@
   - P0 [`00-feasibility.md`](./00-feasibility.md)
   - P1 [`01-packaging.md`](./01-packaging.md)
   - P2 [`02-adapter.md`](./02-adapter.md)
-- PR：待创建（`stage/p3-session-core`）
+- PR：[Gitea #4](http://192.168.8.77:3000/Landasika/dshell/pulls/4)
 - 证据：`find/p3-evidence.md`
 
 ## 1. 这一阶段解决什么
