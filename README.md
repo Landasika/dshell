@@ -13,9 +13,10 @@ V1 supports **Linux only**. macOS and Windows are out of scope for now.
 
 ## Status
 
-This repository has completed **P0–P4** (session core + TUI):
+This repository has completed **P0–P5** (session core + TUI + product CLI):
 
 - default `dshell` opens a Claude Code-style full-screen TUI;
+- `dshell -p "..."` is a scriptable one-shot mode (`text`, `json`, `stream-json`);
 - CLI: `doctor`, `workspaces`, `list`, `new`, `attach`, `prompt`, `steer`,
   `cancel`;
 - Host plugin: `dshell-host`, mounted through a DSH profile bundle;
@@ -25,8 +26,8 @@ This repository has completed **P0–P4** (session core + TUI):
 - approval bridge: CLI and Web can answer the same request; first answer wins,
   timeout/disconnect fail closed.
 
-P5 (product CLI / `-p` / JSON) and P6 (compatibility/release) are still ahead.
-The `poc/` directory contains earlier probes and the M1 spike.
+P6 (compatibility/release) is still ahead. The `poc/` directory contains
+earlier probes and the M1 spike.
 
 ## Requirements
 
@@ -87,6 +88,10 @@ Look for:
 ```bash
 dshell                         # full-screen TUI
 dshell --resume <sessionId>    # open a session directly
+dshell -p "summarize this repo"             # one-shot, text
+dshell -p --json "summarize this repo"      # one-shot, JSON
+dshell -p --output-format stream-json "..." # NDJSON
+printf 'hello\n' | dshell -p                # stdin
 dshell doctor
 dshell workspaces
 dshell list [workspaceId]
@@ -146,6 +151,7 @@ Stage docs:
 - [`docs/dev/02-adapter.md`](./docs/dev/02-adapter.md)
 - [`docs/dev/03-session-core.md`](./docs/dev/03-session-core.md)
 - [`docs/dev/04-tui.md`](./docs/dev/04-tui.md)
+- [`docs/dev/05-product-cli.md`](./docs/dev/05-product-cli.md)
 
 Findings:
 

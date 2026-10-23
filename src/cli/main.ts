@@ -9,6 +9,7 @@ import { packageVersion } from '../shared/package.js'
 import { printEvent, printSessions, printWorkspaces, isTurnEnd, turnFailed } from './output.js'
 import { runDoctor } from './doctor.js'
 import { runTui } from '../tui/app.js'
+import { runPrint, type OutputFormat } from './print.js'
 
 interface Options {
   command: string
@@ -18,6 +19,12 @@ interface Options {
   verbose: boolean
   resume?: string
   color?: boolean
+  print: boolean
+  outputFormat: OutputFormat
+  sessionId?: string
+  workspaceId?: string
+  cwd?: string
+  create?: boolean
 }
 
 const HELP = `dshell ${packageVersion()}
@@ -25,6 +32,8 @@ const HELP = `dshell ${packageVersion()}
 Usage:
   dshell                  interactive TUI (same as 'dshell tui')
   dshell tui [--resume <sessionId>]
+  dshell -p [options] [prompt]        non-interactive one-shot
+  dshell --print --session <id> "…"
   dshell doctor
   dshell workspaces
   dshell list [workspaceId]
@@ -40,6 +49,13 @@ Options:
   --verbose           print context and lifecycle events
   --resume <id>, -r   open a session directly in the TUI
   --no-color          disable ANSI colors
+  -p, --print         one-shot mode; prompt from args or stdin
+  --output-format <f> text | json | stream-json (default: text)
+  --json              shorthand for --output-format json
+  -s, --session <id>  use an existing session (print)
+  -w, --workspace <id> use a workspace when creating a session
+  --cwd <path>        working directory for a new session
+  --new               always create a new session (print)
   -h, --help          show this help
   -V, --version       show the version
 
@@ -59,6 +75,12 @@ function parseArgs(argv: string[]): Options {
   let verbose = false
   let resume: string | undefined
   let color: boolean | undefined
+  let print = false
+  let outputFormat: OutputFormat = 'text'
+  let sessionId: string | undefined
+  let workspaceId: string | undefined
+  let cwd: string | undefined
+  let create = false
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -74,6 +96,48 @@ function parseArgs(argv: string[]): Options {
     }
     if (arg === '-V' || arg === '--version') {
       command = 'version'
+      continue
+    }
+    if (arg === '-p' || arg === '--print') {
+      print = true
+      continue
+    }
+    if (arg === '--json') {
+      outputFormat = 'json'
+      continue
+    }
+    if (arg === '--output-format') {
+      const value = argv[index + 1]
+      if (value !== 'text' && value !== 'json' && value !== 'stream-json') {
+        throw new DshellError('BAD_REQUEST', '--output-format must be text, json, or stream-json')
+      }
+      outputFormat = value
+      index += 1
+      continue
+    }
+    if (arg === '--session' || arg === '-s') {
+      const value = argv[index + 1]
+      if (value === undefined) throw new DshellError('BAD_REQUEST', `${arg} requires a sessionId`)
+      sessionId = value
+      index += 1
+      continue
+    }
+    if (arg === '--workspace' || arg === '-w') {
+      const value = argv[index + 1]
+      if (value === undefined) throw new DshellError('BAD_REQUEST', `${arg} requires a workspaceId`)
+      workspaceId = value
+      index += 1
+      continue
+    }
+    if (arg === '--cwd') {
+      const value = argv[index + 1]
+      if (value === undefined) throw new DshellError('BAD_REQUEST', '--cwd requires a path')
+      cwd = value
+      index += 1
+      continue
+    }
+    if (arg === '--new') {
+      create = true
       continue
     }
     if (arg === '--verbose') {
@@ -111,22 +175,29 @@ function parseArgs(argv: string[]): Options {
       index += 1
       continue
     }
-    if (arg.startsWith('-')) {
+    if (arg.startsWith('-') && arg !== '-') {
       throw new DshellError('BAD_REQUEST', `unknown option: ${arg}`)
     }
 
-    if (command === undefined) command = arg
+    if (print) args.push(arg)
+    else if (command === undefined) command = arg
     else args.push(arg)
   }
 
   return {
-    command: command ?? (argv.length === 0 ? 'tui' : 'help'),
+    command: print ? 'print' : command ?? (argv.length === 0 ? 'tui' : 'help'),
     args,
     socket,
     timeoutMs,
     verbose,
     ...(resume === undefined ? {} : { resume }),
     ...(color === undefined ? {} : { color }),
+    print,
+    outputFormat,
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(workspaceId === undefined ? {} : { workspaceId }),
+    ...(cwd === undefined ? {} : { cwd }),
+    ...(create ? { create } : {}),
   }
 }
 
@@ -430,13 +501,31 @@ export async function main(argv: string[]): Promise<void> {
           await backend.connect()
           process.exitCode = await runTui(backend, {
             cwd: process.cwd(),
-            ...(options.resume === undefined ? {} : { resume: options.resume }),
+            ...(options.resume === undefined
+              ? options.sessionId === undefined
+                ? {}
+                : { resume: options.sessionId }
+              : { resume: options.resume }),
             verbose: options.verbose,
             ...(options.color === undefined ? {} : { color: options.color }),
           })
         } finally {
           await backend.disconnect()
         }
+        return
+      }
+      case 'print': {
+        const prompt = options.args.length === 0 ? undefined : options.args.join(' ')
+        process.exitCode = await runPrint(socketPath, {
+          ...(prompt === undefined ? {} : { prompt }),
+          ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+          ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
+          ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+          ...(options.create === true ? { create: true } : {}),
+          outputFormat: options.outputFormat,
+          timeoutMs: options.timeoutMs,
+          verbose: options.verbose,
+        })
         return
       }
       case 'doctor':
@@ -490,7 +579,7 @@ export async function main(argv: string[]): Promise<void> {
     if (error instanceof DshellError || error instanceof BackendError) {
       console.error(`dshell: ${error.message}`)
       if (error.action !== undefined) console.error(`       ${error.action}`)
-      process.exitCode = 1
+      process.exitCode = error.code === 'BAD_REQUEST' ? 2 : 1
       return
     }
     console.error(`dshell: ${error instanceof Error ? error.message : String(error)}`)
