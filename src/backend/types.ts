@@ -89,6 +89,7 @@ export interface SendOptions {
 
 export interface SendReceipt {
   requestId: string
+  mode?: 'queue' | 'steer'
 }
 
 /**
