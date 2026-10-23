@@ -24,3 +24,6 @@ pnpm-debug.log*
 .DS_Store
 .idea/
 .vscode/
+
+# P0 local test state (credentials, DSH_HOME)
+.p0/

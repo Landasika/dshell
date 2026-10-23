@@ -1,0 +1,32 @@
+{
+  "name": "dshell-p0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "probe": "node p0-client.mjs connect",
+    "probe:list": "node p0-client.mjs list",
+    "probe:create": "node p0-client.mjs create",
+    "probe:prompt": "node p0-client.mjs prompt",
+    "probe:history": "node p0-client.mjs history",
+    "probe:page": "node p0-client.mjs page",
+    "probe:workspace": "node p0-client.mjs workspace",
+    "probe:reconnect": "node p0-client.mjs reconnect",
+    "probe:none": "node p0-client.mjs none",
+    "probe:none-prompt": "node p0-client.mjs none-prompt",
+    "probe:detach": "node p0-client.mjs detach",
+    "probe:cancel-task": "node p0-client.mjs cancel-task",
+    "probe:race": "node p0-client.mjs race",
+    "probe:watch": "node p0-client.mjs watch",
+    "import-check": "node import-check.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-api-gateway": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-connection": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-file-upload": "0.2.1-rc.2",
+    "ws": "8.22.0"
+  }
+}
