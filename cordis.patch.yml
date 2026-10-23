@@ -1,0 +1,7 @@
+# Mount the dshell-host control plane next to the Web profile's rows.
+#
+# The plugin listens on $DSH_HOME/run/dshell.sock by default. Set
+# `socketPath` here if the CLI should use a different path.
+- insert:
+    - id: dshell-host
+      name: '@landasika/dshell'

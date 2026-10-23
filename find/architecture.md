@@ -183,7 +183,7 @@ V1 只支持 **Linux**：
 | M1 | socket + list/attach/prompt + 双向事件 | 已完成（spike） |
 | M2 | 审批、cancel/steer、status、错误恢复 | 待做 |
 | M3 | TUI：历史渲染、输入、工具卡片、流式 | 待做 |
-| M4 | 打包为 `@scope/dshell`，提供 `dshell` bin 和 profile 安装 | 待做 |
+| M4 | 打包为 `@landasika/dshell`，提供 `dshell` bin 和 profile 安装 | 待做 |
 | M5 | 重连、多客户端、权限校验、版本握手 | 待做 |
 
 ## 非目标

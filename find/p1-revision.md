@@ -1,7 +1,7 @@
 # P1 修订：Linux 优先的 CLI + Host 插件发布单元
 
-> 状态：设计决策，尚未实现。  
-> 本文只修订 `docs/development/01-packaging.md` 的方向，不改原文档；原始计划保留作历史对照。
+> 状态：设计决策，已实现为 P1 scaffold（`@landasika/dshell@0.1.0`）。
+> 本文保留 P1 的设计边界；实际结构、验收证据和差异见 [`p1-implementation.md`](./p1-implementation.md)。原始 `docs/development/` 不改动。
 
 ## 0. 已拍板的范围
 
@@ -41,15 +41,15 @@ Linux
 ## 2. 安装拓扑
 
 ```text
-                    npm tarball: @scope/dshell
+                    npm tarball: @landasika/dshell
                     ├─ bin/dshell.mjs          → 全局 CLI
                     └─ plugin/index.js         → DSH profile 插件
                               │
               ┌───────────────┴───────────────┐
               │                               │
-   npm i -g @scope/dshell          dsh plugin --profile web add @scope/dshell
+   npm i -g @landasika/dshell          dsh plugin --profile web add @landasika/dshell
               │                               │
-        dshell 命令                  profile 的 bundles 增加 @scope/dshell
+        dshell 命令                  profile 的 bundles 增加 @landasika/dshell
                                               │
                                      dsh --profile web 启动时加载
                                               │
@@ -74,40 +74,38 @@ P1 先接受两步安装，后续可以加 `dshell setup` 封装，但 P1 不依
 ```json
 {
   "dependencies": {
-    "@scope/dshell": "0.0.0"
+    "@landasika/dshell": "0.1.0"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
-        "@scope/dshell"
+        "@landasika/dshell"
       ]
     }
   }
 }
 ```
 
-`profiles/web/node_modules/@scope/dshell` 指向安装产物；`dsh.bundle.patch` 指向包内的 `cordis.patch.yml`。
+`profiles/web/node_modules/@landasika/dshell` 指向安装产物；`dsh.bundle.patch` 指向包内的 `cordis.patch.yml`。
 
 ## 3. 包结构
 
 ```text
 dshell/
 ├── package.json
+├── tsconfig.json
 ├── cordis.patch.yml          # Host 插件挂载行
-├── bin/
-│   └── dshell.mjs            # CLI 入口，shebang
 ├── src/
+│   ├── bin/dshell.ts         # CLI 入口，shebang（编译到 dist/bin）
 │   ├── cli/                  # 参数、命令、doctor
 │   ├── client/               # Unix socket 客户端
 │   ├── protocol/             # NDJSON 消息类型、版本、错误码
 │   ├── plugin/               # dshell-host Cordis 插件
-│   └── shared/               # 两端共享的纯类型/常量
-├── tests/
-│   ├── unit/
-│   ├── protocol/
-│   └── e2e/
+│   └── shared/               # 两端共享的纯路径/版本常量
+├── tests/                    # protocol + client 测试
+├── dist/                     # tsc 产物（gitignore）
 └── README.md
 ```
 
@@ -115,19 +113,20 @@ dshell/
 
 ```json
 {
-  "name": "@scope/dshell",
+  "name": "@landasika/dshell",
+  "version": "0.1.0",
   "type": "module",
-  "bin": { "dshell": "./bin/dshell.mjs" },
+  "main": "./dist/plugin/index.js",
+  "bin": { "dshell": "./dist/bin/dshell.js" },
   "exports": {
-    ".": "./src/client/index.js",
-    "./plugin": "./src/plugin/index.js",
-    "./protocol": "./src/protocol/index.js",
+    ".": "./dist/plugin/index.js",
+    "./plugin": "./dist/plugin/index.js",
+    "./protocol": "./dist/protocol/index.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "bin/",
-    "src/",
+    "dist/",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -135,9 +134,6 @@ dshell/
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  },
-  "peerDependencies": {
-    "@deepseek-ai/dsh": "0.2.1-rc.2"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -150,7 +146,7 @@ dshell/
 - `./plugin` 不能 import CLI 的 TUI/终端代码；
 - CLI 不能 import `@deepseek-ai/dsh` 的 Host-only 模块；
 - 两端只共享 `src/protocol` 和 `src/shared`；
-- `@deepseek-ai/dsh` 只作为 peer，不捆绑 Runtime。
+- 不捆绑 DSH Runtime；P1 实际暂不声明 `peerDependencies`（本机 pnpm 会自动装 peer，污染仓库），版本由 `welcome.dshVersion` 报告，发布前再补兼容性策略。
 
 ## 4. Host 插件契约
 
@@ -199,7 +195,7 @@ P1 先依赖文件权限。`SO_PEERCRED` 需要 Node 原生扩展或非公开 ha
 {
   "type": "welcome",
   "protocol": 1,
-  "pluginVersion": "0.0.0",
+  "pluginVersion": "0.1.0",
   "dshVersion": "0.2.1-rc.2",
   "capabilities": ["list", "attach", "prompt", "event", "stream", "status"]
 }
@@ -271,7 +267,7 @@ P1 必须包含，因为三种失败很容易混淆：
 [ok]   socket               /home/<user>/.dsh/run/dshell.sock
 [ok]   socket mode          0600
 [ok]   host process          running
-[ok]   plugin version        0.0.0
+[ok]   plugin version        0.1.0
 [ok]   protocol              1
 [ok]   dsh version           0.2.1-rc.2
 [ok]   capabilities          list, attach, prompt, event, stream, status
@@ -282,7 +278,7 @@ P1 必须包含，因为三种失败很容易混淆：
 ```text
 [error] socket not found
         start the host: dsh --profile web
-        install plugin: dsh plugin --profile web add @scope/dshell
+        install plugin: dsh plugin --profile web add @landasika/dshell
 ```
 
 ## 7. 验收标准（替换原 P1 验收）
@@ -292,7 +288,7 @@ P1 必须包含，因为三种失败很容易混淆：
 1. `npm pack` 生成 tarball；
 2. 在临时目录 `npm i -g <tarball>` 后，`dshell --help` 可用；
 3. 在临时 `DSH_HOME` 初始化 `web` profile；
-4. `dsh plugin --profile web add <tarball>` 成功，`bundles` 包含 `@scope/dshell`；
+4. `dsh plugin --profile web add <tarball>` 成功，`bundles` 包含 `@landasika/dshell`；
 5. 启动 `dsh --profile web`，stderr 出现 `[dshell-host] listening on ...`；
 6. `dshell doctor` 全绿；
 7. `dshell list` 能看到 Web 创建的 Session；
@@ -342,9 +338,16 @@ P1 必须包含，因为三种失败很容易混淆：
 - P4 再做 TUI 渲染、工具卡片、todo/plan 面板、subagent 树；
 - 审批桥接（M2）独立于 P1，但必须早于 P3 的交互验收。
 
-## 11. 待定
+## 11. 已定 / 仍待定
 
-- 最终 npm scope 和包名（`dshell` 已被占用）；
-- 是否在 P1 增加 `dshell setup`（建议 P1 后再做）；
-- 是否在 P1 支持 `--socket` 参数（建议支持，等价于 `DSHELL_SOCKET`）；
-- Linux 发行版矩阵（建议先 Ubuntu 24.04 + Node 24，CI 再加一个 Node 22）。
+已定：
+
+- npm 包名：`@landasika/dshell`（`dshell` 包名已被占用；命令名仍可用）；
+- P1 支持 `--socket`，优先级高于 `DSHELL_SOCKET`；
+- P1 先支持 Linux；CI 目标 Ubuntu 24.04 + Node 22/24。
+
+仍待定：
+
+- 是否在 P1 之后增加 `dshell setup`（封装全局安装 + profile 安装）；
+- `@landasika` npm scope 的实际发布权限；
+- 发布前的 peer/版本兼容性硬校验方式。

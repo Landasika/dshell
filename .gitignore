@@ -30,3 +30,6 @@ pnpm-debug.log*
 
 # Local package-manager caches
 .pnpm-store/
+
+# Packed npm tarballs
+*.tgz
