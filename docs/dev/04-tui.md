@@ -4,7 +4,7 @@
 - 完成时间：2026-10-23
 - 原始计划：[`docs/development/04-tui.md`](../development/04-tui.md)
 - 前置阶段：[P0](./00-feasibility.md) · [P1](./01-packaging.md) · [P2](./02-adapter.md) · [P3](./03-session-core.md)
-- PR：待创建（`stage/p4-tui`）
+- PR：[Gitea #5](http://192.168.8.77:3000/Landasika/dshell/pulls/5)
 - 证据：`find/p4-evidence.md`
 
 ## 1. 目标与边界
