@@ -3,6 +3,7 @@
 - 状态：**完成（list/attach/prompt 适配层）**
 - 完成时间：2026-10-23
 - 原始计划：[`docs/development/02-adapter.md`](../development/02-adapter.md)
+- PR：[Gitea #3](http://192.168.8.77:3000/Landasika/dshell/pulls/3)
 - P0 结论：[`00-feasibility.md`](./00-feasibility.md)
 
 ## 1. 边界
