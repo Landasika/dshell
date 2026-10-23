@@ -4,7 +4,7 @@
 - 完成时间：2026-10-23
 - 原始计划：[`docs/development/05-product-cli.md`](../development/05-product-cli.md)
 - 前置阶段：[P0](./00-feasibility.md) · [P1](./01-packaging.md) · [P2](./02-adapter.md) · [P3](./03-session-core.md) · [P4](./04-tui.md)
-- PR：待创建（`stage/p5-product-cli`）
+- PR：[Gitea #6](http://192.168.8.77:3000/Landasika/dshell/pulls/6)
 - 证据：`find/p5-evidence.md`
 
 ## 1. 入口模型
