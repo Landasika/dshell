@@ -89,6 +89,7 @@ DSH 版本等于 `TESTED_DSH_VERSION`，没有 warning。
 - SHA-256 `b3499211449030d4005ad96b02bb0eca2072a888f2a3f71b792e7df38e569c76`
 - 该 hash 在本地 CI 的临时目录生成；CI/release workflow 会重新生成并写入
   `SHA256SUMS`。
+- Git tag：`v0.1.0`（P6 合并后创建）。
 
 ## 7. CI / release 配置
 
