@@ -47,10 +47,10 @@ test('handshake, list, and prompt over a Unix socket', async (t) => {
     if (message.type === 'hello') {
       write(socket, {
         type: 'welcome',
-        protocol: 1,
+        protocol: 2,
         pluginVersion: 'test',
         dshVersion: 'test',
-        capabilities: ['list', 'attach', 'prompt', 'event', 'stream', 'status'],
+        capabilities: ['list', 'attach', 'prompt', 'event', 'stream', 'status', 'workspaces', 'history', 'cancel', 'steer', 'approval'],
         socketPath: 'test.sock',
         sessions: [],
       })
@@ -70,7 +70,7 @@ test('handshake, list, and prompt over a Unix socket', async (t) => {
     connection.close()
     await server.close()
   })
-  assert.equal(connection.welcome.protocol, 1)
+  assert.equal(connection.welcome.protocol, 2)
 
   connection.send({ type: 'list' })
   const sessions = await connection.waitFor((message) => message.type === 'sessions')

@@ -13,15 +13,19 @@ V1 supports **Linux only**. macOS and Windows are out of scope for now.
 
 ## Status
 
-This repository is at the P1 scaffold stage:
+This repository has completed **P0–P3** (session core):
 
-- CLI: `doctor`, `list`, `attach`, `prompt`;
+- CLI: `doctor`, `workspaces`, `list`, `new`, `attach`, `prompt`, `steer`,
+  `cancel`;
 - Host plugin: `dshell-host`, mounted through a DSH profile bundle;
 - transport: `$DSH_HOME/run/dshell.sock` with mode `0600`;
-- protocol: NDJSON, version 1.
+- protocol: NDJSON, version 2;
+- Workspace/Session creation, history paging, cancel/steer;
+- approval bridge: CLI and Web can answer the same request; first answer wins,
+  timeout/disconnect fail closed.
 
-TUI, approval answering, commands, todo/plan/subagent panels, and `-p` are not
-implemented yet. The `poc/` directory contains earlier probes and the M1 spike.
+P4 (full TUI), P5 (product CLI / `-p` / JSON) and P6 (compatibility/release)
+are still ahead. The `poc/` directory contains earlier probes and the M1 spike.
 
 ## Requirements
 
@@ -81,10 +85,18 @@ Look for:
 
 ```bash
 dshell doctor
-dshell list
+dshell workspaces
+dshell list [workspaceId]
+dshell new [cwd]
 dshell attach <sessionId>
 dshell prompt <sessionId> 'Reply with exactly DSH_OK'
+dshell steer <sessionId> 'Change direction while the turn is running'
+dshell cancel <sessionId>
 ```
+
+`prompt` asks for approval on a TTY (`allow once` / `reject`). On a non-TTY it
+rejects anything pending instead of silently allowing it. `steer` requires a
+running turn; use `prompt` to start a new one.
 
 Options:
 
@@ -104,6 +116,8 @@ DSHELL_SOCKET       control socket override
 `dshell attach` replays the current snapshot and then prints live events; it
 does not resume a cold Agent just to read history. `dshell prompt` resumes a
 cold session when needed, using the session's preset and model selection.
+`dshell new` uses the CLI's current directory when no `cwd` is given, not the
+Host process's directory.
 
 `dshell` never starts a second Host. If the socket is missing it prints an
 actionable error and exits.
@@ -122,7 +136,17 @@ actionable error and exits.
 
 See:
 
+Stage docs:
+
+- [`docs/dev/00-feasibility.md`](./docs/dev/00-feasibility.md)
+- [`docs/dev/01-packaging.md`](./docs/dev/01-packaging.md)
+- [`docs/dev/02-adapter.md`](./docs/dev/02-adapter.md)
+- [`docs/dev/03-session-core.md`](./docs/dev/03-session-core.md)
+
+Findings:
+
 - [`find/architecture.md`](./find/architecture.md)
+- [`find/p3-evidence.md`](./find/p3-evidence.md)
 - [`find/p1-revision.md`](./find/p1-revision.md)
 - [`find/p1-implementation.md`](./find/p1-implementation.md)
 - [`find/P0.md`](./find/P0.md)

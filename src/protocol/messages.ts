@@ -1,7 +1,7 @@
 /** Wire protocol between the dshell CLI and the dshell-host plugin. */
-export const PROTOCOL_VERSION = 1 as const
+export const PROTOCOL_VERSION = 2 as const
 
-/** Capabilities advertised by a protocol-v1 host. */
+/** Capabilities advertised by a protocol-v2 host. */
 export const CAPABILITIES = [
   'list',
   'attach',
@@ -9,6 +9,12 @@ export const CAPABILITIES = [
   'event',
   'stream',
   'status',
+  'workspaces',
+  'create-session',
+  'history',
+  'cancel',
+  'steer',
+  'approval',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
@@ -20,24 +26,37 @@ export type DshellErrorCode =
   | 'PROTOCOL_MISMATCH'
   | 'DSH_VERSION_UNSUPPORTED'
   | 'CAPABILITY_MISSING'
+  | 'UNSUPPORTED_CAPABILITY'
   | 'SESSION_NOT_FOUND'
   | 'SESSION_ALREADY_LIVE'
+  | 'APPROVAL_NOT_PENDING'
   | 'BAD_REQUEST'
   | 'INTERNAL'
+
+export interface WorkspaceSummary {
+  id: string
+  path: string
+  title: string
+  sessionIds?: string[]
+}
 
 export interface SessionSummary {
   sessionId: string
   cwd?: string
+  title?: string
   createdAt?: number
   live?: boolean
   persisted?: boolean
   formatStatus?: string
+  workspaceId?: string
+  status?: string
 }
 
 export interface SessionHeader {
   id: string
   cwd?: string
   createdAt?: number
+  title?: string
   [key: string]: unknown
 }
 
@@ -57,6 +76,7 @@ export interface WelcomeMessage {
   capabilities: Capability[]
   socketPath: string
   sessions: SessionSummary[]
+  workspaces: WorkspaceSummary[]
 }
 
 export interface PongMessage {
@@ -69,6 +89,11 @@ export interface SessionsMessage {
   sessions: SessionSummary[]
 }
 
+export interface WorkspacesMessage {
+  type: 'workspaces'
+  workspaces: WorkspaceSummary[]
+}
+
 export interface AttachedMessage {
   type: 'attached'
   sessionId: string
@@ -77,8 +102,25 @@ export interface AttachedMessage {
   events: SessionEvent[]
 }
 
+export interface HistoryMessage {
+  type: 'history'
+  sessionId: string
+  events: SessionEvent[]
+  /** Lowest seq in this page. Pass it as `before` to load the previous page. */
+  cursor: number
+  hasMore: boolean
+}
+
 export interface DetachedMessage {
   type: 'detached'
+  sessionId?: string
+}
+
+export interface SessionCreatedMessage {
+  type: 'session-created'
+  sessionId: string
+  header: SessionHeader
+  workspaceId?: string
 }
 
 export interface AcceptedMessage {
@@ -86,6 +128,12 @@ export interface AcceptedMessage {
   sessionId: string
   requestId: string
   mode: 'queue' | 'steer'
+}
+
+export interface CancelledMessage {
+  type: 'cancelled'
+  sessionId: string
+  requestId?: string
 }
 
 export interface EventMessage {
@@ -106,6 +154,26 @@ export interface StatusMessage {
   status: string
 }
 
+export type ApprovalOutcome = 'allowed-once' | 'rejected'
+
+export interface ApprovalRequestMessage {
+  type: 'approval-request'
+  sessionId: string
+  requestId: string
+  toolName: string
+  callId?: string
+  reason?: string
+  expiresAt?: number
+}
+
+export interface ApprovalResolvedMessage {
+  type: 'approval-resolved'
+  sessionId: string
+  requestId: string
+  outcome: string
+  source: 'cli' | 'other' | 'timeout' | 'disconnect'
+}
+
 export interface ErrorMessage {
   type: 'error'
   code: DshellErrorCode
@@ -117,18 +185,39 @@ export type ClientMessage =
   | { type: 'hello'; protocol: number }
   | { type: 'ping' }
   | { type: 'list' }
+  | { type: 'session/list'; workspaceId?: string }
   | { type: 'attach'; sessionId: string }
-  | { type: 'detach' }
-  | { type: 'prompt'; sessionId: string; text: string; mode?: 'queue' | 'steer'; requestId?: string }
+  | { type: 'detach'; sessionId?: string }
+  | { type: 'watch'; sessionId: string }
+  | { type: 'unwatch'; sessionId: string }
+  | { type: 'workspaces' }
+  | { type: 'workspace/create'; path: string; title?: string }
+  | { type: 'session/create'; cwd?: string; workspaceId?: string; title?: string }
+  | { type: 'session/history'; sessionId: string; before?: number; limit?: number }
+  | { type: 'session/cancel'; sessionId: string; requestId?: string }
+  | {
+      type: 'prompt'
+      sessionId: string
+      text: string
+      mode?: 'queue' | 'steer'
+      requestId?: string
+    }
+  | { type: 'approval/answer'; requestId: string; outcome: ApprovalOutcome }
 
 export type ServerMessage =
   | WelcomeMessage
   | PongMessage
   | SessionsMessage
+  | WorkspacesMessage
   | AttachedMessage
+  | HistoryMessage
   | DetachedMessage
+  | SessionCreatedMessage
   | AcceptedMessage
+  | CancelledMessage
   | EventMessage
   | StreamMessage
   | StatusMessage
+  | ApprovalRequestMessage
+  | ApprovalResolvedMessage
   | ErrorMessage

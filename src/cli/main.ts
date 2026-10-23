@@ -1,9 +1,12 @@
+import { createInterface } from 'node:readline/promises'
+import { stdin as input, stdout as output } from 'node:process'
+
 import { DshellError } from '../client/socket-client.js'
 import { BackendError, SocketBackend, type SessionView } from '../backend/index.js'
 import type { SessionEvent } from '../protocol/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
 import { packageVersion } from '../shared/package.js'
-import { printEvent, printSessions, isTurnEnd, turnFailed } from './output.js'
+import { printEvent, printSessions, printWorkspaces, isTurnEnd, turnFailed } from './output.js'
 import { runDoctor } from './doctor.js'
 
 interface Options {
@@ -18,9 +21,13 @@ const HELP = `dshell ${packageVersion()}
 
 Usage:
   dshell doctor
-  dshell list
+  dshell workspaces
+  dshell list [workspaceId]
+  dshell new [cwd]
   dshell attach <sessionId>
   dshell prompt <sessionId> <text...>
+  dshell steer <sessionId> <text...>
+  dshell cancel <sessionId>
 
 Options:
   --socket <path>     override the control socket
@@ -127,11 +134,49 @@ function waitForInterrupt(): Promise<void> {
   })
 }
 
-async function list(socketPath: string): Promise<void> {
+async function workspaces(socketPath: string): Promise<void> {
   const backend = new SocketBackend(socketPath)
   try {
     await backend.connect()
-    printSessions(await backend.listSessions())
+    printWorkspaces(await backend.listWorkspaces())
+  } finally {
+    await backend.disconnect()
+  }
+}
+
+async function newSession(socketPath: string, cwd: string | undefined): Promise<void> {
+  const backend = new SocketBackend(socketPath)
+  let handle = undefined as Awaited<ReturnType<SocketBackend['openSession']>> | undefined
+  try {
+    await backend.connect()
+    handle = await backend.createSession({ cwd: cwd ?? process.cwd() })
+    const header = handle.snapshot().header
+    console.log(`[created] ${handle.id}  ${String(header.cwd ?? '')}`)
+  } finally {
+    handle?.dispose()
+    await backend.disconnect()
+  }
+}
+
+async function cancel(socketPath: string, sessionId: string): Promise<void> {
+  const backend = new SocketBackend(socketPath)
+  let handle = undefined as Awaited<ReturnType<SocketBackend['openSession']>> | undefined
+  try {
+    await backend.connect()
+    handle = await backend.openSession(sessionId)
+    await handle.cancel()
+    console.log(`[cancelled] ${sessionId}`)
+  } finally {
+    handle?.dispose()
+    await backend.disconnect()
+  }
+}
+
+async function list(socketPath: string, workspaceId?: string): Promise<void> {
+  const backend = new SocketBackend(socketPath)
+  try {
+    await backend.connect()
+    printSessions(await backend.listSessions(workspaceId))
   } finally {
     await backend.disconnect()
   }
@@ -169,6 +214,80 @@ async function attach(socketPath: string, sessionId: string, verbose: boolean): 
   }
 }
 
+async function steer(
+  socketPath: string,
+  sessionId: string,
+  text: string,
+  timeoutMs: number,
+  verbose: boolean,
+): Promise<void> {
+  const backend = new SocketBackend(socketPath)
+  let handle: Awaited<ReturnType<SocketBackend['openSession']>> | undefined
+  let off: (() => void) | undefined
+  try {
+    await backend.connect()
+    handle = await backend.openSession(sessionId)
+    if (handle.snapshot().status !== 'running') {
+      throw new DshellError(
+        'BAD_REQUEST',
+        'steer needs a running turn; use prompt for a new turn',
+        'Run `dshell prompt <sessionId> <text...>` instead.',
+      )
+    }
+    let lastSeq = handle.snapshot().cursor
+    let settle: (() => void) | undefined
+    const ended = new Promise<void>((resolve) => {
+      settle = resolve
+    })
+    let asking = false
+    const askApproval = async (view: SessionView): Promise<void> => {
+      const pending = view.pendingApproval
+      if (pending === undefined || asking) return
+      asking = true
+      try {
+        if (!input.isTTY) {
+          console.error(`[approval] ${pending.toolName}: no TTY; rejecting (fail closed)`)
+          await handle?.answerApproval(pending.requestId, 'rejected')
+          return
+        }
+        const rl = createInterface({ input, output })
+        try {
+          const answer = await rl.question(
+            `\n[approval] ${pending.toolName}${pending.reason === undefined ? '' : `: ${pending.reason}`} [a]llow once / [r]eject: `,
+          )
+          await handle?.answerApproval(
+            pending.requestId,
+            answer.trim().toLowerCase().startsWith('a') ? 'allowed-once' : 'rejected',
+          )
+        } finally {
+          rl.close()
+        }
+      } catch (error) {
+        console.error(`[approval] ${error instanceof Error ? error.message : String(error)}`)
+      } finally {
+        asking = false
+      }
+    }
+
+    off = handle.subscribe((view) => {
+      for (const event of view.events) {
+        if (event.seq <= lastSeq) continue
+        printEvent(event, verbose)
+        lastSeq = event.seq
+        if (isTurnEnd(event)) settle?.()
+      }
+      if (view.pendingApproval !== undefined) void askApproval(view)
+    })
+    const receipt = await handle.send(text, { mode: 'steer' })
+    console.log(`[steered] ${receipt.requestId}`)
+    await withTimeout(ended, timeoutMs, `steer did not finish within ${timeoutMs}ms`)
+  } finally {
+    off?.()
+    handle?.dispose()
+    await backend.disconnect()
+  }
+}
+
 async function prompt(
   socketPath: string,
   sessionId: string,
@@ -191,6 +310,36 @@ async function prompt(
       fail = reject
     })
 
+    let asking = false
+    const askApproval = async (view: SessionView): Promise<void> => {
+      const pending = view.pendingApproval
+      if (pending === undefined || asking) return
+      asking = true
+      try {
+        if (!input.isTTY) {
+          console.error(`[approval] ${pending.toolName}: no TTY; rejecting (fail closed)`)
+          await handle?.answerApproval(pending.requestId, 'rejected')
+          return
+        }
+        const rl = createInterface({ input, output })
+        try {
+          const answer = await rl.question(
+            `\n[approval] ${pending.toolName}${pending.reason === undefined ? '' : `: ${pending.reason}`} [a]llow once / [r]eject: `,
+          )
+          await handle?.answerApproval(
+            pending.requestId,
+            answer.trim().toLowerCase().startsWith('a') ? 'allowed-once' : 'rejected',
+          )
+        } finally {
+          rl.close()
+        }
+      } catch (error) {
+        console.error(`[approval] ${error instanceof Error ? error.message : String(error)}`)
+      } finally {
+        asking = false
+      }
+    }
+
     off = handle.subscribe((view) => {
       for (const event of view.events) {
         if (event.seq <= lastSeq) continue
@@ -198,6 +347,7 @@ async function prompt(
         lastSeq = event.seq
         if (isTurnEnd(event)) settle?.(event)
       }
+      if (view.pendingApproval !== undefined) void askApproval(view)
       if (verbose && view.status !== 'unknown') console.log(`[status] ${view.status}`)
     })
 
@@ -247,8 +397,22 @@ export async function main(argv: string[]): Promise<void> {
         process.exitCode = await runDoctor(socketPath)
         return
       case 'list':
-        await list(socketPath)
+      case 'sessions':
+        await list(socketPath, options.args[0])
         return
+      case 'workspaces':
+        await workspaces(socketPath)
+        return
+      case 'new': {
+        await newSession(socketPath, options.args[0])
+        return
+      }
+      case 'cancel': {
+        const sessionId = options.args[0]
+        if (sessionId === undefined) throw new DshellError('BAD_REQUEST', 'cancel requires a sessionId')
+        await cancel(socketPath, sessionId)
+        return
+      }
       case 'attach': {
         const sessionId = options.args[0]
         if (sessionId === undefined) throw new DshellError('BAD_REQUEST', 'attach requires a sessionId')
@@ -262,6 +426,15 @@ export async function main(argv: string[]): Promise<void> {
           throw new DshellError('BAD_REQUEST', 'prompt requires <sessionId> <text...>')
         }
         await prompt(socketPath, sessionId, text, options.timeoutMs, options.verbose)
+        return
+      }
+      case 'steer': {
+        const sessionId = options.args[0]
+        const text = options.args.slice(1).join(' ')
+        if (sessionId === undefined || text.length === 0) {
+          throw new DshellError('BAD_REQUEST', 'steer requires <sessionId> <text...>')
+        }
+        await steer(socketPath, sessionId, text, options.timeoutMs, options.verbose)
         return
       }
       default:

@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto'
 import { DshellError, HostConnection } from '../client/socket-client.js'
 import type {
   AttachedMessage,
+  ErrorMessage,
   ServerMessage,
+  SessionCreatedMessage,
   SessionEvent,
   SessionHeader,
   SessionsMessage,
@@ -53,12 +55,12 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     attach: has('attach'),
     prompt: has('prompt'),
     streaming: has('stream'),
-    workspaces: has('list'),
-    createSession: false,
-    cancel: false,
-    steer: false,
-    paging: false,
-    approvals: false,
+    workspaces: has('workspaces'),
+    createSession: has('create-session'),
+    cancel: has('cancel'),
+    steer: has('steer'),
+    paging: has('history'),
+    approvals: has('approval'),
   }
 }
 
@@ -102,7 +104,7 @@ export class SocketBackend implements DshellBackend {
 
   async listSessions(workspaceId?: string): Promise<SessionSummary[]> {
     const connection = this.requireControl()
-    connection.send({ type: 'list' })
+    connection.send({ type: 'session/list' })
     let message: SessionsMessage
     try {
       message = await connection.waitFor<SessionsMessage>(
@@ -113,44 +115,48 @@ export class SocketBackend implements DshellBackend {
       throw mapError(error)
     }
     const sessions = message.sessions.map((session) => ({
-      sessionId: session.sessionId,
-      cwd: session.cwd,
-      createdAt: session.createdAt,
-      live: session.live,
-      persisted: session.persisted,
-      status: session.live === true ? 'running' : 'idle',
+      ...session,
+      status: session.status ?? (session.live === true ? 'running' : 'idle'),
     }))
     if (workspaceId === undefined) return sessions
-    return sessions.filter((session) => workspaceIdFor(session.cwd) === workspaceId)
+    return sessions.filter((session) => session.workspaceId === workspaceId)
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
-    const sessions = await this.listSessions()
-    const byPath = new Map<string, WorkspaceSummary>()
-    for (const session of sessions) {
-      const cwd = session.cwd
-      if (cwd === undefined) continue
-      const existing = byPath.get(cwd)
-      if (existing !== undefined) {
-        existing.sessionIds?.push(session.sessionId)
-        continue
-      }
-      byPath.set(cwd, {
-        id: `workspace:${cwd}`,
-        path: cwd,
-        title: cwd.split('/').filter(Boolean).at(-1) ?? cwd,
-        sessionIds: [session.sessionId],
-      })
+    const connection = this.requireControl()
+    connection.send({ type: 'workspaces' })
+    try {
+      const message = await connection.waitFor<{ type: 'workspaces'; workspaces: WorkspaceSummary[] }>(
+        (candidate) => candidate.type === 'workspaces',
+        10_000,
+      )
+      return message.workspaces
+    } catch (error) {
+      throw mapError(error)
     }
-    return [...byPath.values()]
   }
 
-  async createSession(_options?: CreateSessionOptions): Promise<SessionHandle> {
-    throw new BackendError(
-      'UNSUPPORTED_CAPABILITY',
-      'this Host cannot create sessions from dshell yet',
-      'Create the session in the Web UI, then run dshell list.',
-    )
+  async createSession(options: CreateSessionOptions = {}): Promise<SessionHandle> {
+    const connection = this.requireControl()
+    connection.send({
+      type: 'session/create',
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
+      ...(options.title === undefined ? {} : { title: options.title }),
+    })
+    let created: SessionCreatedMessage | ErrorMessage
+    try {
+      created = await connection.waitFor<SessionCreatedMessage | ErrorMessage>(
+        (candidate) => candidate.type === 'session-created' || candidate.type === 'error',
+        60_000,
+      )
+    } catch (error) {
+      throw mapError(error)
+    }
+    if (created.type === 'error') {
+      throw new BackendError(created.code, created.message, created.action)
+    }
+    return this.openSession(created.sessionId)
   }
 
   async openSession(sessionId: string): Promise<SessionHandle> {
@@ -180,10 +186,6 @@ export class SocketBackend implements DshellBackend {
   }
 }
 
-function workspaceIdFor(cwd: string | undefined): string | undefined {
-  return cwd === undefined ? undefined : `workspace:${cwd}`
-}
-
 export class SocketSessionHandle implements SessionHandle {
   readonly id: string
   header: SessionHeader = { id: '' }
@@ -196,6 +198,12 @@ export class SocketSessionHandle implements SessionHandle {
   private status: SessionView['status'] = 'unknown'
   private streamText = ''
   private pendingApproval: SessionView['pendingApproval']
+  private pendingHistory: {
+    resolve: (hasMore: boolean) => void
+    reject: (error: Error) => void
+  } | null = null
+  private pendingApprovalAnswer: string | null = null
+  private hasMoreHistory = true
   private ready = false
   private disposed = false
   private off: (() => void) | null = null
@@ -274,24 +282,38 @@ export class SocketSessionHandle implements SessionHandle {
   }
 
   async cancel(): Promise<void> {
-    throw new BackendError(
-      'UNSUPPORTED_CAPABILITY',
-      'this Host does not support cancel over the dshell protocol yet',
-    )
+    this.assertOpen()
+    this.connection.send({ type: 'session/cancel', sessionId: this.id })
   }
 
-  async loadOlder(): Promise<boolean> {
-    throw new BackendError(
-      'UNSUPPORTED_CAPABILITY',
-      'this Host does not support history paging over the dshell protocol yet',
-    )
+  async loadOlder(limit = 50): Promise<boolean> {
+    this.assertOpen()
+    if (!this.hasMoreHistory) return false
+    const oldest = this.events[0]?.seq
+    if (oldest === undefined) return false
+    if (this.pendingHistory !== null) {
+      throw new BackendError('BAD_REQUEST', 'a history page is already loading')
+    }
+    const result = new Promise<boolean>((resolve, reject) => {
+      this.pendingHistory = { resolve, reject }
+    })
+    this.connection.send({ type: 'session/history', sessionId: this.id, before: oldest, limit })
+    return await withTimeout(result, 10_000, 'timed out loading older history')
   }
 
-  async answerApproval(): Promise<void> {
-    throw new BackendError(
-      'UNSUPPORTED_CAPABILITY',
-      'this Host does not support approval answers over the dshell protocol yet',
-    )
+  async answerApproval(
+    requestId: string,
+    outcome: 'allowed-once' | 'rejected',
+  ): Promise<void> {
+    this.assertOpen()
+    if (this.pendingApproval?.requestId !== requestId) {
+      throw new BackendError('APPROVAL_NOT_PENDING', `approval "${requestId}" is not pending`)
+    }
+    if (this.pendingApprovalAnswer !== null) {
+      throw new BackendError('BAD_REQUEST', 'an approval answer is already pending')
+    }
+    this.pendingApprovalAnswer = requestId
+    this.connection.send({ type: 'approval/answer', requestId, outcome })
   }
 
   dispose(): void {
@@ -355,7 +377,37 @@ export class SocketSessionHandle implements SessionHandle {
     if (message.type === 'accepted' && message.sessionId === this.id) {
       const pending = this.pendingAccepted
       this.pendingAccepted = null
-      pending?.resolve({ requestId: message.requestId })
+      pending?.resolve({ requestId: message.requestId, mode: message.mode })
+      return
+    }
+    if (message.type === 'history' && message.sessionId === this.id) {
+      const known = new Set(this.events.map((event) => event.seq))
+      const older = message.events.filter((event) => !known.has(event.seq))
+      this.events.unshift(...older)
+      this.events.sort((left, right) => left.seq - right.seq)
+      this.hasMoreHistory = message.hasMore
+      const pending = this.pendingHistory
+      this.pendingHistory = null
+      pending?.resolve(message.hasMore)
+      this.emit()
+      return
+    }
+    if (message.type === 'approval-request' && message.sessionId === this.id) {
+      this.pendingApproval = {
+        requestId: message.requestId,
+        sessionId: message.sessionId,
+        toolName: message.toolName,
+        ...(message.callId === undefined ? {} : { callId: message.callId }),
+        ...(message.reason === undefined ? {} : { reason: message.reason }),
+      }
+      this.status = 'running'
+      this.emit()
+      return
+    }
+    if (message.type === 'approval-resolved' && message.sessionId === this.id) {
+      if (this.pendingApproval?.requestId === message.requestId) this.pendingApproval = undefined
+      this.pendingApprovalAnswer = null
+      this.emit()
       return
     }
     if (message.type === 'error') {
@@ -372,15 +424,9 @@ export class SocketSessionHandle implements SessionHandle {
     if (event.type === 'turn/start') this.status = 'running'
     if (event.type === 'turn/end' || event.type === 'turn/failed') this.status = 'idle'
     if (event.type === 'assistant/message') this.streamText = ''
-    if (event.type === 'approval/asked') {
-      this.pendingApproval = {
-        requestId: String(data.id ?? `approval-${event.seq}`),
-        sessionId: this.id,
-        toolName: String(data.toolName ?? 'tool'),
-        ...(typeof data.callId === 'string' ? { callId: data.callId } : {}),
-        ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
-      }
-    }
+    // Only the Host's `approval-request` message carries an answerable id.
+    // The durable `approval/asked` event has its own id and may be replayed
+    // from history; using it would send an answer for an already-dead request.
     if (event.type === 'approval/decided') this.pendingApproval = undefined
   }
 

@@ -4,11 +4,24 @@ import { test } from 'node:test'
 import { CAPABILITIES, PROTOCOL_VERSION } from '../dist/protocol/index.js'
 import { defaultSocketPath, resolveSocketPath } from '../dist/shared/paths.js'
 
-test('protocol v1 advertises the P1 capabilities', () => {
-  assert.equal(PROTOCOL_VERSION, 1)
+test('protocol v2 advertises the P3 capabilities', () => {
+  assert.equal(PROTOCOL_VERSION, 2)
   assert.deepEqual(
     [...CAPABILITIES],
-    ['list', 'attach', 'prompt', 'event', 'stream', 'status'],
+    [
+      'list',
+      'attach',
+      'prompt',
+      'event',
+      'stream',
+      'status',
+      'workspaces',
+      'create-session',
+      'history',
+      'cancel',
+      'steer',
+      'approval',
+    ],
   )
 })
 

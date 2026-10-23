@@ -1,4 +1,4 @@
-import type { AttachedMessage, SessionEvent, SessionSummary } from '../protocol/index.js'
+import type { AttachedMessage, SessionEvent, SessionSummary, WorkspaceSummary } from '../protocol/index.js'
 
 type JsonObject = Record<string, any>
 
@@ -117,6 +117,17 @@ export function printSessions(sessions: SessionSummary[]): void {
   for (const session of sessions) {
     const live = session.live === true ? 'live' : 'cold'
     console.log(`${session.sessionId}  ${live.padEnd(4)}  ${session.cwd ?? ''}`)
+  }
+}
+
+export function printWorkspaces(workspaces: WorkspaceSummary[]): void {
+  if (workspaces.length === 0) {
+    console.log('No workspaces. Create one with a session in the dsh Web UI, or run `dshell new <cwd>`.')
+    return
+  }
+  for (const workspace of workspaces) {
+    const count = workspace.sessionIds?.length ?? 0
+    console.log(`${workspace.id}  ${String(count).padStart(2)} sessions  ${workspace.title}  ${workspace.path}`)
   }
 }
 

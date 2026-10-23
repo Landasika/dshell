@@ -69,15 +69,23 @@ test('SocketBackend maps list, attach, prompt, and stream over a Unix socket', a
     if (message.type === 'hello') {
       write(socket, {
         type: 'welcome',
-        protocol: 1,
+        protocol: 2,
         pluginVersion: 'test',
         dshVersion: 'test',
-        capabilities: ['list', 'attach', 'prompt', 'event', 'stream', 'status'],
+        capabilities: ['list', 'attach', 'prompt', 'event', 'stream', 'status', 'workspaces', 'history', 'cancel', 'steer', 'approval'],
         socketPath: 'test.sock',
         sessions: [],
       })
-    } else if (message.type === 'list') {
+    } else if (message.type === 'session/list' || message.type === 'list') {
       write(socket, { type: 'sessions', sessions: [{ sessionId: 's1', live: true, cwd: '/work' }] })
+    } else if (message.type === 'workspaces') {
+      write(socket, { type: 'workspaces', workspaces: [{ id: 'workspace:/work', path: '/work', title: 'work' }] })
+    } else if (message.type === 'session/create') {
+      write(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this host cannot create sessions',
+      })
     } else if (message.type === 'attach') {
       write(socket, {
         type: 'attached',
@@ -141,17 +149,122 @@ test('SocketBackend maps list, attach, prompt, and stream over a Unix socket', a
   await backend.disconnect()
 })
 
+
+test('SocketBackend supports history paging, steer, cancel, and approvals', async (t) => {
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') {
+      write(socket, {
+        type: 'welcome',
+        protocol: 2,
+        pluginVersion: 'test',
+        dshVersion: 'test',
+        capabilities: ['list', 'attach', 'prompt', 'event', 'stream', 'status', 'workspaces', 'create-session', 'history', 'cancel', 'steer', 'approval'],
+        socketPath: 'test.sock',
+        sessions: [],
+      })
+    } else if (message.type === 'attach') {
+      write(socket, {
+        type: 'attached',
+        sessionId: message.sessionId,
+        header: { id: message.sessionId, cwd: '/work' },
+        cursor: 6,
+        events: [
+          { type: 'assistant/message', seq: 5, data: { message: { content: [{ type: 'text', text: 'newer' }] } } },
+          { type: 'turn/end', seq: 6, data: { reason: { kind: 'completed' } } },
+        ],
+      })
+    } else if (message.type === 'session/create') {
+      write(socket, {
+        type: 'session-created',
+        sessionId: 'created-1',
+        header: { id: 'created-1', cwd: message.cwd ?? '/work' },
+        workspaceId: 'workspace:/work',
+      })
+    } else if (message.type === 'session/history') {
+      write(socket, {
+        type: 'history',
+        sessionId: message.sessionId,
+        events: [{ type: 'user/message', seq: 4, data: { message: { content: [{ type: 'text', text: 'older' }] } } }],
+        cursor: 4,
+        hasMore: false,
+      })
+    } else if (message.type === 'prompt') {
+      write(socket, {
+        type: 'accepted',
+        sessionId: message.sessionId,
+        requestId: 'steer-1',
+        mode: message.mode ?? 'queue',
+      })
+      write(socket, {
+        type: 'approval-request',
+        sessionId: message.sessionId,
+        requestId: 'approval-1',
+        toolName: 'bash',
+        reason: 'test approval',
+      })
+    } else if (message.type === 'approval/answer') {
+      write(socket, {
+        type: 'approval-resolved',
+        sessionId: 's1',
+        requestId: message.requestId,
+        outcome: message.outcome,
+        source: 'cli',
+      })
+    } else if (message.type === 'session/cancel') {
+      write(socket, { type: 'cancelled', sessionId: message.sessionId })
+    }
+  })
+  t.after(server.close)
+
+  const backend = new SocketBackend(server.socketPath)
+  await backend.connect()
+  assert.equal(backend.capabilities().paging, true)
+  assert.equal(backend.capabilities().approvals, true)
+
+  const created = await backend.createSession({ cwd: '/work/new' })
+  assert.equal(created.id, 'created-1')
+  assert.equal(created.header.id, 'created-1')
+  created.dispose()
+
+  const handle = await backend.openSession('s1')
+  assert.equal(await handle.loadOlder(), false)
+  assert.equal(handle.snapshot().events[0].seq, 4)
+
+  const receipt = await handle.send('steer me', { mode: 'steer' })
+  assert.equal(receipt.mode, 'steer')
+  for (let index = 0; index < 50 && handle.snapshot().pendingApproval === undefined; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const pending = handle.snapshot().pendingApproval
+  assert.equal(pending?.requestId, 'approval-1')
+  await handle.answerApproval('approval-1', 'allowed-once')
+  for (let index = 0; index < 50 && handle.snapshot().pendingApproval !== undefined; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(handle.snapshot().pendingApproval, undefined)
+
+  await handle.cancel()
+  handle.dispose()
+  await backend.disconnect()
+})
+
 test('SocketBackend reports unsupported capabilities clearly', async (t) => {
   const server = await socketServer((message, socket) => {
     if (message.type === 'hello') {
       write(socket, {
         type: 'welcome',
-        protocol: 1,
+        protocol: 2,
         pluginVersion: 'test',
         dshVersion: 'test',
         capabilities: ['list', 'attach', 'prompt'],
         socketPath: 'test.sock',
         sessions: [],
+      })
+    } else if (message.type === 'session/create') {
+      write(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this host cannot create sessions',
       })
     }
   })

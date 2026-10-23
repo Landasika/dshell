@@ -7,20 +7,33 @@ import { createInterface } from 'node:readline'
 import {
   CAPABILITIES,
   PROTOCOL_VERSION,
+  type ApprovalRequestMessage,
+  type ApprovalResolvedMessage,
   type Capability,
-  type DshellErrorCode,
   type ErrorMessage,
+  type HistoryMessage,
+  type SessionCreatedMessage,
   type SessionEvent,
   type SessionHeader,
   type SessionSummary,
+  type WorkspaceSummary,
 } from '../protocol/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
 
 export const name = 'dshell-host'
-export const inject = ['agents', 'sessions', 'sessionQuery', 'agentPresets', 'agentDefaultModel']
+export const inject = [
+  'agents',
+  'sessions',
+  'sessionQuery',
+  'workspaceRegistry',
+  'agentPresets',
+  'agentDefaultModel',
+]
 
 export interface Config {
   socketPath?: string
+  /** Hard fail-closed deadline for an unanswered CLI approval. */
+  approvalTimeoutMs?: number
 }
 
 interface UserMessageLike {
@@ -34,6 +47,8 @@ interface AgentLike {
   id: string
   session: { id: string }
   followup(message: UserMessageLike): void
+  steer(message: UserMessageLike): void
+  cancel(cause: { kind: 'user' }): void
 }
 
 interface AgentHandleLike {
@@ -77,6 +92,28 @@ interface SessionQueryLike {
   observeSession(sessionId: string, options?: { projectionMode?: 'all' | 'none' }): Promise<SessionObservationLike>
 }
 
+interface WorkspaceLike {
+  id: string
+  path: string
+  title: string
+  sessionIds?: readonly string[]
+  attachSession?(sessionId: string): Promise<void>
+}
+
+interface WorkspaceRegistryLike {
+  list(): WorkspaceLike[]
+  get(id: string): WorkspaceLike | undefined
+  create(path: string, title?: string): Promise<WorkspaceLike>
+}
+
+interface ApprovalRequestLike {
+  agent: AgentLike
+  toolName: string
+  callId?: string
+  reason?: string
+  signal?: AbortSignal
+}
+
 interface AgentPresetLike {
   id: string
 }
@@ -93,17 +130,28 @@ interface AgentDefaultModelLike {
 interface PluginContext {
   agents: {
     get(sessionId: string): AgentLike | undefined
+    list(): AgentLike[]
     resume(options: {
       resumeSessionId: string
+      agentOptions?: Record<string, unknown>
+      setup?: (agentCtx: unknown) => Promise<void>
+    }): Promise<AgentHandleLike>
+    create(options: {
+      sessionId: string
+      meta?: {
+        cwd?: string
+        agentPreset?: string
+      }
       agentOptions?: Record<string, unknown>
       setup?: (agentCtx: unknown) => Promise<void>
     }): Promise<AgentHandleLike>
   }
   sessions: unknown
   sessionQuery: SessionQueryLike
+  workspaceRegistry?: WorkspaceRegistryLike
   agentPresets?: AgentPresetRegistryLike
   agentDefaultModel?: AgentDefaultModelLike
-  on(event: string, listener: (...args: any[]) => void): () => void
+  on(event: string, listener: (...args: any[]) => void, options?: { global?: boolean; prepend?: boolean }): () => void
   effect(setup: () => void | (() => void | Promise<void>)): void
 }
 
@@ -162,7 +210,12 @@ function mappedError(error: unknown): ErrorMessage {
 }
 
 function jsonLine(socket: Socket, message: unknown): void {
-  if (!socket.destroyed) socket.write(`${JSON.stringify(message)}\n`)
+  if (socket.destroyed || !socket.writable) return
+  try {
+    socket.write(`${JSON.stringify(message)}\n`)
+  } catch {
+    // The peer may reset between the writable check and the write.
+  }
 }
 
 function canConnect(socketPath: string, timeoutMs = 300): Promise<boolean> {
@@ -237,22 +290,50 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   await prepareSocketPath(socketPath)
 
   const clients = new Set<Socket>()
-  const attached = new Map<Socket, string>()
+  const watched = new Map<Socket, Set<string>>()
   const handles = new Map<string, AgentHandleLike>()
   const resuming = new Map<string, Promise<AgentHandleLike>>()
   const queues = new WeakMap<Socket, Promise<void>>()
+  const pendingApprovals = new Map<string, {
+    sessionId: string
+    resolve: (outcome: string) => void
+    timer: NodeJS.Timeout
+  }>()
+  const approvalTimeoutMs = config.approvalTimeoutMs ?? 120_000
   let closing = false
 
-  const listSessions = async (): Promise<SessionSummary[]> => {
-    const records = await ctx.sessionQuery.listSessions()
-    return records.map((record) => ({
-      sessionId: record.header.id,
-      cwd: record.header.cwd,
-      createdAt: record.header.createdAt,
-      live: record.live,
-      persisted: record.persisted,
-      formatStatus: record.formatStatus,
+  const workspaceList = (): WorkspaceSummary[] => {
+    const registry = ctx.workspaceRegistry
+    if (registry === undefined) return []
+    return registry.list().map((workspace) => ({
+      id: workspace.id,
+      path: workspace.path,
+      title: workspace.title,
+      sessionIds: [...(workspace.sessionIds ?? [])],
     }))
+  }
+
+  const listSessions = async (workspaceId?: string): Promise<SessionSummary[]> => {
+    const records = await ctx.sessionQuery.listSessions()
+    const workspaces = workspaceList()
+    const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
+    return records
+      .map((record) => {
+        const workspace = record.header.cwd === undefined
+          ? undefined
+          : workspaceByPath.get(record.header.cwd)
+        return {
+          sessionId: record.header.id,
+          cwd: record.header.cwd,
+          createdAt: record.header.createdAt,
+          live: record.live,
+          persisted: record.persisted,
+          formatStatus: record.formatStatus,
+          ...(workspace === undefined ? {} : { workspaceId: workspace.id }),
+          status: record.live ? 'running' : 'idle',
+        }
+      })
+      .filter((session) => workspaceId === undefined || session.workspaceId === workspaceId)
   }
 
   const composeAgent = async (presetId: string | undefined): Promise<{
@@ -309,6 +390,39 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     jsonLine(socket, error)
   }
 
+  const watch = (socket: Socket, sessionId: string): Set<string> => {
+    let sessions = watched.get(socket)
+    if (sessions === undefined) {
+      sessions = new Set()
+      watched.set(socket, sessions)
+    }
+    sessions.add(sessionId)
+    return sessions
+  }
+
+  const unwatch = (socket: Socket, sessionId?: string): void => {
+    if (sessionId === undefined) {
+      watched.delete(socket)
+      return
+    }
+    const sessions = watched.get(socket)
+    if (sessions === undefined) return
+    sessions.delete(sessionId)
+    if (sessions.size === 0) watched.delete(socket)
+  }
+
+  const watchersFor = (sessionId: string): Socket[] => {
+    const result: Socket[] = []
+    for (const [socket, sessions] of watched) {
+      if (!socket.destroyed && sessions.has(sessionId)) result.push(socket)
+    }
+    return result
+  }
+
+  const broadcast = (sessionId: string, message: unknown): void => {
+    for (const socket of watchersFor(sessionId)) jsonLine(socket, message)
+  }
+
   const attach = async (socket: Socket, sessionId: unknown): Promise<void> => {
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       sendError(socket, {
@@ -320,15 +434,121 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
 
     if (socket.destroyed) return
-    const snapshot = await ctx.sessionQuery.readSession(sessionId)
-    attached.set(socket, sessionId)
+    // Subscribe before reading: an event emitted between the read and the
+    // subscription would otherwise be lost. The client buffers messages
+    // until `attached`, then dedupes them by seq.
+    watch(socket, sessionId)
+    let snapshot
+    try {
+      snapshot = await ctx.sessionQuery.readSession(sessionId)
+    } catch (error) {
+      unwatch(socket, sessionId)
+      throw error
+    }
     jsonLine(socket, {
       type: 'attached',
       sessionId,
       header: snapshot.session,
-      cursor: snapshot.events.at(-1)?.seq ?? 0,
+      cursor: snapshot.events.at(-1)?.seq ?? -1,
       events: snapshot.events,
     })
+  }
+
+  const history = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'session/history requires a sessionId' })
+      return
+    }
+    const snapshot = await ctx.sessionQuery.readSession(message.sessionId)
+    const limit = typeof message.limit === 'number' && Number.isFinite(message.limit)
+      ? Math.min(200, Math.max(1, Math.floor(message.limit)))
+      : 50
+    const before = typeof message.before === 'number' && Number.isFinite(message.before)
+      ? message.before
+      : undefined
+    const end = before === undefined
+      ? snapshot.events.length
+      : snapshot.events.findIndex((event) => event.seq >= before)
+    const safeEnd = end === -1 ? snapshot.events.length : end
+    const start = Math.max(0, safeEnd - limit)
+    const events = snapshot.events.slice(start, safeEnd)
+    const reply: HistoryMessage = {
+      type: 'history',
+      sessionId: message.sessionId,
+      events,
+      cursor: events[0]?.seq ?? -1,
+      hasMore: start > 0,
+    }
+    jsonLine(socket, reply)
+  }
+
+  const createWorkspace = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const registry = ctx.workspaceRegistry
+    if (registry === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host has no workspace registry',
+      })
+      return
+    }
+    if (typeof message.path !== 'string' || message.path.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'workspace/create requires a path' })
+      return
+    }
+    await registry.create(message.path, typeof message.title === 'string' ? message.title : undefined)
+    jsonLine(socket, { type: 'workspaces', workspaces: workspaceList() })
+  }
+
+  const createSession = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const registry = ctx.workspaceRegistry
+    if (registry === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host has no workspace registry, so dshell cannot create a session',
+        action: 'Create the session in the Web UI, then run dshell list.',
+      })
+      return
+    }
+
+    let workspace: WorkspaceLike | undefined
+    if (typeof message.workspaceId === 'string' && message.workspaceId.length > 0) {
+      workspace = registry.get(message.workspaceId)
+      if (workspace === undefined) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: `unknown workspace: ${message.workspaceId}` })
+        return
+      }
+    } else {
+      const cwd = typeof message.cwd === 'string' && message.cwd.length > 0
+        ? message.cwd
+        : process.cwd()
+      workspace = await registry.create(cwd, typeof message.title === 'string' ? message.title : undefined)
+    }
+
+    const composition = await composeAgent(undefined)
+    const agentOptions = ctx.agentDefaultModel?.currentSelection()
+    const sessionId = `session-${randomUUID()}`
+    const handle = await ctx.agents.create({
+      sessionId,
+      meta: {
+        cwd: workspace.path,
+        ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
+      },
+      ...(agentOptions === undefined ? {} : { agentOptions }),
+      ...(composition.setup === undefined ? {} : { setup: composition.setup }),
+    })
+    handles.set(sessionId, handle)
+    await workspace.attachSession?.(sessionId).catch(() => undefined)
+    watch(socket, sessionId)
+    const snapshot = await ctx.sessionQuery.readSession(sessionId)
+    const reply: SessionCreatedMessage = {
+      type: 'session-created',
+      sessionId,
+      header: snapshot.session,
+      workspaceId: workspace.id,
+    }
+    jsonLine(socket, reply)
   }
 
   const prompt = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
@@ -348,7 +568,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    if (message.mode !== undefined && message.mode !== 'queue') {
+    const mode = message.mode === undefined ? 'queue' : message.mode
+    if (mode !== 'queue' && mode !== 'steer') {
       sendError(socket, {
         type: 'error',
         code: 'BAD_REQUEST',
@@ -360,7 +581,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (socket.destroyed) return
     const agent = await liveAgent(message.sessionId)
     if (socket.destroyed) return
-    attached.set(socket, message.sessionId)
+    watch(socket, message.sessionId)
     const requestId = typeof message.requestId === 'string' && message.requestId.length > 0
       ? message.requestId
       : `dshell-${randomUUID()}`
@@ -371,15 +592,81 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       type: 'accepted',
       sessionId: message.sessionId,
       requestId,
-      mode: 'queue',
+      mode,
     })
 
-    agent.followup({
+    const userMessage: UserMessageLike = {
       id: requestId,
       role: 'user',
       content: [{ type: 'text', text: message.text }],
       source: { kind: 'user' },
+    }
+    if (mode === 'steer') agent.steer(userMessage)
+    else agent.followup(userMessage)
+  }
+
+  const cancel = (socket: Socket, message: Record<string, unknown>): void => {
+    if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'session/cancel requires a sessionId' })
+      return
+    }
+    const agent = ctx.agents.get(message.sessionId)
+    if (agent !== undefined) agent.cancel({ kind: 'user' })
+    jsonLine(socket, {
+      type: 'cancelled',
+      sessionId: message.sessionId,
+      ...(typeof message.requestId === 'string' ? { requestId: message.requestId } : {}),
     })
+  }
+
+  const settleApproval = (
+    requestId: string,
+    outcome: string,
+    source: 'cli' | 'other' | 'timeout' | 'disconnect',
+  ): boolean => {
+    const pending = pendingApprovals.get(requestId)
+    if (pending === undefined) return false
+    clearTimeout(pending.timer)
+    pendingApprovals.delete(requestId)
+    const resolved: ApprovalResolvedMessage = {
+      type: 'approval-resolved',
+      sessionId: pending.sessionId,
+      requestId,
+      outcome,
+      source,
+    }
+    broadcast(pending.sessionId, resolved)
+    pending.resolve(outcome)
+    return true
+  }
+
+  const answerApproval = (socket: Socket, message: Record<string, unknown>): void => {
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'approval/answer requires requestId' })
+      return
+    }
+    if (message.outcome !== 'allowed-once' && message.outcome !== 'rejected') {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'approval outcome must be allowed-once or rejected' })
+      return
+    }
+    const pending = pendingApprovals.get(message.requestId)
+    if (pending === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'APPROVAL_NOT_PENDING',
+        message: `approval "${message.requestId}" is not pending`,
+      })
+      return
+    }
+    if (watched.get(socket)?.has(pending.sessionId) !== true) {
+      sendError(socket, {
+        type: 'error',
+        code: 'BAD_REQUEST',
+        message: 'this client is not watching the approval session',
+      })
+      return
+    }
+    settleApproval(message.requestId, message.outcome, 'cli')
   }
 
   const handleLine = async (socket: Socket, line: string): Promise<void> => {
@@ -403,7 +690,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
               type: 'error',
               code: 'PROTOCOL_MISMATCH',
               message: `protocol ${String(message.protocol)} is not supported; expected ${PROTOCOL_VERSION}`,
-              action: 'Update the dshell CLI or the dshell-host plugin so both use protocol 1.',
+              action: 'Update the dshell CLI or the dshell-host plugin so both use protocol 2.',
             })
             return
           }
@@ -415,6 +702,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             capabilities: [...CAPABILITIES] as Capability[],
             socketPath,
             sessions: await listSessions(),
+            workspaces: workspaceList(),
           })
           return
         }
@@ -422,17 +710,48 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           jsonLine(socket, { type: 'pong', time: Date.now() })
           return
         case 'list':
-          jsonLine(socket, { type: 'sessions', sessions: await listSessions() })
+        case 'session/list':
+          jsonLine(socket, {
+            type: 'sessions',
+            sessions: await listSessions(typeof message.workspaceId === 'string' ? message.workspaceId : undefined),
+          })
+          return
+        case 'workspaces':
+          jsonLine(socket, { type: 'workspaces', workspaces: workspaceList() })
+          return
+        case 'workspace/create':
+          await createWorkspace(socket, message)
+          return
+        case 'session/create':
+          await createSession(socket, message)
+          return
+        case 'session/history':
+          await history(socket, message)
           return
         case 'attach':
           await attach(socket, message.sessionId)
           return
+        case 'watch':
+          if (typeof message.sessionId === 'string') watch(socket, message.sessionId)
+          return
+        case 'unwatch':
+          unwatch(socket, typeof message.sessionId === 'string' ? message.sessionId : undefined)
+          return
         case 'detach':
-          attached.delete(socket)
-          jsonLine(socket, { type: 'detached' })
+          unwatch(socket, typeof message.sessionId === 'string' ? message.sessionId : undefined)
+          jsonLine(socket, {
+            type: 'detached',
+            ...(typeof message.sessionId === 'string' ? { sessionId: message.sessionId } : {}),
+          })
           return
         case 'prompt':
           await prompt(socket, message)
+          return
+        case 'session/cancel':
+          cancel(socket, message)
+          return
+        case 'approval/answer':
+          answerApproval(socket, message)
           return
         default:
           sendError(socket, {
@@ -457,20 +776,27 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
   }
 
+  const cleanupSocket = (socket: Socket): void => {
+    clients.delete(socket)
+    unwatch(socket)
+    queues.delete(socket)
+    for (const [requestId, pending] of [...pendingApprovals]) {
+      if (watchersFor(pending.sessionId).length === 0) {
+        settleApproval(requestId, 'unavailable', 'disconnect')
+      }
+    }
+  }
+
   const server = createServer((socket) => {
     clients.add(socket)
     socket.setEncoding('utf8')
     const lines = createInterface({ input: socket })
+    lines.on('error', () => cleanupSocket(socket))
     lines.on('line', (line) => {
       if (line.trim().length > 0) enqueue(socket, line)
     })
-    const cleanup = () => {
-      clients.delete(socket)
-      attached.delete(socket)
-      queues.delete(socket)
-    }
-    socket.on('close', cleanup)
-    socket.on('error', cleanup)
+    socket.on('close', () => cleanupSocket(socket))
+    socket.on('error', () => cleanupSocket(socket))
   })
 
   server.on('error', (error) => {
@@ -478,31 +804,72 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   })
 
   const disposeSessionEvent = ctx.on('session/event', (session: { id: string }, event: SessionEvent) => {
-    for (const [socket, sessionId] of attached) {
-      if (sessionId !== session.id) continue
-      jsonLine(socket, { type: 'event', sessionId, event })
-    }
+    broadcast(session.id, { type: 'event', sessionId: session.id, event })
   })
 
   const disposeAssistantStream = ctx.on('agent/assistant-stream', ({ agent, frame }: {
     agent: AgentLike
     frame: unknown
   }) => {
-    for (const [socket, sessionId] of attached) {
-      if (sessionId !== agent.id) continue
-      jsonLine(socket, { type: 'stream', sessionId, frame })
-    }
+    broadcast(agent.id, { type: 'stream', sessionId: agent.id, frame })
   })
 
   const disposeAgentStatus = ctx.on('agent/status', ({ agent, status }: {
     agent: AgentLike
     status: string
   }) => {
-    for (const [socket, sessionId] of attached) {
-      if (sessionId !== agent.id) continue
-      jsonLine(socket, { type: 'status', sessionId, status })
-    }
+    broadcast(agent.id, { type: 'status', sessionId: agent.id, status })
   })
+
+  const handleApproval = async (request: ApprovalRequestLike, next: () => Promise<string>): Promise<string> => {
+    const sessionId = request.agent.session.id
+    if (watchersFor(sessionId).length === 0) return next()
+
+    const requestId = `approval-${randomUUID()}`
+    let resolveCli!: (outcome: string) => void
+    const cli = new Promise<string>((resolve) => {
+      resolveCli = resolve
+    })
+    const timer = setTimeout(() => {
+      settleApproval(requestId, 'unavailable', 'timeout')
+    }, approvalTimeoutMs)
+    pendingApprovals.set(requestId, { sessionId, resolve: resolveCli, timer })
+    const onAbort = (): void => {
+      settleApproval(requestId, 'unavailable', 'disconnect')
+    }
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+    const requestMessage: ApprovalRequestMessage = {
+      type: 'approval-request',
+      sessionId,
+      requestId,
+      toolName: request.toolName,
+      ...(request.callId === undefined ? {} : { callId: request.callId }),
+      ...(request.reason === undefined ? {} : { reason: request.reason }),
+      expiresAt: Date.now() + approvalTimeoutMs,
+    }
+    broadcast(sessionId, requestMessage)
+
+    const other = Promise.resolve()
+      .then(() => next())
+      .then(
+        (outcome) => ({ source: 'other' as const, outcome }),
+        () => ({ source: 'other' as const, outcome: 'unavailable' }),
+      )
+    const winner = await Promise.race([
+      cli.then((outcome) => ({ source: 'cli' as const, outcome })),
+      other,
+    ])
+    request.signal?.removeEventListener('abort', onAbort)
+    if (winner.source === 'other' && pendingApprovals.has(requestId)) {
+      settleApproval(requestId, winner.outcome, 'other')
+    }
+    return winner.outcome
+  }
+
+  // Agent-scoped waterfalls filter ordinary listeners by context. A global
+  // listener is the supported way for the Host plugin to observe approvals
+  // for every Agent it owns without duplicating the Web answerer.
+  const disposeApproval = ctx.on('approval/request', handleApproval, { global: true, prepend: true })
 
   try {
     await listen(server, socketPath)
@@ -511,6 +878,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     disposeSessionEvent()
     disposeAssistantStream()
     disposeAgentStatus()
+    disposeApproval()
     await closeServer(server)
     throw error
   }
@@ -523,9 +891,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     disposeSessionEvent()
     disposeAssistantStream()
     disposeAgentStatus()
+    disposeApproval()
+    for (const requestId of [...pendingApprovals.keys()]) {
+      settleApproval(requestId, 'unavailable', 'disconnect')
+    }
     for (const socket of clients) socket.destroy()
     clients.clear()
-    attached.clear()
+    watched.clear()
     await closeServer(server)
     for (const handle of handles.values()) {
       await handle.dispose().catch(() => {})
