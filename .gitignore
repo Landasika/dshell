@@ -27,3 +27,6 @@ pnpm-debug.log*
 
 # P0 local test state (credentials, DSH_HOME)
 .p0/
+
+# Local package-manager caches
+.pnpm-store/

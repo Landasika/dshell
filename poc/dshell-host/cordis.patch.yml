@@ -1,0 +1,8 @@
+# Mount dshell-host next to the Web profile's existing rows.
+#
+# The plugin derives its socket from $DSH_HOME by default. Override
+# `socketPath` in the profile's cordis.patch.yml if the CLI should look
+# somewhere else.
+- insert:
+    - id: dshell-host
+      name: '@dshell/host'

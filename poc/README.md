@@ -134,3 +134,56 @@ P0_PROMPT="Use the bash tool with sandbox_permissions set to 'danger-full-access
 - `.p0/url`、`.p0/cookies.txt`、`.p0/dsh-home/` 都是 owner 凭据/本地状态，已 gitignore。
 - 不要把 Host URL、Cookie、`clientId` 贴到 issue/聊天/日志。
 - API Peer 是 owner；拿到凭据等于拿到 Host 控制权。
+
+## 7. dshell-host spike（一个 Host + CLI）
+
+目标不是再起一个 Host，而是给已经运行的 `dsh --profile web` 挂一个 Unix socket，让 CLI 和 Web 操作同一个 live Session。设计和里程碑见 [`../find/architecture.md`](../find/architecture.md)。
+
+### 安装插件
+
+```bash
+cd <repo>
+export DSH_HOME="$PWD/.p0/dsh-home"
+
+# 本地包；dsh 会把它加入 profile 的 bundles
+dsh plugin --profile web add "$PWD/poc/dshell-host"
+```
+
+如果 `dsh` 不在 PATH，用第 1 节的 runtime `bin.js` 替换 `dsh`。
+
+启动 Host 后，stderr 应出现：
+
+```text
+[dshell-host] listening on /home/.../.p0/dsh-home/run/dshell.sock
+```
+
+socket 权限是 `0600`；CLI 不拿 token，也不读 Cookie。
+
+### 运行 CLI
+
+```bash
+export DSH_HOME="$PWD/.p0/dsh-home"
+export DSHELL_SOCKET="$DSH_HOME/run/dshell.sock"
+
+node poc/dshell-cli.mjs list
+node poc/dshell-cli.mjs attach <sessionId>
+node poc/dshell-cli.mjs prompt <sessionId> 'Reply with exactly DSH_SOCKET_OK'
+```
+
+`prompt` 会先自动 attach，所以能看到这一轮的 `user/message`、`assistant/message`、`turn/end`。
+
+### 已验证
+
+- Web API 创建的 Session，CLI `list` 能看到；
+- CLI `prompt` 写入的 `user/message`，Web 侧 `session/follow` 能读到；
+- Web API `prompt` 后，CLI 的 `attach` 能实时收到事件和流式文本；
+- CLI 断开后 Session 保持 live，Web 仍可继续；
+- 冷 Session 由 `dshell-host` `resume`，插件持有 handle，不随 CLI 断开而销毁。
+
+### 还没做
+
+- CLI 审批回答（现在只能在 Web 回答；CLI 能看到 `approval/asked`）；
+- `steer` / `cancel` / 多 Session 并行；
+- TUI 渲染（历史、markdown、工具卡片、输入框）；
+- 断线重连、版本握手、`SO_PEERCRED` 校验；
+- 正式 npm 包名和 `dshell` bin（`dshell` 这个名字已被占用，需要用 scope）。
