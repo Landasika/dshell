@@ -109,6 +109,7 @@ exit 0
 │   /clear           clear the local transcript view     │
 │   /reconnect       reattach the current session        │
 │   /verbose         toggle reasoning and lifecycle ...  │
+│   /quit            leave the TUI (does not cancel ...) │
 │ ↑/↓ select  tab insert  enter run/select  esc close    │
 └────────────────────────────────────────────────────────┘
 ❯ /
