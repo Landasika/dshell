@@ -52,6 +52,7 @@ interface AppState {
   verbose: boolean
   clearedAtSeq: number
   approvalBusy: boolean
+  pendingPrompt?: string
   quitting: boolean
 }
 
@@ -211,6 +212,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.status = 'idle'
       state.clearedAtSeq = 0
       viewport.reset()
+      const pending = state.pendingPrompt
+      state.pendingPrompt = undefined
+      if (pending !== undefined) void send(pending)
     } catch (error) {
       state.error = errorText(error)
       state.status = 'error'
@@ -247,6 +251,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.status = 'new session'
       state.clearedAtSeq = 0
       viewport.reset()
+      const pending = state.pendingPrompt
+      state.pendingPrompt = undefined
+      if (pending !== undefined) void send(pending)
       await refreshSessions()
       toast(`created ${view.sessionId}`)
     } catch (error) {
@@ -257,12 +264,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const send = async (text: string): Promise<void> => {
-    if (state.handle === undefined) {
-      toast('no session attached')
-      return
-    }
     const trimmed = text.replace(/\s+$/, '')
     if (trimmed.length === 0) return
+    if (state.handle === undefined) {
+      state.pendingPrompt = trimmed
+      state.editor = createEditor()
+      state.historyIndex = -1
+      toast('session is still connecting; your prompt is queued')
+      schedule()
+      return
+    }
     state.history.push(trimmed)
     if (state.history.length > 100) state.history.shift()
     state.historyIndex = -1
@@ -730,6 +741,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   screen.onResizeRequest(() => schedule())
   screen.start()
 
+  // Accept input before the first Host round-trip. A slow or broken Host must
+  // never leave the user staring at an unresponsive alternate screen.
+  input.setEncoding('utf8')
+  input.on('data', onData)
+  input.on('end', onEnd)
+  process.once('SIGTERM', onSignal)
+  process.once('SIGHUP', onSignal)
+  render()
+
   try {
     await refreshSessions()
     const resume = options.resume
@@ -743,11 +763,6 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     state.status = 'idle'
     schedule()
-    input.setEncoding('utf8')
-    input.on('data', onData)
-    input.on('end', onEnd)
-    process.once('SIGTERM', onSignal)
-    process.once('SIGHUP', onSignal)
     pollTimer = setInterval(() => {
       void refreshSessions()
     }, 5_000)

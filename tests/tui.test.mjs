@@ -166,7 +166,7 @@ test('TUI smoke: starts, renders a turn, and quits without a PTY', async () => {
       if (predicate()) return
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
-    throw new Error('timed out waiting for TUI output')
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-500))}`)
   }
 
   await waitFor(() => output.text.includes('dshell'))
