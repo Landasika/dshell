@@ -21,8 +21,8 @@ $ pnpm test
 ✔ TUI smoke: renders and answers an approval overlay
 ✔ TUI startup asks before creating a missing workspace
 ... P0–P3 tests ...
-ℹ tests 28
-ℹ pass 28
+ℹ tests 30
+ℹ pass 30
 ℹ fail 0
 ```
 
@@ -93,6 +93,31 @@ exit 0
 
 启动时不再自动 attach；已有 workspace 显示 Session 列表，缺失 workspace
 显示创建/退出选项。键盘监听在第一次 Host 请求之前安装，早期输入会排队。
+
+## 2.4 Slash completion（post-P6）
+
+在 Fake TTY 下输入 `/`，实际渲染（去 ANSI）：
+
+```text
+┌─ commands ─────────────────────────────────────────────┐
+│ ▸ /help            show keys and commands              │
+│   /sessions        switch session                      │
+│   /workspaces      switch workspace                    │
+│   /new             create a session                    │
+│   /attach          attach by id                        │
+│   /cancel          cancel the running turn             │
+│   /clear           clear the local transcript view     │
+│   /reconnect       reattach the current session        │
+│   /verbose         toggle reasoning and lifecycle ...  │
+│ ↑/↓ select  tab insert  enter run/select  esc close    │
+└────────────────────────────────────────────────────────┘
+❯ /
+```
+
+输入 `q` 后过滤到 `/quit`，`Enter` 执行并退出，证明菜单不是静态提示。
+Codex 参考实现位于 `/tmp/codex-src/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs`
+与 `command_popup.rs`：核心也是“输入即弹出、过滤、上下选择、Tab 补全、
+Enter 执行、Esc 关闭”。
 
 ## 3. 无 TTY 行为
 

@@ -11,6 +11,7 @@ import { buildBlocks, renderBlocks, renderTranscript, summarizeTool } from '../d
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
 import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
+import { completionContext, completionFor } from '../dist/tui/completion.js'
 
 const theme = createTheme(false)
 
@@ -110,10 +111,28 @@ test('key parser handles arrows, control keys, and bracketed paste across chunks
   assert.deepEqual(parser.feed('\u001bOA'), [{ type: 'up' }])
   assert.deepEqual(parser.feed('\u001b[200~hello\nworld\u001b[201~'), [{ type: 'paste', text: 'hello\nworld' }])
   assert.deepEqual(parser.feed('\u0003'), [{ type: 'ctrl-c' }])
+  assert.deepEqual(parser.feed('\u0010'), [{ type: 'ctrl-p' }])
+  assert.deepEqual(parser.feed('\u000e'), [{ type: 'ctrl-n' }])
   assert.deepEqual(parser.feed('中'), [{ type: 'text', text: '中' }])
   const split = new KeyParser()
   assert.deepEqual(split.feed('\u001b['), [])
   assert.deepEqual(split.feed('B'), [{ type: 'down' }])
+})
+
+test('completion finds slash commands and @ files', () => {
+  assert.equal(completionContext('/')?.kind, 'command')
+  assert.equal(completionContext('/se')?.query, 'se')
+  assert.equal(completionContext('/attach '), null)
+  assert.deepEqual(
+    completionFor('/', []).items.map((item) => item.label).slice(0, 3),
+    ['/help', '/sessions', '/workspaces'],
+  )
+  const sessions = completionFor('/se', []).items
+  assert.equal(sessions.length, 1)
+  assert.equal(sessions[0].label, '/sessions')
+  const file = completionContext('look at @src/ma')
+  assert.deepEqual(file, { kind: 'file', query: 'src/ma', start: 8, end: 15 })
+  assert.equal(completionFor('look at @src/ma', ['src/main.ts']).items[0].label, '@src/main.ts')
 })
 
 test('session titles come from the latest session/title event', () => {
@@ -330,6 +349,50 @@ test('TUI startup supports arrow selection and Enter attach', async () => {
   assert.equal(backend.requireSession('s2').events.some((event) => event.type === 'user/message'), true)
   assert.equal(backend.requireSession('s1').events.some((event) => event.type === 'user/message'), false)
   input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('TUI slash completion menu filters and executes a command', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', title: 'Demo session' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 150; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for slash menu; got ${JSON.stringify(output.text.slice(-800))}`)
+  }
+
+  await waitFor(() => output.text.includes('dshell'))
+  input.push('/')
+  await waitFor(() => output.text.includes('commands') && output.text.includes('/help'))
+  input.push('q')
+  await waitFor(() => output.text.includes('/quit'))
+  input.push('\r')
   assert.equal(await app, 0)
   await backend.disconnect()
 })

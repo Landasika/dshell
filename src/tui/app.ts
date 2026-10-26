@@ -13,6 +13,7 @@ import type {
 } from '../backend/index.js'
 import { BackendError } from '../backend/index.js'
 import { KeyParser, type Key } from './keys.js'
+import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
 import { composerLines, createEditor, editKey, insertText, lineCol, type EditorState } from './editor.js'
 import { buildBlocks, renderBlocks, type Block } from './events.js'
 import { renderMarkdown } from './markdown.js'
@@ -66,22 +67,11 @@ interface AppState {
   verbose: boolean
   clearedAtSeq: number
   approvalBusy: boolean
+  completion?: CompletionState
   pendingPrompt?: string
   quitting: boolean
 }
 
-const COMMANDS = [
-  ['/help', 'show keys and commands'],
-  ['/sessions', 'switch session'],
-  ['/workspaces', 'switch workspace'],
-  ['/new [cwd]', 'create a session'],
-  ['/attach <id>', 'attach by id'],
-  ['/cancel', 'cancel the running turn'],
-  ['/clear', 'clear the local transcript view'],
-  ['/reconnect', 'reattach the current session'],
-  ['/verbose', 'toggle reasoning and lifecycle events'],
-  ['/quit', 'leave the TUI (does not cancel the Host turn)'],
-] as const
 
 function shortId(id: string | undefined): string {
   if (id === undefined) return 'no session'
@@ -468,31 +458,32 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
-  const complete = (): void => {
+  const refreshCompletion = (): void => {
     const text = state.editor.text
-    if (text.startsWith('/') && !text.includes(' ')) {
-      const match = COMMANDS.map(([name]) => name).find((name) => name.startsWith(text))
-      if (match !== undefined) {
-        state.editor = createEditor(`${match} `)
-        schedule()
-      }
+    const context = completionContext(text)
+    const files = context?.kind === 'file' ? fileCandidates(options.cwd, context.query) : []
+    state.completion = completionFor(text, files) ?? undefined
+  }
+
+  const acceptCompletion = (execute: boolean): void => {
+    const completion = state.completion
+    if (completion === undefined) return
+    const item: CompletionItem | undefined = completion.items[completion.index]
+    if (item === undefined) return
+    const text = state.editor.text
+    const inserted = `${text.slice(0, completion.context.start)}${item.insert}${text.slice(completion.context.end)}`
+    state.editor = createEditor(inserted)
+    state.historyIndex = -1
+    state.completion = undefined
+    if (execute && item.kind === 'command' && item.execute !== undefined) {
+      state.editor = createEditor()
+      void runCommand(item.execute)
       return
     }
-    const at = /(?:^|\s)@([^\s]*)$/.exec(text)
-    if (at === null) return
-    const prefix = at[1] ?? ''
-    const candidates = fileCandidates(options.cwd, prefix)
-    if (candidates.length === 0) {
-      toast(`no files match @${prefix}`)
-      return
-    }
-    const replacement = `@${candidates[0]}`
-    const start = text.length - (prefix.length + 1)
-    const next = `${text.slice(0, start)}${replacement}`
-    state.editor = createEditor(next)
-    if (candidates.length > 1) toast(`${candidates.length} matches; first: ${candidates[0]}`)
+    refreshCompletion()
     schedule()
   }
+
 
   const handleOverlayKey = (key: Key): void => {
     const overlay = state.overlay
@@ -584,9 +575,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (key.type === 'escape') {
-      if (state.editor.text.length > 0) {
+      if (state.completion !== undefined) {
+        state.completion = undefined
+        schedule()
+      } else if (state.editor.text.length > 0) {
         state.editor = createEditor()
         state.historyIndex = -1
+        refreshCompletion()
         schedule()
       }
       return
@@ -612,6 +607,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    if (
+      state.completion !== undefined
+      && (key.type === 'up' || key.type === 'down' || key.type === 'ctrl-p' || key.type === 'ctrl-n')
+    ) {
+      const count = state.completion.items.length
+      if (count > 0) {
+        const delta = key.type === 'up' || key.type === 'ctrl-p' ? -1 : 1
+        state.completion.index = Math.max(0, Math.min(count - 1, state.completion.index + delta))
+      }
+      schedule()
+      return
+    }
     if (key.type === 'page-up') {
       viewport.page(-1, transcriptLineCount(), transcriptHeight())
       schedule()
@@ -625,13 +632,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (key.type === 'newline') {
       state.editor = insertText(state.editor, '\n')
       state.historyIndex = -1
+      refreshCompletion()
       schedule()
       return
     }
     if (key.type === 'enter') {
+      if (state.completion !== undefined) {
+        const item = state.completion.items[state.completion.index]
+        acceptCompletion(item?.kind === 'command' && item.execute !== undefined)
+        return
+      }
       const text = state.editor.text
       if (isCommand(text)) {
         state.editor = createEditor()
+        state.completion = undefined
         void runCommand(text)
       } else {
         void send(text)
@@ -640,17 +654,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'paste') {
       state.editor = insertText(state.editor, key.text)
+      refreshCompletion()
       schedule()
       return
     }
     if (key.type === 'text') {
       state.editor = insertText(state.editor, key.text)
       state.historyIndex = -1
+      refreshCompletion()
       schedule()
       return
     }
     if (key.type === 'tab') {
-      complete()
+      if (state.completion === undefined) refreshCompletion()
+      if (state.completion !== undefined) acceptCompletion(false)
       return
     }
     const mapped: Record<string, string> = {
@@ -667,6 +684,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       'ctrl-w': 'ctrl-w',
       'ctrl-a': 'ctrl-a',
       'ctrl-e': 'ctrl-e',
+      'ctrl-p': 'up',
+      'ctrl-n': 'down',
       newline: '',
     }
     const action = mapped[key.type]
@@ -674,6 +693,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const result = editKey(state.editor, action, state.history, state.historyIndex)
     state.editor = result.state
     state.historyIndex = result.historyIndex
+    refreshCompletion()
     schedule()
   }
 
@@ -704,10 +724,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return { lines, live: view.status === 'running' }
   }
 
-  const transcriptHeight = (): number => {
+  const transcriptHeight = (menuHeight = 0): number => {
     const { rows } = screen.size
     const composer = Math.min(7, Math.max(1, composerLines(state.editor.text, Math.max(1, screen.size.columns - 4)).length))
-    return Math.max(3, rows - 2 - composer - 3)
+    return Math.max(3, rows - 2 - composer - menuHeight - 3)
   }
 
   const transcriptLineCount = (): number => transcript().lines.length
@@ -743,7 +763,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (overlay.kind === 'help') {
       const body: string[] = []
-      for (const [name, description] of COMMANDS) body.push(`${paint(theme, 'bold', pad(name, 14))} ${description}`)
+      for (const { name, description } of COMMAND_SPECS) body.push(`${paint(theme, 'bold', pad(name, 14))} ${description}`)
       body.push('')
       body.push(paint(theme, 'dim', 'The TUI never owns the Agent: quitting only closes this view.'))
       return box('help', body)
@@ -843,11 +863,41 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     ]
   }
 
+  const completionMenuLines = (): string[] => {
+    const completion = state.completion
+    if (completion === undefined) return []
+    const width = Math.max(30, Math.min(screen.size.columns - 4, 78))
+    const inner = width - 4
+    const title = completion.context.kind === 'command' ? 'commands' : 'files'
+    const body: string[] = []
+    const visibleCount = Math.max(1, Math.min(12, screen.size.rows - 12))
+    const start = Math.max(
+      0,
+      Math.min(completion.index - Math.floor(visibleCount / 2), completion.items.length - visibleCount),
+    )
+    const visible = completion.items.slice(start, start + visibleCount)
+    for (const [offset, item] of visible.entries()) {
+      const index = start + offset
+      const marker = index === completion.index ? '▸' : ' '
+      body.push(
+        `${marker} ${paint(theme, 'bold', pad(item.label, 16))} ${truncate(item.description, Math.max(6, inner - 20))}`,
+      )
+    }
+    if (completion.items.length === 0) {
+      body.push(paint(theme, 'dim', completion.context.kind === 'command' ? 'no matching command' : 'no matching file'))
+    }
+    body.push(paint(theme, 'dim', '↑/↓ select  tab insert  enter run/select  esc close'))
+    const top = `┌─ ${title} ${'─'.repeat(Math.max(0, width - displayWidth(title) - 5))}┐`
+    const bottom = `└${'─'.repeat(width - 2)}┘`
+    return [paint(theme, 'gray', top), ...body.map((line) => `│ ${pad(line, inner)} │`), paint(theme, 'gray', bottom)]
+  }
+
   const render = (): void => {
     if (state.quitting) return
     const { rows, columns } = screen.size
     const transcriptData = transcript()
     const overlay = overlayLines()
+    const menu = completionMenuLines()
     let lines: string[] = []
     let cursor: { row: number; column: number } | undefined
     lines.push(...headerLines())
@@ -868,7 +918,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (state.toast !== undefined && state.toast.until > Date.now()) lines.push('', paint(theme, 'yellow', state.toast.text))
       if (state.error !== undefined) lines.push(paint(theme, 'red', `! ${state.error}`))
     } else {
-      const height = transcriptHeight()
+      const height = transcriptHeight(menu.length)
       const visible = viewport.visible(transcriptData.lines, height)
       lines.push(...visible.lines)
       for (let index = visible.lines.length; index < height; index += 1) lines.push('')
@@ -879,6 +929,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       } else {
         lines.push('')
       }
+      lines.push(...menu)
       const composerWidth = Math.max(1, columns - 4)
       const composer = composerLines(state.editor.text, composerWidth)
       const maxComposer = Math.min(7, composer.length)
@@ -964,7 +1015,7 @@ export function fileCandidates(cwd: string, prefix: string): string[] {
 }
 
 export function renderHelp(theme: Theme, width: number): string[] {
-  return COMMANDS.flatMap(([name, description]) => wrapText(`${name}  ${description}`, width)).map((line) => paint(theme, 'dim', line))
+  return COMMAND_SPECS.flatMap(({ name, description }) => wrapText(`${name}  ${description}`, width)).map((line) => paint(theme, 'dim', line))
 }
 
 export function blocksFor(events: SessionView['events'], verbose = false): Block[] {

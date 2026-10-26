@@ -111,7 +111,8 @@ dshell --no-color
 ```
 
 - Enter sends; `Alt+Enter` / `Ctrl-J` inserts a newline.
-- `Tab` completes `/` commands and `@` file paths.
+- typing `/` opens a live command menu; `↑/↓`/`Ctrl-P/N` select, `Tab` inserts, `Enter` runs/selects, `Esc` closes;
+  typing `@` opens a file-reference menu; `Tab` completes `/` commands and `@` file paths.
 - `PgUp`/`PgDn` scroll; `Ctrl-C` clears input, cancels a running turn, or exits.
 - `Ctrl-D` exits when the composer is empty.
 - startup chooser: pick an existing session in the current workspace or create a new one;
@@ -232,7 +233,7 @@ There is no token or Cookie. Run dshell as the same user that started the Host.
 pnpm install
 pnpm typecheck
 pnpm lint
-pnpm test          # 28 tests
+pnpm test          # 30 tests
 ./scripts/ci.sh    # full local gate, including clean pack/install
 ```
 

@@ -135,6 +135,21 @@ history；重新 attach 会重新看到。
 - 切换 Session 时旧 handle 只 dispose 本地连接，Host 继续运行；
 - `--resume <id>` 直接打开指定 Session。
 
+## 5.4 Slash Command 与 @ 文件补全
+
+对齐 Codex TUI 的交互模型（参考 `codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs`
+和 `command_popup.rs`）：
+
+- 输入 `/` **立即**弹出命令面板，而不是等 Tab；
+- 输入继续过滤，例如 `/se` 只剩 `/sessions`；
+- `↑/↓` 移动高亮，`Ctrl-P/N` 同样可用；
+- `Tab` 把高亮命令插入 composer；
+- `Enter` 执行无参数命令；`/attach` 这类需要参数的命令插入 `/attach ` 后等待输入；
+- `Esc` 只关闭面板，不清空草稿；
+- 面板最多 9 行，选中项超出时窗口滚动；
+- 输入 `@` 时显示当前 cwd 的文件候选，`Tab`/`Enter` 插入引用；
+- 命令定义、过滤、上下文解析是纯函数（`src/tui/completion.ts`），有独立测试。
+
 ## 5.5 启动时的 Workspace / Session 选择
 
 TUI 启动不再自动 attach 最近 Session。它先比较 CLI cwd（canonical path）和
@@ -176,7 +191,7 @@ Host 的 workspace 列表：
 
 ### 7.1 自动化
 
-`pnpm test`：**28/28 通过**（P4 原始 20 个 + 启动选择器 2 个 + title 1 个；后续 P5 增加 5 个）：
+`pnpm test`：**30/30 通过**（P4 原始 20 个 + 启动选择器 2 个 + title 1 个 + completion 2 个；后续 P5 增加 5 个）：
 
 - display width / ANSI 截断 / CJK wrap；
 - markdown heading/bullet/fence/diff；
@@ -189,7 +204,8 @@ Host 的 workspace 列表：
 - **Fake TTY approval smoke**：渲染弹层、按 `a`、显示 allowed once、退出 0；
 - **Fake TTY startup smoke**：已有 workspace 先显示选择器；缺失 workspace 显示创建/退出；
 - **方向键 + Enter 选择**：CSI/SS3 上下键移动高亮，Enter attach 到第二个 Session；
-- **Session title**：展示 Host `session/title` 投影，列表和标题栏使用最新标题。
+- **Session title**：展示 Host `session/title` 投影，列表和标题栏使用最新标题；
+- **Slash/file completion**：输入 `/` 立即显示候选，输入 `@` 显示文件候选；上下/Ctrl-P/N、Tab、Enter、Esc 行为与 Codex 风格一致。
 
 ### 7.2 真实 Host
 
