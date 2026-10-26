@@ -19,9 +19,10 @@ $ pnpm test
 ✔ file completion is bounded and skips hidden/ignored directories
 ✔ TUI smoke: starts, renders a turn, and quits without a PTY
 ✔ TUI smoke: renders and answers an approval overlay
+✔ TUI startup asks before creating a missing workspace
 ... P0–P3 tests ...
-ℹ tests 20
-ℹ pass 20
+ℹ tests 25
+ℹ pass 25
 ℹ fail 0
 ```
 
@@ -70,6 +71,28 @@ exit 0
 `approval required` → 按 `a` → `P4_TUI_APPROVED` 出现在 transcript。
 （该测试脚本在 Host 仍执行 turn 时被 `timeout` 包住，进程清理出现一次
 环境相关的 linger；TUI 本身在普通 turn 下已自然退出，见 2.1。）
+
+## 2.3 启动选择器（post-P6）
+
+真实 Host 上通过注入 Fake TTY 验证：
+
+```text
+# 当前 cwd 已有 workspace
+$ node /tmp/tui-picker.mjs /home/landasika/dshell PICK_B
+picker shown for existing workspace
+picker attach + turn OK
+exit 0
+
+# 当前 cwd 尚无 workspace
+$ mkdir -p /tmp/dshell-new-work
+$ node /tmp/tui-new-workspace.mjs A
+missing workspace prompt shown
+create workspace + turn OK
+exit 0
+```
+
+启动时不再自动 attach；已有 workspace 显示 Session 列表，缺失 workspace
+显示创建/退出选项。键盘监听在第一次 Host 请求之前安装，早期输入会排队。
 
 ## 3. 无 TTY 行为
 

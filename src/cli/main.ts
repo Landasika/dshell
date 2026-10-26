@@ -508,6 +508,8 @@ export async function main(argv: string[]): Promise<void> {
               : { resume: options.resume }),
             verbose: options.verbose,
             ...(options.color === undefined ? {} : { color: options.color }),
+            ...(options.create === true ? { create: true } : {}),
+            ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
           })
         } finally {
           await backend.disconnect()

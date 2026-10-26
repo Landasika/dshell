@@ -114,6 +114,8 @@ dshell --no-color
 - `Tab` completes `/` commands and `@` file paths.
 - `PgUp`/`PgDn` scroll; `Ctrl-C` clears input, cancels a running turn, or exits.
 - `Ctrl-D` exits when the composer is empty.
+- startup chooser: pick an existing session in the current workspace or create a new one;
+  if the workspace does not exist yet, create it or quit;
 - `/sessions`, `/workspaces`, `/new`, `/attach`, `/cancel`, `/clear`,
   `/reconnect`, `/verbose`, `/help`, `/quit`.
 - Approvals appear as a modal: `a` allow once, `r` reject, `d` details.
@@ -230,7 +232,7 @@ There is no token or Cookie. Run dshell as the same user that started the Host.
 pnpm install
 pnpm typecheck
 pnpm lint
-pnpm test          # 25 tests
+pnpm test          # 26 tests
 ./scripts/ci.sh    # full local gate, including clean pack/install
 ```
 

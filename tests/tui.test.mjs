@@ -170,6 +170,9 @@ test('TUI smoke: starts, renders a turn, and quits without a PTY', async () => {
   }
 
   await waitFor(() => output.text.includes('dshell'))
+  await waitFor(() => output.text.includes('choose session'))
+  input.push('\r')
+  await waitFor(() => output.text.includes('idle'))
   input.push('hello')
   input.push('\r')
   await waitFor(() => output.text.includes('echo: hello'))
@@ -203,7 +206,7 @@ test('TUI smoke: renders and answers an approval overlay', async () => {
   const output = new FakeOutput()
   const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
   await backend.connect()
-  const app = runTui(backend, { cwd: '/work', color: false, input, output })
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
   const waitFor = async (predicate) => {
     for (let index = 0; index < 100; index += 1) {
       if (predicate()) return
@@ -218,6 +221,48 @@ test('TUI smoke: renders and answers an approval overlay', async () => {
   input.push('a')
   await waitFor(() => output.text.includes('allowed once'))
   input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('TUI startup asks before creating a missing workspace', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend()
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/brand-new', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 100; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-500))}`)
+  }
+
+  await waitFor(() => output.text.includes('workspace not created'))
+  input.push('c')
+  await waitFor(() => output.text.includes('created fake-1'))
+  input.push('')
   assert.equal(await app, 0)
   await backend.disconnect()
 })

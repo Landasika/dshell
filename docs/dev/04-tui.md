@@ -135,6 +135,20 @@ history；重新 attach 会重新看到。
 - 切换 Session 时旧 handle 只 dispose 本地连接，Host 继续运行；
 - `--resume <id>` 直接打开指定 Session。
 
+## 5.5 启动时的 Workspace / Session 选择
+
+TUI 启动不再自动 attach 最近 Session。它先比较 CLI cwd（canonical path）和
+Host 的 workspace 列表：
+
+- **workspace 已存在**：列出该 workspace 的 Session，显示 live/cold、cwd、
+  相对时间；`↑/↓` 选择，`Enter` 接入，`n` 新建 Session，`q`/`Esc` 退出；
+- **workspace 未创建**：显示目录和“workspace not created”，`c`/`Enter`
+  创建 workspace + 新 Session，`q`/`Esc` 退出；
+- 已有 `--resume <id>` 或 `--new` 时跳过选择器；
+- 选择器渲染期间键盘监听已安装，慢 Host 不会让界面看起来“无响应”。
+
+这解决了“先自动选了错误 Session/在空目录里直接创建”的体验问题。
+
 ## 6. 审批弹层
 
 当当前 view 出现 `pendingApproval` 时，自动覆盖全屏弹层：
@@ -162,7 +176,7 @@ history；重新 attach 会重新看到。
 
 ### 7.1 自动化
 
-`pnpm test`：**20/20 通过**，P4 新增 10 个：
+`pnpm test`：**26/26 通过**（P4 原始 20 个 + 启动选择器 1 个；后续 P5 增加 5 个）：
 
 - display width / ANSI 截断 / CJK wrap；
 - markdown heading/bullet/fence/diff；
@@ -172,7 +186,8 @@ history；重新 attach 会重新看到。
 - key parser（箭头、Ctrl、括号粘贴跨 chunk）；
 - `@` 文件补全边界；
 - **Fake TTY smoke**：启动、发送 turn、渲染 `echo: hello`、Ctrl-D 退出 0；
-- **Fake TTY approval smoke**：渲染弹层、按 `a`、显示 allowed once、退出 0。
+- **Fake TTY approval smoke**：渲染弹层、按 `a`、显示 allowed once、退出 0；
+- **Fake TTY startup smoke**：已有 workspace 先显示选择器；缺失 workspace 显示创建/退出。
 
 ### 7.2 真实 Host
 

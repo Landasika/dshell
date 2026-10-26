@@ -1,5 +1,6 @@
 import { readdirSync, type Dirent } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { realpathSync } from 'node:fs'
 import { stdin, stdout } from 'node:process'
 import type { ReadStream, WriteStream } from 'node:tty'
 
@@ -25,9 +26,21 @@ export interface TuiOptions {
   resume?: string
   verbose?: boolean
   color?: boolean
+  /** Skip the startup picker and create a session immediately. */
+  create?: boolean
+  /** Workspace to use when `create` is set. */
+  workspaceId?: string
   /** Injectable streams for a PTY test harness. */
   input?: ReadStream
   output?: WriteStream
+}
+
+interface StartupState {
+  kind: 'sessions' | 'missing'
+  cwd: string
+  workspace?: WorkspaceSummary
+  sessions: SessionSummary[]
+  index: number
 }
 
 type Overlay =
@@ -46,6 +59,7 @@ interface AppState {
   history: string[]
   historyIndex: number
   overlay: Overlay | null
+  startup?: StartupState
   status: string
   error?: string
   toast?: { text: string; until: number }
@@ -74,8 +88,27 @@ function shortId(id: string | undefined): string {
   return id.length > 22 ? `${id.slice(0, 19)}…` : id
 }
 
+export function canonicalPath(value: string): string {
+  try {
+    return realpathSync(value)
+  } catch {
+    return resolve(value)
+  }
+}
+
+export function findWorkspaceForCwd(
+  workspaces: readonly WorkspaceSummary[],
+  cwd: string,
+): WorkspaceSummary | undefined {
+  const wanted = canonicalPath(cwd)
+  return workspaces.find((workspace) => canonicalPath(workspace.path) === wanted)
+}
+
 function statusLabel(state: AppState): string {
   if (state.error !== undefined) return 'error'
+  if (state.startup !== undefined) {
+    return state.startup.kind === 'missing' ? 'workspace' : 'choose session'
+  }
   if (state.view?.pendingApproval !== undefined) return 'approval'
   if (state.view?.status === 'running') return 'running'
   if (state.view === undefined) return 'connecting'
@@ -194,7 +227,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const openSession = async (sessionId: string): Promise<void> => {
-    if (state.handle?.id === sessionId) return
+    if (state.handle?.id === sessionId) {
+      state.startup = undefined
+      return
+    }
     try {
       state.status = `attaching ${shortId(sessionId)}`
       schedule()
@@ -210,6 +246,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       void off
       state.error = undefined
       state.status = 'idle'
+      state.startup = undefined
       state.clearedAtSeq = 0
       viewport.reset()
       const pending = state.pendingPrompt
@@ -248,6 +285,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       applyView(view)
       handle.subscribe((next) => applyView(next))
       state.overlay = null
+      state.startup = undefined
       state.status = 'new session'
       state.clearedAtSeq = 0
       viewport.reset()
@@ -261,6 +299,30 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.status = 'error'
       schedule()
     }
+  }
+
+  const prepareStartup = (): void => {
+    const cwd = canonicalPath(options.cwd)
+    const workspace = findWorkspaceForCwd(state.workspaces, cwd)
+    if (workspace === undefined) {
+      state.startup = { kind: 'missing', cwd, sessions: [], index: 0 }
+      schedule()
+      return
+    }
+    const sessions = state.sessions
+      .filter((session) => {
+        if (session.workspaceId === workspace.id) return true
+        return session.cwd !== undefined && canonicalPath(session.cwd) === canonicalPath(workspace.path)
+      })
+      .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))
+    state.startup = {
+      kind: 'sessions',
+      cwd,
+      workspace,
+      sessions,
+      index: 0,
+    }
+    schedule()
   }
 
   const send = async (text: string): Promise<void> => {
@@ -471,8 +533,42 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  const handleStartupKey = (key: Key): void => {
+    const startup = state.startup
+    if (startup === undefined) return
+    if (key.type === 'ctrl-c' || key.type === 'ctrl-d' || key.type === 'escape') {
+      quit(0)
+      return
+    }
+    if (key.type === 'text' && key.text.toLowerCase() === 'q') {
+      quit(0)
+      return
+    }
+    if (startup.kind === 'missing') {
+      if (key.type === 'enter' || (key.type === 'text' && key.text.toLowerCase() === 'c')) {
+        void createSession(startup.cwd)
+      }
+      return
+    }
+    if (key.type === 'up') {
+      startup.index = Math.max(0, startup.index - 1)
+    } else if (key.type === 'down') {
+      startup.index = Math.min(Math.max(0, startup.sessions.length - 1), startup.index + 1)
+    } else if (key.type === 'enter') {
+      const chosen = startup.sessions[startup.index]
+      if (chosen !== undefined) void openSession(chosen.sessionId)
+    } else if (key.type === 'text' && key.text.toLowerCase() === 'n') {
+      void createSession(undefined, startup.workspace?.id)
+    }
+    schedule()
+  }
+
   const handleKey = (key: Key): void => {
     if (state.quitting) return
+    if (state.startup !== undefined) {
+      handleStartupKey(key)
+      return
+    }
     if (state.overlay !== null) {
       handleOverlayKey(key)
       return
@@ -683,6 +779,57 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return box('approval required', body)
   }
 
+  const startupLines = (): string[] => {
+    const startup = state.startup
+    if (startup === undefined) return []
+    const width = Math.max(34, Math.min(screen.size.columns - 4, 86))
+    const inner = width - 4
+    const title = startup.kind === 'missing' ? 'workspace not created' : 'choose session'
+    const body: string[] = []
+    body.push(`${paint(theme, 'bold', 'directory')}  ${truncate(startup.cwd, Math.max(8, inner - 12))}`)
+    if (startup.kind === 'missing') {
+      body.push('')
+      body.push(paint(theme, 'yellow', 'No workspace exists for this directory yet.'))
+      body.push(paint(theme, 'dim', 'Create one now, or quit and cd to an existing workspace.'))
+      body.push('')
+      body.push(`${paint(theme, 'bold', 'c')} / ${paint(theme, 'bold', 'enter')}  create workspace + new session`)
+      body.push(`${paint(theme, 'bold', 'q')} / ${paint(theme, 'bold', 'esc')}    quit without creating anything`)
+    } else {
+      const workspace = startup.workspace
+      body.push(`${paint(theme, 'bold', 'workspace')}  ${truncate(workspace?.title ?? '', 28)}`)
+      body.push(`${paint(theme, 'bold', 'path')}       ${truncate(workspace?.path ?? '', Math.max(8, inner - 12))}`)
+      body.push('')
+      body.push(paint(theme, 'bold', 'sessions'))
+      if (startup.sessions.length === 0) {
+        body.push(paint(theme, 'dim', '  (no sessions yet; press n to create one)'))
+      } else {
+        const visibleCount = Math.max(1, Math.min(10, screen.size.rows - 13))
+        const start = Math.max(
+          0,
+          Math.min(startup.index - Math.floor(visibleCount / 2), startup.sessions.length - visibleCount),
+        )
+        for (const [offset, session] of startup.sessions.slice(start, start + visibleCount).entries()) {
+          const index = start + offset
+          const marker = index === startup.index ? '▸' : ' '
+          const live = session.live === true ? 'live' : 'cold'
+          const age = timeAgo(session.createdAt)
+          body.push(
+            `${marker} ${truncate(session.sessionId, 24)} ${pad(live, 4)} ${truncate(session.cwd ?? '', Math.max(6, inner - 38))} ${age}`,
+          )
+        }
+      }
+      body.push('')
+      body.push(`${paint(theme, 'bold', '↑/↓')} select   ${paint(theme, 'bold', 'enter')} attach   ${paint(theme, 'bold', 'n')} new session   ${paint(theme, 'bold', 'q')} quit`)
+    }
+    const top = `┌─ ${truncate(title, Math.max(1, width - 6))} ${'─'.repeat(Math.max(0, width - displayWidth(title) - 5))}┐`
+    const bottom = `└${'─'.repeat(width - 2)}┘`
+    return [
+      paint(theme, 'cyan', top),
+      ...body.map((line) => `│ ${pad(line, inner)} │`),
+      paint(theme, 'cyan', bottom),
+    ]
+  }
+
   const render = (): void => {
     if (state.quitting) return
     const { rows, columns } = screen.size
@@ -692,7 +839,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     let cursor: { row: number; column: number } | undefined
     lines.push(...headerLines())
     lines.push(paint(theme, 'gray', '─'.repeat(columns)))
-    if (overlay.length > 0) {
+    if (state.startup !== undefined) {
+      const panel = startupLines()
+      const available = Math.max(4, rows - 4)
+      const top = Math.max(0, Math.floor((available - panel.length) / 2))
+      lines.push(...Array.from({ length: top }, () => ''))
+      lines.push(...panel.slice(0, available))
+      if (state.error !== undefined) lines.push('', paint(theme, 'red', `! ${state.error}`))
+    } else if (overlay.length > 0) {
       const available = Math.max(4, rows - 4)
       const visible = overlay.slice(0, available)
       const top = Math.max(0, Math.floor((available - visible.length) / 2))
@@ -755,11 +909,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const resume = options.resume
     if (resume !== undefined) {
       await openSession(resume)
+    } else if (options.create === true) {
+      await createSession(options.cwd, options.workspaceId)
     } else {
-      const latest = [...state.sessions].sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))
-      const preferred = latest.find((session) => session.live === true) ?? latest[0]
-      if (preferred !== undefined) await openSession(preferred.sessionId)
-      else await createSession(options.cwd)
+      prepareStartup()
     }
     state.status = 'idle'
     schedule()
