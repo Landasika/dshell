@@ -21,8 +21,8 @@ $ pnpm test
 ✔ TUI smoke: renders and answers an approval overlay
 ✔ TUI startup asks before creating a missing workspace
 ... P0–P3 tests ...
-ℹ tests 25
-ℹ pass 25
+ℹ tests 27
+ℹ pass 27
 ℹ fail 0
 ```
 

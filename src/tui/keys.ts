@@ -32,6 +32,11 @@ const SEQUENCES: Record<string, Key> = {
   '\u001b[B': { type: 'down' },
   '\u001b[C': { type: 'right' },
   '\u001b[D': { type: 'left' },
+  // Application-cursor mode (SS3), sent by some terminals for arrow keys.
+  '\u001bOA': { type: 'up' },
+  '\u001bOB': { type: 'down' },
+  '\u001bOC': { type: 'right' },
+  '\u001bOD': { type: 'left' },
   '\u001b[H': { type: 'home' },
   '\u001b[F': { type: 'end' },
   '\u001bOH': { type: 'home' },

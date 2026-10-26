@@ -106,6 +106,8 @@ test('editor supports unicode boundaries, history, and multiline composers', () 
 test('key parser handles arrows, control keys, and bracketed paste across chunks', () => {
   const parser = new KeyParser()
   assert.deepEqual(parser.feed('\u001b[A'), [{ type: 'up' }])
+  assert.deepEqual(parser.feed('\u001bOB'), [{ type: 'down' }])
+  assert.deepEqual(parser.feed('\u001bOA'), [{ type: 'up' }])
   assert.deepEqual(parser.feed('\u001b[200~hello\nworld\u001b[201~'), [{ type: 'paste', text: 'hello\nworld' }])
   assert.deepEqual(parser.feed('\u0003'), [{ type: 'ctrl-c' }])
   assert.deepEqual(parser.feed('中'), [{ type: 'text', text: '中' }])
@@ -263,6 +265,57 @@ test('TUI startup asks before creating a missing workspace', async () => {
   input.push('c')
   await waitFor(() => output.text.includes('created fake-1'))
   input.push('')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('TUI startup supports arrow selection and Enter attach', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([
+    { sessionId: 's1', cwd: '/work' },
+    { sessionId: 's2', cwd: '/work' },
+  ])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 150; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for selection output; got ${JSON.stringify(output.text.slice(-800))}`)
+  }
+
+  await waitFor(() => output.text.includes('choose session'))
+  input.push('\u001b[B') // down: s1 -> s2 (CSI mode)
+  input.push('\r')
+  await waitFor(() => output.text.includes('idle'))
+  input.push('select me')
+  input.push('\r')
+  await waitFor(() => output.text.includes('echo: select me'))
+  assert.equal(backend.requireSession('s2').events.some((event) => event.type === 'user/message'), true)
+  assert.equal(backend.requireSession('s1').events.some((event) => event.type === 'user/message'), false)
+  input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
 })

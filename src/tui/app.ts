@@ -545,16 +545,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (startup.kind === 'missing') {
-      if (key.type === 'enter' || (key.type === 'text' && key.text.toLowerCase() === 'c')) {
+      if (key.type === 'enter' || key.type === 'newline' || (key.type === 'text' && key.text.toLowerCase() === 'c')) {
         void createSession(startup.cwd)
       }
       return
     }
-    if (key.type === 'up') {
+    if (key.type === 'up' || (key.type === 'text' && key.text.toLowerCase() === 'k')) {
       startup.index = Math.max(0, startup.index - 1)
-    } else if (key.type === 'down') {
+    } else if (key.type === 'down' || (key.type === 'text' && key.text.toLowerCase() === 'j')) {
       startup.index = Math.min(Math.max(0, startup.sessions.length - 1), startup.index + 1)
-    } else if (key.type === 'enter') {
+    } else if (key.type === 'enter' || key.type === 'newline') {
       const chosen = startup.sessions[startup.index]
       if (chosen !== undefined) void openSession(chosen.sessionId)
     } else if (key.type === 'text' && key.text.toLowerCase() === 'n') {

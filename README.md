@@ -232,7 +232,7 @@ There is no token or Cookie. Run dshell as the same user that started the Host.
 pnpm install
 pnpm typecheck
 pnpm lint
-pnpm test          # 26 tests
+pnpm test          # 27 tests
 ./scripts/ci.sh    # full local gate, including clean pack/install
 ```
 
