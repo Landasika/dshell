@@ -130,6 +130,16 @@ function statusColor(status: string): 'green' | 'yellow' | 'red' | 'gray' | 'cya
   }
 }
 
+export function latestSessionTitle(events: readonly SessionView['events'][number][]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type !== 'session/title') continue
+    const data = (event.data ?? {}) as Record<string, unknown>
+    if (typeof data.title === 'string' && data.title.trim().length > 0) return data.title.trim()
+  }
+  return undefined
+}
+
 function isCommand(text: string): boolean {
   return text.startsWith('/') && !text.includes('\n')
 }
@@ -705,7 +715,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const headerLines = (): string[] => {
     const view = state.view
     const status = statusLabel(state)
-    const session = shortId(view?.sessionId)
+    const title = view?.header.title ?? (view === undefined ? undefined : latestSessionTitle(view.events))
+    const session = title === undefined ? shortId(view?.sessionId) : truncate(title, 34)
     const cwd = view?.header.cwd ?? options.cwd
     const left = `${paint(theme, 'bold', paint(theme, 'cyan', 'dshell'))} ${paint(theme, 'dim', '·')} ${session}`
     const right = `${paint(theme, statusColor(status), status)} ${paint(theme, 'dim', `· ${truncate(cwd, Math.max(10, screen.size.columns - 36))}`)}`
@@ -813,8 +824,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           const marker = index === startup.index ? '▸' : ' '
           const live = session.live === true ? 'live' : 'cold'
           const age = timeAgo(session.createdAt)
+          const title = session.title?.trim()
+          const label = title === undefined || title.length === 0 ? session.sessionId : title
           body.push(
-            `${marker} ${truncate(session.sessionId, 24)} ${pad(live, 4)} ${truncate(session.cwd ?? '', Math.max(6, inner - 38))} ${age}`,
+            `${marker} ${pad(truncate(label, 24), 24)} ${pad(live, 4)} ${truncate(session.cwd ?? '', Math.max(6, inner - 40))} ${age}`,
           )
         }
       }

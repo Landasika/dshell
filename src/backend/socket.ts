@@ -421,6 +421,9 @@ export class SocketSessionHandle implements SessionHandle {
 
   private noteEvent(event: SessionEvent): void {
     const data = (event.data ?? {}) as Record<string, unknown>
+    if (event.type === 'session/title' && typeof data.title === 'string' && data.title.length > 0) {
+      this.header = { ...this.header, title: data.title }
+    }
     if (event.type === 'turn/start') this.status = 'running'
     if (event.type === 'turn/end' || event.type === 'turn/failed') this.status = 'idle'
     if (event.type === 'assistant/message') this.streamText = ''

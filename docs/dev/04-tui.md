@@ -176,7 +176,7 @@ Host 的 workspace 列表：
 
 ### 7.1 自动化
 
-`pnpm test`：**27/27 通过**（P4 原始 20 个 + 启动选择器 2 个；后续 P5 增加 5 个）：
+`pnpm test`：**28/28 通过**（P4 原始 20 个 + 启动选择器 2 个 + title 1 个；后续 P5 增加 5 个）：
 
 - display width / ANSI 截断 / CJK wrap；
 - markdown heading/bullet/fence/diff；
@@ -188,7 +188,8 @@ Host 的 workspace 列表：
 - **Fake TTY smoke**：启动、发送 turn、渲染 `echo: hello`、Ctrl-D 退出 0；
 - **Fake TTY approval smoke**：渲染弹层、按 `a`、显示 allowed once、退出 0；
 - **Fake TTY startup smoke**：已有 workspace 先显示选择器；缺失 workspace 显示创建/退出；
-- **方向键 + Enter 选择**：CSI/SS3 上下键移动高亮，Enter attach 到第二个 Session。
+- **方向键 + Enter 选择**：CSI/SS3 上下键移动高亮，Enter attach 到第二个 Session；
+- **Session title**：展示 Host `session/title` 投影，列表和标题栏使用最新标题。
 
 ### 7.2 真实 Host
 

@@ -55,7 +55,7 @@ export class FakeBackend implements DshellBackend {
     for (const seed of seeds) {
       const createdAt = Date.now()
       this.sessions.set(seed.sessionId, {
-        header: { id: seed.sessionId, cwd: seed.cwd, createdAt },
+        header: { id: seed.sessionId, cwd: seed.cwd, createdAt, ...(seed.title === undefined ? {} : { title: seed.title }) },
         events: [...(seed.events ?? [])],
         cursor: Math.max(-1, ...(seed.events ?? []).map((event) => event.seq)),
         status: 'idle',
@@ -156,6 +156,7 @@ export class FakeBackend implements DshellBackend {
     const workspace = this.workspaceFor(session.header.cwd)
     return {
       sessionId: session.header.id,
+      ...(session.header.title === undefined ? {} : { title: session.header.title }),
       cwd: session.header.cwd,
       createdAt: session.header.createdAt,
       live: session.status === 'running',

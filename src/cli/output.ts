@@ -116,7 +116,10 @@ export function printSessions(sessions: SessionSummary[]): void {
   }
   for (const session of sessions) {
     const live = session.live === true ? 'live' : 'cold'
-    console.log(`${session.sessionId}  ${live.padEnd(4)}  ${session.cwd ?? ''}`)
+    const title = session.title?.trim()
+    console.log(
+      `${session.sessionId}  ${live.padEnd(4)}  ${title === undefined || title.length === 0 ? '(untitled)' : title}  ${session.cwd ?? ''}`,
+    )
   }
 }
 

@@ -61,6 +61,7 @@ interface SessionRecordLike {
     id: string
     cwd?: string
     createdAt?: number
+    title?: string
   }
   live: boolean
   persisted: boolean
@@ -86,8 +87,19 @@ interface SessionObservationLike {
   [Symbol.dispose](): void
 }
 
+interface SessionTitleResultLike {
+  sessionId: string
+  status: 'fulfilled' | 'rejected'
+  value?: {
+    title?: {
+      title?: string
+    }
+  }
+}
+
 interface SessionQueryLike {
   listSessions(): Promise<SessionRecordLike[]>
+  readTitleSnapshots?(sessionIds: readonly string[]): Promise<SessionTitleResultLike[]>
   readSession(sessionId: string): Promise<SessionSnapshotLike>
   observeSession(sessionId: string, options?: { projectionMode?: 'all' | 'none' }): Promise<SessionObservationLike>
 }
@@ -317,13 +329,30 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const records = await ctx.sessionQuery.listSessions()
     const workspaces = workspaceList()
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
+    const titles = new Map<string, string>()
+    if (ctx.sessionQuery.readTitleSnapshots !== undefined && records.length > 0) {
+      try {
+        const observations = await ctx.sessionQuery.readTitleSnapshots(records.map((record) => record.header.id))
+        for (const observation of observations) {
+          const title = observation.value?.title?.title
+          if (observation.status === 'fulfilled' && typeof title === 'string' && title.length > 0) {
+            titles.set(observation.sessionId, title)
+          }
+        }
+      } catch {
+        // A title is presentation metadata. A title-fold failure must not make
+        // the whole session list unusable.
+      }
+    }
     return records
       .map((record) => {
         const workspace = record.header.cwd === undefined
           ? undefined
           : workspaceByPath.get(record.header.cwd)
+        const title = titles.get(record.header.id) ?? record.header.title
         return {
           sessionId: record.header.id,
+          ...(title === undefined || title.length === 0 ? {} : { title }),
           cwd: record.header.cwd,
           createdAt: record.header.createdAt,
           live: record.live,

@@ -10,7 +10,7 @@ import { renderMarkdown, renderDiff } from '../dist/tui/markdown.js'
 import { buildBlocks, renderBlocks, renderTranscript, summarizeTool } from '../dist/tui/events.js'
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
-import { fileCandidates } from '../dist/tui/app.js'
+import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
 
 const theme = createTheme(false)
 
@@ -114,6 +114,18 @@ test('key parser handles arrows, control keys, and bracketed paste across chunks
   const split = new KeyParser()
   assert.deepEqual(split.feed('\u001b['), [])
   assert.deepEqual(split.feed('B'), [{ type: 'down' }])
+})
+
+test('session titles come from the latest session/title event', () => {
+  assert.equal(
+    latestSessionTitle([
+      { type: 'session/title', seq: 1, data: { title: 'Old title' } },
+      { type: 'turn/end', seq: 2, data: {} },
+      { type: 'session/title', seq: 3, data: { title: 'New title' } },
+    ]),
+    'New title',
+  )
+  assert.equal(latestSessionTitle([{ type: 'turn/end', seq: 1, data: {} }]), undefined)
 })
 
 test('file completion is bounded and skips hidden/ignored directories', async () => {
@@ -293,8 +305,8 @@ test('TUI startup supports arrow selection and Enter attach', async () => {
   const input = new FakeInput()
   const output = new FakeOutput()
   const backend = new FakeBackend([
-    { sessionId: 's1', cwd: '/work' },
-    { sessionId: 's2', cwd: '/work' },
+    { sessionId: 's1', cwd: '/work', title: 'First session' },
+    { sessionId: 's2', cwd: '/work', title: 'Second session' },
   ])
   await backend.connect()
   const app = runTui(backend, { cwd: '/work', color: false, input, output })
@@ -307,6 +319,8 @@ test('TUI startup supports arrow selection and Enter attach', async () => {
   }
 
   await waitFor(() => output.text.includes('choose session'))
+  assert.equal(output.text.includes('First session'), true)
+  assert.equal(output.text.includes('Second session'), true)
   input.push('\u001b[B') // down: s1 -> s2 (CSI mode)
   input.push('\r')
   await waitFor(() => output.text.includes('idle'))
