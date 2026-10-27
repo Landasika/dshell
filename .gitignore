@@ -28,6 +28,9 @@ pnpm-debug.log*
 # P0 local test state (credentials, DSH_HOME)
 .p0/
 
+# Isolated dev Host (scripts/dsh-dev uses this; never commit credentials)
+.dsh-dev/
+
 # Local package-manager caches
 .pnpm-store/
 
