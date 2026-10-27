@@ -10,7 +10,7 @@ import type {
   SessionHeader,
   SessionsMessage,
 } from '../protocol/index.js'
-import { isStreamStart, streamChunkText } from './stream.js'
+import { isStreamStart, streamChunkParts } from './stream.js'
 import {
   BackendError,
   type CreateSessionOptions,
@@ -197,6 +197,7 @@ export class SocketSessionHandle implements SessionHandle {
   private cursor = -1
   private status: SessionView['status'] = 'unknown'
   private streamText = ''
+  private streamReasoning = ''
   private pendingApproval: SessionView['pendingApproval']
   private pendingHistory: {
     resolve: (hasMore: boolean) => void
@@ -249,6 +250,7 @@ export class SocketSessionHandle implements SessionHandle {
       cursor: this.cursor,
       status: this.status,
       streamText: this.streamText,
+      streamReasoning: this.streamReasoning,
       ...(this.pendingApproval === undefined
         ? {}
         : { pendingApproval: { ...this.pendingApproval } }),
@@ -364,8 +366,14 @@ export class SocketSessionHandle implements SessionHandle {
     }
     if (message.type === 'stream' && message.sessionId === this.id) {
       const frame = message.frame
-      if (isStreamStart(frame)) this.streamText = ''
-      else this.streamText += streamChunkText(frame)
+      if (isStreamStart(frame)) {
+        this.streamText = ''
+        this.streamReasoning = ''
+      } else {
+        const parts = streamChunkParts(frame)
+        this.streamText += parts.text
+        this.streamReasoning += parts.reasoning
+      }
       this.emit()
       return
     }
@@ -426,7 +434,10 @@ export class SocketSessionHandle implements SessionHandle {
     }
     if (event.type === 'turn/start') this.status = 'running'
     if (event.type === 'turn/end' || event.type === 'turn/failed') this.status = 'idle'
-    if (event.type === 'assistant/message') this.streamText = ''
+    if (event.type === 'assistant/message') {
+      this.streamText = ''
+      this.streamReasoning = ''
+    }
     // Only the Host's `approval-request` message carries an answerable id.
     // The durable `approval/asked` event has its own id and may be replayed
     // from history; using it would send an answer for an already-dead request.

@@ -80,6 +80,8 @@ export interface SessionView {
   status: 'idle' | 'running' | 'unknown'
   /** Text accumulated from the current process-local assistant stream, if any. */
   streamText: string
+  /** Reasoning accumulated from the same stream (reasoning-delta chunks). */
+  streamReasoning: string
   pendingApproval?: ApprovalView
 }
 

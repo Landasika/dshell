@@ -33,6 +33,7 @@ interface FakeSession {
   cursor: number
   status: 'idle' | 'running'
   streamText: string
+  streamReasoning: string
   pendingApproval?: SessionView['pendingApproval']
 }
 
@@ -61,6 +62,7 @@ export class FakeBackend implements DshellBackend {
         cursor: Math.max(-1, ...(seed.events ?? []).map((event) => event.seq)),
         status: 'idle',
         streamText: '',
+        streamReasoning: '',
       })
       if (seed.cwd !== undefined) this.ensureWorkspace(seed.cwd)
     }
@@ -110,6 +112,7 @@ export class FakeBackend implements DshellBackend {
       cursor: -1,
       status: 'idle',
       streamText: '',
+      streamReasoning: '',
     })
     this.ensureWorkspace(cwd)
     const handle = new FakeSessionHandle(sessionId, this, this.sessions.get(sessionId) as FakeSession)
@@ -226,6 +229,7 @@ class FakeSessionHandle implements SessionHandle {
       cursor: this.session.cursor,
       status: this.session.status,
       streamText: this.session.streamText,
+      streamReasoning: this.session.streamReasoning,
       ...(this.session.pendingApproval === undefined
         ? {}
         : { pendingApproval: { ...this.session.pendingApproval } }),
