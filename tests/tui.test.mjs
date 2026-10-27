@@ -784,6 +784,16 @@ test('thinking folds to one header per turn and expands under verbose', () => {
   assert.ok(full.some((line) => line.includes('ctrl+o fold')))
 })
 
+test('user prompts render as quoted > lines, not a you label', () => {
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello there' }] } } },
+    { type: 'assistant/message', seq: 2, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } } },
+  ]
+  const lines = renderBlocks(buildBlocks(events), 60, theme).map(stripAnsi)
+  assert.ok(lines.includes('> hello there'))
+  assert.equal(lines.some((line) => line === 'you'), false)
+})
+
 test('a failed turn is always visible in the transcript', () => {
   const failed = [
     { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] } } },
@@ -1040,11 +1050,11 @@ test('drag selects text and copies it through OSC 52', async () => {
   }
 
   await waitFor(() => output.text.includes('HELLO-TARGET'))
-  input.push('\u001b[<0;1;4M')
-  input.push('\u001b[<32;20;4M')
+  input.push('\u001b[<0;1;3M')
+  input.push('\u001b[<32;20;3M')
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.match(output.text, /\u001b\[7m/)
-  input.push('\u001b[<0;20;4m')
+  input.push('\u001b[<0;20;3m')
   await waitFor(() => output.text.includes('copied'))
   const match = /\u001b\]52;c;([A-Za-z0-9+/=]+)\u0007/.exec(output.text)
   assert.ok(match)

@@ -7,6 +7,9 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Quoted prompts**: user messages render as `> hello` (continuation lines
+  indented) instead of a separate `you` header, matching the composer and the
+  Claude Code/Codex transcript style.
 - **Visible turn failures**: a `turn/end` error (quota, auth, provider outage)
   now renders `! turn failed: <reason>` in the transcript instead of being
   hidden behind verbose mode, so a prompt that gets no answer explains itself.

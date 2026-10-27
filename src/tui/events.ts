@@ -370,8 +370,12 @@ export function renderBlocks(
     if (out.length > 0) out.push('')
     switch (block.kind) {
       case 'user': {
-        out.push(paint(theme, 'bold', paint(theme, 'cyan', 'you')))
-        out.push(...renderBody(block, width, theme, options))
+        // Quote-style prompt: `> hello`, continuation lines aligned under it.
+        const body = renderBody(block, Math.max(8, width - 2), theme, options)
+        const marker = paint(theme, 'cyan', '>')
+        body.forEach((line, index) => {
+          out.push(`${index === 0 ? marker : '  '} ${line}`)
+        })
         break
       }
       case 'assistant': {
