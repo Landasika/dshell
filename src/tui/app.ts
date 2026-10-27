@@ -345,6 +345,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.currentId = sessionId
       state.approvalBusy = false
       applyView(next.snapshot())
+      // Seed arrow history from the durable transcript so prompts sent before
+      // this TUI attached can be recalled, not just the ones typed here.
+      state.history = userPrompts().reverse().slice(-100)
+      state.historyIndex = -1
       const off = next.subscribe((view) => applyView(view))
       // A disposed handle drops its listeners; keep the disposer out of the
       // state to avoid an extra public field on the app object.

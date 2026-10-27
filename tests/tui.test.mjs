@@ -947,6 +947,13 @@ test('wheel and Alt+arrows scroll the transcript while plain arrows recall histo
 
   await waitFor(() => output.text.includes('idle'))
 
+  // History is seeded from the durable transcript, so Up recalls a prompt sent
+  // before this TUI attached.
+  input.push('\u001b[A')
+  await waitFor(() => stripAnsi(output.text.slice(-1200)).includes('❯ prompt number 29'))
+  input.push('\u001b')
+  await new Promise((resolve) => setTimeout(resolve, 60))
+
   // The wheel scrolls the transcript; End returns to the tail.
   input.push('\u001b[<64;10;10M')
   await waitFor(() => output.text.slice(-2000).includes('Jump to bottom'))
@@ -961,7 +968,7 @@ test('wheel and Alt+arrows scroll the transcript while plain arrows recall histo
   input.push('\u001b[F')
   await new Promise((resolve) => setTimeout(resolve, 40))
 
-  // Plain Up still recalls the previous prompt into the composer.
+  // A prompt sent in this run is recalled too.
   input.push('recall-me')
   input.push('\r')
   await waitFor(() => output.text.includes('echo: recall-me'))

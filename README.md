@@ -224,7 +224,7 @@ the official API.
 | `Enter` | send / run command |
 | `Alt+Enter`, `Ctrl-J` | newline |
 | `Tab` | complete `/` command or `@` file |
-| `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history |
+| `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history (seeded from the session's durable transcript) |
 | `Alt+↑`/`Alt+↓` | scroll the transcript three lines (same as the wheel) |
 | `PgUp`/`PgDn`, wheel | page or line scroll of the transcript |
 | drag | select transcript text and copy it (OSC 52); `Shift+drag` uses the terminal's own selection |

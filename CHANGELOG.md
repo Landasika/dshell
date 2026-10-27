@@ -7,6 +7,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Prompt history from the transcript**: `↑`/`↓` now recall prompts sent
+  before this TUI attached, not just the ones typed in the current run. History
+  is seeded from the durable `user/message` events whenever a session is
+  opened or resumed (injected context and slash commands excluded, last 100
+  prompts kept).
 - **Text selection and transcript scroll keys**: the wheel, `PgUp/PgDn` and
   `Alt+↑/↓` scroll the transcript, while `↑/↓` keep their readline job of
   recalling prompt history. Dragging with the mouse selects transcript text,
