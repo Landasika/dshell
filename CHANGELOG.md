@@ -7,6 +7,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Retry visibility**: while a provider request is being retried, the activity
+  line says `Retrying · attempt 3/5 · TRANSPORT` (with the live elapsed time)
+  instead of a bare `Thinking`, so a long backoff no longer looks like a stuck
+  turn.
 - **Frameless composer**: the boxed prompt is now Claude-Code-style horizontal
   rules — top rule (with the context gauge and token speed right-aligned),
   the `❯` input, a bottom rule, then a dim shortcut hint. Input text starts

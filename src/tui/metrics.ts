@@ -328,6 +328,24 @@ function unmatchedToolCall(events: readonly SessionEvent[]): { name: string; det
   return undefined
 }
 
+/** Latest LLM retry in the current step, if no answer has landed since. */
+function retryActivity(events: readonly SessionEvent[]): { retry: number; max: number; code: string } | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event === undefined) continue
+    if (event.type === 'turn/start' || event.type === 'turn/end' || event.type === 'assistant/message') return undefined
+    if (event.type !== 'llm/retry') continue
+    const data = asObject(event.data) ?? {}
+    const failure = asObject(data.failure) ?? {}
+    return {
+      retry: Math.max(0, Number(data.retry ?? 0)),
+      max: Math.max(0, Number(data.maxRetries ?? 0)),
+      code: String(failure.code ?? 'ERROR'),
+    }
+  }
+  return undefined
+}
+
 function deriveActivity(view: SessionView): Activity {
   if (view.pendingApproval !== undefined) {
     return {
@@ -341,6 +359,11 @@ function deriveActivity(view: SessionView): Activity {
     const call = unmatchedToolCall(view.events)
     if (call !== undefined) return { phase: 'tool', verb: activityVerb(call.name), toolName: call.name, detail: call.detail }
     if (view.streamText.trim().length > 0) return { phase: 'streaming', verb: 'Writing' }
+    const retry = retryActivity(view.events)
+    if (retry !== undefined) {
+      const attempt = retry.max > 0 ? `${retry.retry}/${retry.max}` : String(retry.retry)
+      return { phase: 'thinking', verb: 'Retrying', detail: `attempt ${attempt} · ${retry.code}` }
+    }
     return { phase: 'thinking', verb: 'Thinking' }
   }
   // Idle. Only call it "done" when the last turn actually completed.

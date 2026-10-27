@@ -485,6 +485,24 @@ test('metrics handle running tool calls, live streams, and normalized usage keys
   assert.ok(metrics.liveTokens > 0)
   assert.equal(metrics.turnStartedAt, 1_000)
 
+  const retrying = {
+    sessionId: 's3',
+    header: { id: 's3' },
+    cursor: 5,
+    status: 'running',
+    streamText: '',
+    events: [
+      { type: 'turn/start', seq: 1, data: { turn: 1 } },
+      { type: 'step/start', seq: 2, data: { turn: 1, step: 1 } },
+      { type: 'assistant/attempt', seq: 3, data: { turn: 1, step: 1 } },
+      { type: 'llm/retry', seq: 4, data: { retry: 3, maxRetries: 5, failure: { code: 'TRANSPORT' } } },
+    ],
+  }
+  const retryMetrics = collectMetrics(retrying, 5_000)
+  assert.equal(retryMetrics.activity.phase, 'thinking')
+  assert.equal(retryMetrics.activity.verb, 'Retrying')
+  assert.match(retryMetrics.activity.detail ?? '', /attempt 3\/5 · TRANSPORT/)
+
   assert.deepEqual(normalizeUsage({ input_tokens: 10, output_tokens: 5 }), { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15 })
   assert.deepEqual(normalizeUsage({ prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 }), { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, total: 5 })
   assert.equal(normalizeUsage({}), undefined)
