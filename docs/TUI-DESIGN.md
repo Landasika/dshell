@@ -9,9 +9,10 @@ rules:
 2. **One truth.** The durable session log is the only source. Metrics are
    projections of `SessionView.events`; the TUI never keeps a second counter
    that can drift from the Host.
-3. **Responsive by dropping optional fields.** The usage rail drops cache,
-   model, gauge and TPS before it drops totals or cost. The launch picker and
-   the composer are never clipped to make room for decoration.
+3. **Responsive by dropping optional fields.** The usage rail keeps the model
+   route and context readout longest and drops TPS, totals, spend, cwd, git,
+   agents and cache first. The launch picker and the composer are never
+   clipped to make room for decoration.
 
 ## Screen regions
 
@@ -39,7 +40,8 @@ rules:
 ├ jump pill (only while scrolled up) ────────────────────────────────────┤
 │                                        ↓ 12 new · End                 │
 ├ usage rail ────────────────────────────────────────────────────────────┤
-│ ↑12.4k  cache 3k  ↓840  ~¥0.42  model      ctx ███░░░░░ 25% · 42 tps  │
+│ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1 │
+│ cache ▰▰▰▰▰ 91%  ctx ▰▰▰▱▱▱▱▱▱▱ 25%  ↑12.4k ↓840  ~¥0.42  42 tps         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -207,8 +209,10 @@ turn.
 
 ## Responsiveness
 
-- Usage-rail fields drop in this order: cache (76) → context gauge (72) →
-  TPS (64) → model (92). Input, output and cost never drop.
+- Usage-rail segments drop in this order: TPS → input/output totals → spend →
+  cwd → git breadcrumb → agents → cache. The provider/model route and the
+  context percentage never drop. The context bar only appears from 88 columns
+  and the cache bar from 96; below that they collapse to a percentage.
 - The jump pill is one row; it shortens to `↓ N new · End` / `↓ Jump to
   bottom · End` rather than wrapping over the transcript.
 - The session panel clips its body to the viewport; the todo section is

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,6 +12,7 @@ import { buildBlocks, renderBlocks, renderTranscript, summarizeTool, turnFailure
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
 import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
+import { readGitInfo } from '../dist/tui/git.js'
 import { completionContext, completionFor } from '../dist/tui/completion.js'
 
 const theme = createTheme(false)
@@ -415,7 +417,7 @@ import {
   todoCounts,
 } from '../dist/tui/metrics.js'
 import { allocateColumns, contextBarLayout, renderContextBar } from '../dist/tui/contextbar.js'
-import { renderActivityLine, renderTodoStrip, renderTpsGauge, renderUsageRail } from '../dist/tui/activity.js'
+import { renderActivityLine, renderTodoStrip, renderTpsGauge, renderUsageRail, shortCwd } from '../dist/tui/activity.js'
 import { renderSplash } from '../dist/tui/splash.js'
 import { renderComposer, renderJumpToBottom } from '../dist/tui/chrome.js'
 import { renderStatusStrip } from '../dist/tui/activity.js'
@@ -585,27 +587,59 @@ test('session cost folds durable usage, peak/idle rates, and unpriced models', (
   assert.equal(replayed.pricedTokens, 3_000_000)
 })
 
-test('usage rail keeps totals, cost, context and TPS on one row', () => {
+test('usage rail carries model route, cwd, git, agents, cache and ctx', () => {
   const tokens = { input: 12_400, cacheRead: 3_000, cacheWrite: 0, output: 840 }
-  const wide = renderUsageRail(theme, { tokens, cost: 0.42, model: 'deepseek-v4.1-flash', contextPct: 25.4, tps: 42, width: 100 })
-  assert.equal(displayWidth(wide), 100)
-  assert.match(stripAnsi(wide), /↑12\.4k/)
-  assert.match(stripAnsi(wide), /cache 3k/)
-  assert.match(stripAnsi(wide), /↓840/)
-  assert.match(stripAnsi(wide), /~¥0\.42/)
-  assert.match(stripAnsi(wide), /deepseek-v4\.1-flash/)
-  assert.match(stripAnsi(wide), /25%/)
-  assert.match(stripAnsi(wide), /42 tps/)
+  const git = { branch: 'main', ahead: 10, behind: 0, dirty: false }
+  const wide = renderUsageRail(theme, {
+    tokens, cost: 0.42, model: 'deepseek-v4.1-flash', provider: 'deepseek-relay',
+    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, contextPct: 25.4, tps: 42, width: 150,
+  })
+  assert.equal(displayWidth(wide), 150)
+  const text = stripAnsi(wide)
+  assert.match(text, /deepseek-relay\/deepseek-v4\.1-flash/)
+  assert.match(text, /~\/dshell/)
+  assert.match(text, /main \[↑10\]/)
+  assert.match(text, /✓ agents 1\/1/)
+  assert.match(text, /cache ▰+▱* 19%/)
+  assert.match(text, /ctx ▰+▱* 25%/)
+  assert.match(text, /↑12\.4k ↓840/)
+  assert.match(text, /~¥0\.42/)
+  assert.match(text, /42 tps/)
 
-  const narrow = renderUsageRail(theme, { tokens, cost: 0.42, model: 'deepseek-v4.1-flash', contextPct: 25.4, tps: 42, width: 60 })
+  const narrow = renderUsageRail(theme, {
+    tokens, model: 'deepseek-v4.1-flash', provider: 'deepseek-relay',
+    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, contextPct: 25.4, width: 60,
+  })
   assert.equal(displayWidth(narrow), 60)
-  assert.match(stripAnsi(narrow), /~¥0\.42/)
-  assert.doesNotMatch(stripAnsi(narrow), /deepseek-v4\.1-flash/)
+  assert.match(stripAnsi(narrow), /deepseek-relay\/deepseek-v4\.1-flash/)
+  assert.match(stripAnsi(narrow), /ctx .*25%/)
+  assert.doesNotMatch(stripAnsi(narrow), /42 tps/)
 
-  // Without a right group the row still occupies the full width.
   const bare = renderUsageRail(theme, { tokens, cost: 0.42, width: 70 })
   assert.equal(displayWidth(bare), 70)
   assert.match(stripAnsi(bare), /↑12\.4k/)
+
+  assert.equal(shortCwd(`${process.env.HOME}/dshell`), '~/dshell')
+  assert.ok(displayWidth(shortCwd('/a/very/long/path/that/keeps/going/dshell', 16)) <= 16)
+})
+
+test('git breadcrumb reads branch and dirtiness', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dshell-git-'))
+  try {
+    execFileSync('git', ['init', '-q', '-b', 'main', dir])
+    await writeFile(join(dir, 'a.txt'), 'one\n')
+    execFileSync('git', ['-C', dir, 'add', '.'])
+    execFileSync('git', ['-C', dir, '-c', 'user.email=a@b.c', '-c', 'user.name=t', 'commit', '-qm', 'init'])
+    const clean = await readGitInfo(dir)
+    assert.equal(clean?.branch, 'main')
+    assert.equal(clean?.dirty, false)
+    await writeFile(join(dir, 'a.txt'), 'two\n')
+    const dirty = await readGitInfo(dir)
+    assert.equal(dirty?.dirty, true)
+    assert.equal(await readGitInfo(join(dir, 'missing')), undefined)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('splash is a list-only picker at every terminal size', () => {

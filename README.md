@@ -160,7 +160,7 @@ Inside a session:
 ╭─ prompt ─────────────────────────────────────────────────────────────╮
 │ ❯ ask anything                                                       │
 ╰─ enter send · / commands · @ files · ctrl+r history · ? help ────────╯
-↑12.4k  cache 3k  ↓840  ~¥0.42  deepseek-v4.1-flash     ctx ███░░░░░ 25% · 42 tps
+deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cache ▰▰▰▰▰ 91%  ctx ▰▰▰▱▱▱▱▱▱▱ 25%
 ```
 
 - startup picker: drawn before the first Host round-trip, so the chat shell
@@ -186,11 +186,15 @@ Inside a session:
   above the composer; click it, press `End`/`Enter`, or `Esc` to return to the
   live tail. `DSHELL_NO_MOUSE=1` disables mouse capture so the terminal keeps
   its own scrollback and text selection.
-- usage rail (bottom, under the composer): session-cumulative input, cache,
-  output, estimated spend (`~¥`), model, context pressure and live TPS. On
-  narrow terminals it drops cache → model → gauge → TPS, keeping the totals and
-  cost. Model and provider details, the peak/idle split and per-model rows live
-  in `Ctrl-B`.
+- usage rail (bottom, under the composer): provider/model route (`provider/model`),
+  the cwd (`~/…`), the Git branch with ahead/behind counts (`main [↑10]`, `*`
+  when dirty), subagent progress (`✓ agents 1/1`, `✗` plus a failed count),
+  cache hit rate (`cache ▰▰▰▰▰ 91%`), context pressure
+  (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and, when space allows, session input/output totals,
+  estimated spend (`~¥`) and live TPS. On narrow terminals it drops
+  TPS → totals → spend → cwd → git → agents → cache, keeping the model route
+  and context readout. Model and provider details, the peak/idle split and
+  per-model rows live in `Ctrl-B`.
 - context bar: measured occupancy from the latest usage, split into
   system / prompt / assistant / thinking / tools; amber at 80%, red at 95%.
   The bar is the readout's boundary, local estimates only divide the used span.

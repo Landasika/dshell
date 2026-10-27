@@ -45,6 +45,7 @@ import {
   renderTodoStrip,
   renderUsageRail,
 } from './activity.js'
+import { readGitInfo, type GitInfo } from './git.js'
 import {
   centerBlock,
   centerVertically,
@@ -227,6 +228,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let escapeTimer: NodeJS.Timeout | undefined
   let pollTimer: NodeJS.Timeout | undefined
   let tickTimer: NodeJS.Timeout | undefined
+  let gitTimer: NodeJS.Timeout | undefined
+  let gitInfo: GitInfo | undefined
+  let gitCwd: string | undefined
+  let gitFetchedAt = 0
   let metricsCache: { key: string; value: SessionMetrics } | undefined
   let lastBodyHeight = 3
   let resolveDone: ((code: number) => void) | undefined
@@ -254,6 +259,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     tickTimer = setInterval(() => {
       if (!needsTick()) {
         if (tickTimer !== undefined) clearInterval(tickTimer)
+    if (gitTimer !== undefined) clearInterval(gitTimer)
         tickTimer = undefined
         return
       }
@@ -281,6 +287,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (escapeTimer !== undefined) clearTimeout(escapeTimer)
     if (pollTimer !== undefined) clearInterval(pollTimer)
     if (tickTimer !== undefined) clearInterval(tickTimer)
+    if (gitTimer !== undefined) clearInterval(gitTimer)
     input.off('data', onData)
     input.off('end', onEnd)
     process.off('SIGTERM', onSignal)
@@ -318,9 +325,22 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return metricsCache.value
   }
 
+  const refreshGit = (): void => {
+    const cwd = state.view?.header.cwd ?? options.cwd
+    if (cwd === gitCwd && Date.now() - gitFetchedAt < 3000) return
+    gitCwd = cwd
+    gitFetchedAt = Date.now()
+    void readGitInfo(cwd).then((info) => {
+      if (gitCwd !== cwd) return
+      gitInfo = info
+      schedule()
+    })
+  }
+
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
+    refreshGit()
     // Surface a failed turn in the header and as a toast, not only inline.
     const failure = turnFailureMessage(view.events)
     if (failure !== undefined && failure !== state.error) {
@@ -1244,10 +1264,24 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const usageRailLine = (metrics: SessionMetrics, now: number): string => {
+    const running = metrics.agents.filter((agent) => agent.status === 'running').length
     return renderUsageRail(theme, {
       tokens: metrics.cost.tokens,
       ...(metrics.cost.cost === undefined ? {} : { cost: metrics.cost.cost }),
       ...(metrics.model === undefined ? {} : { model: metrics.model }),
+      ...(metrics.provider === undefined ? {} : { provider: metrics.provider }),
+      cwd: state.view?.header.cwd ?? options.cwd,
+      ...(gitInfo === undefined ? {} : { git: gitInfo }),
+      ...(metrics.agents.length === 0
+        ? {}
+        : {
+            agents: {
+              done: metrics.agents.length - running,
+              total: metrics.agents.length,
+              running,
+              failed: metrics.agents.filter((agent) => agent.status === 'failed').length,
+            },
+          }),
       ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
       tps: speedFor(metrics, now),
       width: screen.size.columns,
@@ -1272,9 +1306,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     const counts = todoCounts(metrics.todos)
     const statusStrip = renderStatusStrip(theme, {
-      agentsDone: metrics.agents.filter((agent) => agent.status !== 'running').length,
-      agentsTotal: metrics.agents.length,
-      agentsRunning: metrics.agents.filter((agent) => agent.status === 'running').length,
+      agentsDone: 0,
+      agentsTotal: 0,
+      agentsRunning: 0,
       jobsRunning: metrics.jobs.running,
       jobsFailed: metrics.jobs.failed,
       jobsTotal: metrics.jobs.total,
@@ -1642,6 +1676,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   screen.onResizeRequest(() => schedule())
   screen.start()
+  refreshGit()
+  gitTimer = setInterval(refreshGit, 4000)
 
   // Accept input before the first Host round-trip. A slow or broken Host must
   // never leave the user staring at an unresponsive alternate screen.

@@ -2,7 +2,6 @@
 import type { Activity, TodoItem, TpsSample } from './metrics.js'
 import { formatDuration, formatPercent, formatTokens, pressureStyle, todoCounts } from './metrics.js'
 import { formatCostCny } from './cost.js'
-import { renderMiniContextBar } from './contextbar.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
 import { displayWidth, pad, truncate } from './width.js'
 
@@ -189,46 +188,151 @@ export interface UsageRailInput {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number }
   cost?: number
   model?: string
+  provider?: string
+  cwd?: string
+  git?: { branch: string; ahead: number; behind: number; dirty: boolean }
+  agents?: { done: number; total: number; running: number; failed?: number }
   contextPct?: number
   tps?: number
   width: number
 }
 
+function truncateLeft(text: string, width: number): string {
+  if (displayWidth(text) <= width) return text
+  let out = ''
+  let used = 0
+  for (const char of Array.from(text).reverse()) {
+    const cells = displayWidth(char)
+    if (used + cells + 1 > width) break
+    out = char + out
+    used += cells
+  }
+  return `…${out}`
+}
+
+/** `~/dshell` instead of `/home/name/dshell`, with a left-truncated fallback. */
+export function shortCwd(cwd: string, width = 28): string {
+  const home = process.env.HOME
+  const tildified = home !== undefined && (cwd === home || cwd.startsWith(`${home}/`))
+    ? `~${cwd.slice(home.length)}`
+    : cwd
+  return truncateLeft(tildified, width)
+}
+
+function blockBar(theme: Theme, pct: number, cells: number, style: ThemeStyle): string {
+  const bounded = Math.max(0, Math.min(100, pct))
+  const filled = Math.min(cells, Math.max(0, Math.round((bounded / 100) * cells)))
+  return `${paint(theme, style, '▰'.repeat(filled))}${paint(theme, 'muted', '▱'.repeat(cells - filled))}`
+}
+
 /**
- * The bottom-most line under the composer. Kept to one row: session token
- * totals, estimated spend, model, context pressure and live TPS. Optional
- * fields drop in priority order on narrow terminals; totals and cost stay.
+ * The bottom-most line under the composer: model route, workspace, git
+ * breadcrumb, agent count, cache hit rate and context pressure, followed by
+ * token totals, spend and TPS when the terminal is wide enough. Segments drop
+ * from the least important end instead of wrapping.
  */
 export function renderUsageRail(theme: Theme, input: UsageRailInput): string {
   const width = Math.max(20, input.width)
-  const cache = input.tokens.cacheRead + input.tokens.cacheWrite
-  const left: string[] = []
-  left.push(`${paint(theme, 'muted', '↑')}${paint(theme, 'text', formatTokens(input.tokens.input))}`)
-  if (cache > 0 && width >= 76) {
-    left.push(`${paint(theme, 'muted', 'cache')} ${paint(theme, 'info', formatTokens(cache))}`)
+  const segments: { text: string; drop: number; compact?: string }[] = []
+  const model = input.model === undefined
+    ? undefined
+    : input.provider === undefined
+      ? input.model
+      : `${input.provider}/${input.model}`
+  if (model !== undefined && model.length > 0) {
+    segments.push({ text: paint(theme, 'accentSoft', truncate(model, 40)), drop: 0 })
   }
-  left.push(`${paint(theme, 'muted', '↓')}${paint(theme, 'text', formatTokens(input.tokens.output))}`)
-  if (input.cost !== undefined && input.cost > 0) {
-    left.push(paint(theme, 'warning', `~${formatCostCny(input.cost)}`))
+  if (input.cwd !== undefined && input.cwd.length > 0) {
+    segments.push({ text: paint(theme, 'muted', shortCwd(input.cwd)), drop: 6 })
   }
-  if (input.model !== undefined && width >= 92) {
-    left.push(paint(theme, 'accentSoft', truncate(input.model, 28)))
+  if (input.git !== undefined) {
+    const git = input.git
+    const ahead = git.ahead > 0 ? ` ↑${git.ahead}` : ''
+    const behind = git.behind > 0 ? ` ↓${git.behind}` : ''
+    const marks = ahead.length + behind.length > 0 ? paint(theme, 'muted', ` [${`${ahead}${behind}`.trim()}]`) : ''
+    segments.push({
+      text: `${paint(theme, 'text', `${git.branch}${git.dirty ? '*' : ''}`)}${marks}`,
+      drop: 5,
+    })
   }
-
-  const right: string[] = []
+  if (input.agents !== undefined && input.agents.total > 0) {
+    const agents = input.agents
+    const failed = agents.failed ?? 0
+    const settled = agents.running === 0
+    const glyph = failed > 0 ? '✗' : settled ? '✓' : '●'
+    const style: ThemeStyle = failed > 0 ? 'error' : settled ? 'success' : 'info'
+    const detail = failed > 0 ? ` · ✗ ${failed}` : ''
+    const base = `${paint(theme, style, glyph)} ${paint(theme, 'muted', `agents ${agents.done}/${agents.total}`)}`
+    segments.push({
+      text: `${base}${paint(theme, 'error', detail)}`,
+      drop: 4,
+      ...(detail.length === 0 ? {} : { compact: base }),
+    })
+  }
+  const cacheTotal = input.tokens.cacheRead
+  const cacheBase = cacheTotal + input.tokens.input
+  if (cacheTotal > 0 && cacheBase > 0) {
+    const pct = (cacheTotal / cacheBase) * 100
+    const label = `${paint(theme, 'muted', 'cache')} ${paint(theme, 'info', formatPercent(pct))}`
+    const bar = width >= 96 ? `${blockBar(theme, pct, 5, 'info')} ` : ''
+    segments.push({
+      text: `${paint(theme, 'muted', 'cache')} ${bar}${paint(theme, 'info', formatPercent(pct))}`,
+      drop: 3,
+      ...(bar.length === 0 ? {} : { compact: label }),
+    })
+  }
   if (input.contextPct !== undefined) {
     const pct = Math.max(0, Math.min(100, input.contextPct))
     const style = pressureStyle(pct) ?? 'muted'
-    const bar = width >= 72 ? `${renderMiniContextBar(theme, pct, 8)} ` : ''
-    right.push(`${paint(theme, 'muted', 'ctx')} ${bar}${paint(theme, style, formatPercent(pct))}`)
+    const label = `${paint(theme, 'muted', 'ctx')} ${paint(theme, style, formatPercent(pct))}`
+    const bar = width >= 88 ? `${blockBar(theme, pct, 10, style)} ` : ''
+    segments.push({
+      text: `${paint(theme, 'muted', 'ctx')} ${bar}${paint(theme, style, formatPercent(pct))}`,
+      drop: 0,
+      ...(bar.length === 0 ? {} : { compact: label }),
+    })
   }
-  if (input.tps !== undefined && input.tps > 0 && width >= 64) {
-    right.push(paint(theme, 'muted', `${input.tps.toFixed(0)} tps`))
+  if (input.tokens.input > 0 || input.tokens.output > 0) {
+    segments.push({
+      text: `${paint(theme, 'muted', '↑')}${paint(theme, 'text', formatTokens(input.tokens.input))} ${paint(theme, 'muted', '↓')}${paint(theme, 'text', formatTokens(input.tokens.output))}`,
+      drop: 7,
+    })
+  }
+  if (input.cost !== undefined && input.cost > 0) {
+    segments.push({ text: paint(theme, 'warning', `~${formatCostCny(input.cost)}`), drop: 8 })
+  }
+  if (input.tps !== undefined && input.tps > 0) {
+    segments.push({ text: paint(theme, 'muted', `${input.tps.toFixed(0)} tps`), drop: 9 })
   }
 
-  const leftLine = left.join(paint(theme, 'muted', '  '))
-  const rightLine = right.join(paint(theme, 'muted', ' · '))
-  if (rightLine.length === 0) return pad(truncate(leftLine, width), width)
-  const available = Math.max(6, width - displayWidth(rightLine) - 1)
-  return splitLine(truncate(leftLine, available), rightLine, width)
+  const join = (): string => segments.map((segment) => segment.text).join(paint(theme, 'muted', '  '))
+  while (displayWidth(join()) > width) {
+    let candidate = -1
+    let rank = 0
+    for (const [index, segment] of segments.entries()) {
+      if (segment.drop > rank && segment.drop > 0) {
+        rank = segment.drop
+        candidate = index
+      }
+    }
+    // Token totals / spend / TPS are the first things to go; decorative bars
+    // collapse to a percentage only after those, and the remaining segments
+    // (cwd, git, agents, cache) are dropped last.
+    if (candidate >= 0 && rank >= 7) {
+      segments.splice(candidate, 1)
+      if (segments.length === 0) break
+      continue
+    }
+    const degradable = segments.findIndex((segment) => segment.compact !== undefined && segment.text !== segment.compact)
+    if (degradable >= 0) {
+      const segment = segments[degradable]
+      if (segment?.compact !== undefined) segment.text = segment.compact
+      continue
+    }
+    if (candidate < 0) break
+    segments.splice(candidate, 1)
+    if (segments.length === 0) break
+  }
+  if (segments.length === 0) return pad('', width)
+  return pad(truncate(join(), width), width)
 }

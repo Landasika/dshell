@@ -7,6 +7,12 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Richer bottom rail**: one line now shows the provider/model route, `~/…`
+  cwd, the Git branch with ahead/behind counts (and `*` when dirty), subagent
+  progress, the cache hit rate and context pressure as segmented `▰/▱` bars,
+  followed by token totals, spend and TPS when the width allows. Git is read
+  asynchronously every few seconds and cached; segments drop by priority
+  instead of wrapping.
 - **Quoted prompts**: user messages render as `> hello` (continuation lines
   indented) instead of a separate `you` header, matching the composer and the
   Claude Code/Codex transcript style.
