@@ -254,7 +254,8 @@ the official API.
 Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
 `/cancel`.
 
-Commands: `/sessions`, `/workspaces`, `/new`, `/attach`, `/cancel`, `/clear`,
+Commands: `/sessions` (aliases `/session`, `/resume`), `/workspaces`, `/new`,
+`/attach`, `/cancel`, `/clear`,
 `/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/agents`, `/verbose`, `/help`,
 `/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
 

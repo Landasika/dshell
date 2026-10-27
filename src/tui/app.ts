@@ -693,6 +693,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         schedule()
         return
       case '/sessions':
+      case '/session':
       case '/resume':
         state.status = 'listing sessions'
         schedule()

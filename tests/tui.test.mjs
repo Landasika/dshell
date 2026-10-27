@@ -132,6 +132,7 @@ test('completion finds slash commands and @ files', () => {
   const sessions = completionFor('/se', []).items
   assert.equal(sessions.length, 1)
   assert.equal(sessions[0].label, '/sessions')
+  assert.deepEqual(completionFor('/res', []).items.map((item) => item.label), ['/resume'])
   const file = completionContext('look at @src/ma')
   assert.deepEqual(file, { kind: 'file', query: 'src/ma', start: 8, end: 15 })
   assert.equal(completionFor('look at @src/ma', ['src/main.ts']).items[0].label, '@src/main.ts')

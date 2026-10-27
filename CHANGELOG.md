@@ -7,6 +7,8 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **`/resume` alias**: `/resume` (and `/session`) open the same picker as
+  `/sessions`, and `/resume` now appears in completion and help.
 - **Retry visibility**: while a provider request is being retried, the activity
   line says `Retrying · attempt 3/5 · TRANSPORT` (with the live elapsed time)
   instead of a bare `Thinking`, so a long backoff no longer looks like a stuck

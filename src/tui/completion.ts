@@ -22,6 +22,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/agents', description: 'list subagents and open their transcripts' },
   { name: '/status', description: 'alias for /panel' },
   { name: '/verbose', description: 'toggle reasoning and lifecycle events' },
+  { name: '/resume', description: 'alias for /sessions' },
   { name: '/quit', description: 'leave the TUI (does not cancel the Host turn)' },
 ]
 

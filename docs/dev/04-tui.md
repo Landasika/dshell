@@ -115,9 +115,9 @@ Slash commands：
 
 ```text
 /help          /sessions      /workspaces
-/new [cwd]     /attach <id>   /cancel
-/clear         /reconnect     /verbose
-/quit
+/resume        /new [cwd]     /attach <id>
+/cancel        /clear         /reconnect
+/verbose       /quit
 ```
 
 `/clear` 只隐藏本地 transcript（记录 `clearedAtSeq`），不删除 Host 的 durable
@@ -127,7 +127,8 @@ history；重新 attach 会重新看到。
 
 - 启动时优先恢复最近的 **live** Session；没有 live 就恢复最近 cold Session；
   一个 Session 都没有时，在 CLI cwd 创建一个；
-- `/sessions` 打开列表：显示 20 字符 id、live/cold、cwd、相对时间；
+- `/sessions` 打开列表（`/resume`、`/session` 是它的别名）：显示 20 字符 id、
+  live/cold、cwd、相对时间；
   ↑/↓ 选择、Enter attach、`n` 新建；
 - `/workspaces` 打开 workspace 列表：Enter 进入该 workspace 的 session 列表，
   `n` 在该 workspace 新建；
