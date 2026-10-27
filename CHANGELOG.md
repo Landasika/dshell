@@ -11,8 +11,9 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   indented) instead of a separate `you` header, matching the composer and the
   Claude Code/Codex transcript style.
 - **Visible turn failures**: a `turn/end` error (quota, auth, provider outage)
-  now renders `! turn failed: <reason>` in the transcript instead of being
-  hidden behind verbose mode, so a prompt that gets no answer explains itself.
+  now renders `! turn failed: <reason>` in the transcript, turns the header
+  status red (`● error`) and raises a toast, instead of being hidden behind
+  verbose mode. A prompt that gets no answer now explains itself.
 - **Prompt history from the transcript**: `↑`/`↓` now recall prompts sent
   before this TUI attached, not just the ones typed in the current run. History
   is seeded from the durable `user/message` events whenever a session is

@@ -59,6 +59,26 @@ function reasoningText(content: unknown): string {
     .join('\n')
 }
 
+/** The latest turn's failure message, if the transcript ends in a failed turn. */
+export function turnFailureMessage(events: readonly SessionEvent[]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event === undefined) continue
+    if (event.type === 'turn/end' || event.type === 'turn/failed') {
+      const reason = (dataOf(event).reason ?? {}) as Json
+      const kind = String(reason.kind ?? '')
+      if (event.type === 'turn/failed' || kind === 'error' || kind === 'failed') {
+        const failure = (reason.error ?? reason.failure ?? {}) as Json
+        return String(failure.message ?? failure.code ?? 'the turn failed')
+      }
+      return undefined
+    }
+    // A newer turn is in flight: an older failure is history, not status.
+    if (event.type === 'turn/start' || event.type === 'step/start') return undefined
+  }
+  return undefined
+}
+
 export function isInjectedContext(text: string): boolean {
   return (
     text.startsWith('<system-reminder>') ||

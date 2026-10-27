@@ -15,7 +15,7 @@ import { BackendError } from '../backend/index.js'
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
 import { createEditor, editKey, insertText, type EditorState } from './editor.js'
-import { buildBlocks, isInjectedContext, renderBlocks, type Block } from './events.js'
+import { buildBlocks, isInjectedContext, renderBlocks, turnFailureMessage, type Block } from './events.js'
 import { renderMarkdown } from './markdown.js'
 import { TerminalScreen, Viewport } from './screen.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
@@ -321,6 +321,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
+    // Surface a failed turn in the header and as a toast, not only inline.
+    const failure = turnFailureMessage(view.events)
+    if (failure !== undefined && failure !== state.error) {
+      state.error = failure
+      toast(`turn failed: ${failure.length > 80 ? `${failure.slice(0, 80)}…` : failure}`)
+    }
     sampleSpeed(view)
     if (view.pendingApproval !== undefined) {
       if (state.overlay?.kind !== 'approval') state.overlay = { kind: 'approval', details: false }
@@ -344,6 +350,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.handle = next
       state.currentId = sessionId
       state.approvalBusy = false
+      state.error = undefined
       applyView(next.snapshot())
       // Seed arrow history from the durable transcript so prompts sent before
       // this TUI attached can be recalled, not just the ones typed here.
@@ -353,7 +360,6 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       // A disposed handle drops its listeners; keep the disposer out of the
       // state to avoid an extra public field on the app object.
       void off
-      state.error = undefined
       state.status = 'idle'
       state.startup = undefined
       state.clearedAtSeq = 0

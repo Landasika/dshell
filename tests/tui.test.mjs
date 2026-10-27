@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import { createTheme } from '../dist/tui/theme.js'
 import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from '../dist/tui/width.js'
 import { renderMarkdown, renderDiff } from '../dist/tui/markdown.js'
-import { buildBlocks, renderBlocks, renderTranscript, summarizeTool } from '../dist/tui/events.js'
+import { buildBlocks, renderBlocks, renderTranscript, summarizeTool, turnFailureMessage } from '../dist/tui/events.js'
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
 import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
@@ -804,12 +804,14 @@ test('a failed turn is always visible in the transcript', () => {
   assert.ok(error)
   assert.match(error, /Insufficient Balance/)
   assert.ok(renderBlocks(buildBlocks(failed, true), 80, theme).some((line) => stripAnsi(line).includes('Insufficient Balance')))
+  assert.equal(turnFailureMessage(failed), 'Insufficient Balance (request_id: abc)')
 
   const completed = [
     { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] } } },
     { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'completed' } } },
   ]
   assert.equal(renderBlocks(buildBlocks(completed), 80, theme).some((line) => stripAnsi(line).includes('turn failed')), false)
+  assert.equal(turnFailureMessage(completed), undefined)
 })
 
 test('subagent roster follows catalog and settlement events', () => {
