@@ -1064,18 +1064,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
-    if (key.type === 'up' || key.type === 'down') {
-      // Plain arrows scroll the transcript (the composer is usually one line).
-      // Multi-line drafts keep caret movement, and a transcript that fits on
-      // screen falls through to prompt history as before.
-      const total = transcriptLineCount()
-      const height = transcriptHeight()
-      const multiline = state.editor.text.includes('\n')
-      if (!multiline && total > height) {
-        viewport.scroll(key.type === 'up' ? 3 : -3, total, height)
-        schedule()
-        return
-      }
+    if ((key.type === 'up' || key.type === 'down') && !state.editor.text.includes('\n')) {
+      // Plain arrows always move the transcript, never prompt history, so the
+      // conversation can be read without leaving the composer. History is on
+      // Alt+arrows and Ctrl-P/N; multi-line drafts keep caret movement.
+      viewport.scroll(key.type === 'up' ? 3 : -3, transcriptLineCount(), transcriptHeight())
+      schedule()
+      return
     }
     if (key.type === 'page-up') {
       viewport.page(1, transcriptLineCount(), transcriptHeight())
