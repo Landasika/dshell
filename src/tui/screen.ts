@@ -1,6 +1,6 @@
 import type { ReadStream, WriteStream } from 'node:tty'
 
-import { displayWidth, pad, truncate } from './width.js'
+import { displayWidth, highlightColumns, normalizeSelection, pad, selectionText, truncate, type SelectionRange } from './width.js'
 
 export interface ScreenSize {
   columns: number
@@ -11,6 +11,8 @@ export interface ScreenSize {
 export class TerminalScreen {
   private started = false
   private mouseEnabled = false
+  private lastLines: readonly string[] = []
+  private selection: SelectionRange | null = null
   private readonly onResize = (): void => this.resizeHandler?.()
   private resizeHandler: (() => void) | undefined
 
@@ -39,7 +41,9 @@ export class TerminalScreen {
     this.mouseEnabled = process.env.DSHELL_NO_MOUSE !== '1'
     if (this.mouseEnabled) {
       // 1007 off: the terminal must not turn wheel ticks into arrow keys.
-      this.output.write('\u001b[?1007l\u001b[?1000h\u001b[?1006h')
+      // 1002 adds drag motion so the app can implement text selection itself;
+      // 1007l keeps the terminal from turning wheel ticks into arrow keys.
+      this.output.write('\u001b[?1007l\u001b[?1000h\u001b[?1002h\u001b[?1006h')
     }
     this.output.on('resize', this.onResize)
   }
@@ -49,7 +53,7 @@ export class TerminalScreen {
     this.started = false
     this.output.off('resize', this.onResize)
     // Restore alternate-scroll so the user's shell wheel keeps working.
-    const mouseReset = this.mouseEnabled ? '\u001b[?1000l\u001b[?1006l\u001b[?1007h' : ''
+    const mouseReset = this.mouseEnabled ? '\u001b[?1000l\u001b[?1002l\u001b[?1006l\u001b[?1007h' : ''
     this.mouseEnabled = false
     this.output.write(`${mouseReset}\u001b[?2004l\u001b[?25h\u001b[?1049l`)
     try {
@@ -64,14 +68,47 @@ export class TerminalScreen {
     this.resizeHandler = handler
   }
 
+  setSelection(range: SelectionRange | null): void {
+    this.selection = range === null ? null : normalizeSelection(range)
+  }
+
+  get hasSelection(): boolean {
+    return this.selection !== null
+  }
+
+  /** Copy the current selection through the terminal's clipboard (OSC 52). */
+  copySelection(): string {
+    if (this.selection === null) return ''
+    const text = selectionText(this.lastLines, this.selection)
+    if (text.length === 0) return ''
+    const payload = Buffer.from(text, 'utf8').toString('base64')
+    try {
+      this.output.write(`\u001b]52;c;${payload}\u0007`)
+    } catch {
+      // no clipboard support; the caller still gets the text back
+    }
+    return text
+  }
+
   /** Draw a complete frame. Lines longer than the terminal are truncated. */
   draw(lines: readonly string[], cursor?: { row: number; column: number }): void {
     if (!this.started) return
     const { columns, rows } = this.size
+    this.lastLines = lines
     const body = lines.slice(0, rows)
     let frame = '\u001b[H'
     for (let index = 0; index < rows; index += 1) {
-      const line = body[index] ?? ''
+      const raw = body[index] ?? ''
+      const selection = this.selection
+      let line = raw
+      if (selection !== null) {
+        const row = index + 1
+        if (row >= selection.startRow && row <= selection.endRow) {
+          const from = row === selection.startRow ? selection.startColumn : 1
+          const to = row === selection.endRow ? Math.max(selection.endColumn, selection.startColumn) : displayWidth(raw)
+          line = highlightColumns(raw, from, to)
+        }
+      }
       frame += `\u001b[2K${pad(line, columns)}`
       if (index < rows - 1) frame += '\r\n'
     }

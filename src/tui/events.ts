@@ -27,6 +27,8 @@ export interface Block {
   full?: string
   /** Right-aligned meta line under the header, e.g. token count. */
   meta?: string
+  /** How many assistant steps were folded into this block. */
+  steps?: number
 }
 
 function shortAgent(id: string): string {
@@ -130,11 +132,14 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
   const blocks: Block[] = []
   const callBlocks = new Map<string, Block>()
   const agentBlocks = new Map<string, Block>()
+  const reasoningByTurn = new Map<string, Block>()
+  let userTurns = 0
 
   for (const event of events) {
     const data = dataOf(event)
     switch (event.type) {
       case 'user/message': {
+        userTurns += 1
         const message = (data.message ?? data) as Json
         const text = contentText(message.content)
         if (message.source?.kind === 'user' && text.length > 0 && !isInjectedContext(text)) {
@@ -149,15 +154,26 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
         const text = contentText(message.content)
         const reasoning = reasoningText(message.content)
         if (reasoning.length > 0) {
-          const lines = reasoning.split('\n').map((line) => line.trimEnd()).filter((line) => line.length > 0)
-          const preview = lines.slice(-3)
-          blocks.push({
-            kind: 'reasoning',
-            title: 'thinking',
-            body: verbose ? reasoning : preview.join('\n'),
-            full: reasoning,
-            meta: `${Math.max(1, Math.round(reasoning.length / 4))} tok · ${verbose ? 'ctrl+o fold' : 'ctrl+o expand'}`,
-          })
+          // One collapsible thinking block per turn: an agentic turn can carry
+          // dozens of assistant messages, and one rail each turns the
+          // transcript into a wall of reasoning.
+          const key = typeof data.turn === 'number' ? `t${data.turn}` : `u${userTurns}`
+          const existing = reasoningByTurn.get(key)
+          if (existing === undefined) {
+            const block: Block = {
+              kind: 'reasoning',
+              title: 'thinking',
+              body: verbose ? reasoning : '',
+              full: reasoning,
+              steps: 1,
+            }
+            reasoningByTurn.set(key, block)
+            blocks.push(block)
+          } else {
+            existing.full = `${existing.full ?? existing.body}\n\n${reasoning}`
+            existing.body = verbose ? existing.full : ''
+            existing.steps = (existing.steps ?? 1) + 1
+          }
         }
         if (text.length > 0) blocks.push({ kind: 'assistant', body: text })
         break
@@ -357,14 +373,21 @@ export function renderBlocks(
         break
       }
       case 'reasoning': {
-        // Folded by default: a header plus the last few reasoning lines on a
-        // dim rail. Ctrl-O swaps `body` for the full text at build time.
+        // Folded to one header per turn. Ctrl-O rebuilds the blocks with the
+        // full text in `body`, so the rail only appears when expanded.
+        const full = block.full ?? block.body
         const head = `${paint(theme, 'info', '⚓')} ${paint(theme, 'dim', block.title ?? 'thinking')}`
-        const meta = block.meta === undefined ? '' : ` ${paint(theme, 'dim', `· ${block.meta}`)}`
-        out.push(`${head}${meta}`)
-        for (const line of block.body.split('\n')) {
-          for (const wrapped of wrapText(line, Math.max(1, width - 2))) {
-            out.push(paint(theme, 'dim', `│ ${wrapped}`))
+        const tokens = Math.max(1, Math.round(full.length / 4))
+        const steps = block.steps ?? 1
+        const parts = [`${tokens} tok`]
+        if (steps > 1) parts.push(`${steps} steps`)
+        parts.push(block.body.length > 0 ? 'ctrl+o fold' : 'ctrl+o expand')
+        out.push(`${head} ${paint(theme, 'dim', `· ${parts.join(' · ')}`)}`)
+        if (block.body.length > 0) {
+          for (const line of block.body.split('\n')) {
+            for (const wrapped of wrapText(line, Math.max(1, width - 2))) {
+              out.push(paint(theme, 'dim', `│ ${wrapped}`))
+            }
           }
         }
         break

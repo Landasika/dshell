@@ -145,6 +145,16 @@ few seconds and titles resolve a few rows per poll, because a shared `~/.dsh`
 can hold hundreds of sessions and every snapshot read costs hundreds of
 milliseconds.
 
+## Selection and clipboard
+
+Mouse reporting is enabled for the wheel, but a left-button drag is captured
+and rendered as a reverse-video selection over the last frame. On release the
+app extracts the selected display cells (wide CJK/emoji aware, ANSI stripped,
+trailing padding trimmed) and writes it to the terminal clipboard with OSC 52,
+showing `copied N lines`/`copied N chars`. Holding Shift still hands the drag
+to the terminal's native selection for environments where OSC 52 is disabled.
+`DSHELL_NO_MOUSE=1` disables the whole mouse protocol.
+
 ## Scrolling, agents and thinking
 
 **Scrolling.** The alternate screen enables SGR mouse reporting

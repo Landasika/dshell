@@ -203,6 +203,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   // 1-based terminal row of the "jump to bottom" pill, for click hit-testing.
   let pillRow: number | null = null
   let agentHandle: SessionHandle | null = null
+  let selectAnchor: { row: number; column: number } | null = null
   let lastTranscriptTotal = 0
   let seenTranscriptTotal = 0
   const state: AppState = {
@@ -918,7 +919,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       handleOverlayKey(key)
       return
     }
+    // Any non-mouse key ends a text selection.
+    if (key.type !== 'click' && key.type !== 'drag' && key.type !== 'release' && key.type !== 'wheel') {
+      selectAnchor = null
+      screen.setSelection(null)
+    }
     if (key.type === 'wheel') {
+      selectAnchor = null
+      screen.setSelection(null)
       viewport.scroll(-key.delta * 3, transcriptLineCount(), transcriptHeight())
       schedule()
       return
@@ -927,7 +935,40 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (pillRow !== null && key.row === pillRow) {
         viewport.reset()
         schedule()
+        return
       }
+      // Start a selection anchor; a plain click (no drag) copies nothing.
+      selectAnchor = { row: key.row, column: key.column }
+      screen.setSelection(null)
+      schedule()
+      return
+    }
+    if (key.type === 'drag') {
+      if (selectAnchor !== null) {
+        screen.setSelection({
+          startRow: selectAnchor.row,
+          startColumn: selectAnchor.column,
+          endRow: key.row,
+          endColumn: key.column,
+        })
+        schedule()
+      }
+      return
+    }
+    if (key.type === 'release') {
+      if (selectAnchor === null) return
+      const moved = key.row !== selectAnchor.row || key.column !== selectAnchor.column
+      selectAnchor = null
+      if (moved) {
+        const text = screen.copySelection()
+        if (text.length > 0) {
+          const lines = text.split('\n').length
+          toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
+        }
+      } else {
+        screen.setSelection(null)
+      }
+      schedule()
       return
     }
     if ((key.type === 'end' || key.type === 'enter') && viewport.scrollOffset > 0) {
@@ -1023,6 +1064,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    if (key.type === 'up' || key.type === 'down') {
+      // Plain arrows scroll the transcript (the composer is usually one line).
+      // Multi-line drafts keep caret movement, and a transcript that fits on
+      // screen falls through to prompt history as before.
+      const total = transcriptLineCount()
+      const height = transcriptHeight()
+      const multiline = state.editor.text.includes('\n')
+      if (!multiline && total > height) {
+        viewport.scroll(key.type === 'up' ? 3 : -3, total, height)
+        schedule()
+        return
+      }
+    }
     if (key.type === 'page-up') {
       viewport.page(1, transcriptLineCount(), transcriptHeight())
       schedule()
@@ -1093,6 +1147,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       'ctrl-w': 'ctrl-w',
       'ctrl-a': 'ctrl-a',
       'ctrl-e': 'ctrl-e',
+      'alt-up': 'up',
+      'alt-down': 'down',
       'ctrl-p': 'up',
       'ctrl-n': 'down',
       newline: '',
@@ -1242,10 +1298,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
       body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'keys')), '')
       body.push(`${paint(theme, 'text', pad('enter', 15))} send · ${paint(theme, 'text', 'alt+enter')} newline · ${paint(theme, 'text', 'tab')} complete`)
+      body.push(`${paint(theme, 'text', pad('up / down', 15))} scroll transcript · ${paint(theme, 'text', 'alt+up/down')} prompt history`)
+      body.push(`${paint(theme, 'text', pad('pgup / pgdn', 15))} page scroll · ${paint(theme, 'text', 'wheel')} 3 lines`)
+      body.push(`${paint(theme, 'text', pad('drag', 15))} select & copy text (shift+drag: terminal)`)
       body.push(`${paint(theme, 'text', pad('ctrl+r', 15))} history search · ${paint(theme, 'text', 'ctrl+b')} session panel`)
       body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} thinking/details`)
-      body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'ctrl+b')} session panel`)
-      body.push(`${paint(theme, 'text', pad('double esc', 15))} rewind prompt · ${paint(theme, 'text', 'pgup/pgdn/wheel')} scroll`)
+      body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'double esc')} rewind prompt`)
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
       body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} cancel/quit · ${paint(theme, 'text', 'ctrl-d')} quit`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))

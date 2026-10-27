@@ -33,8 +33,12 @@ export type Key =
   | { type: 'ctrl-t' }
   | { type: 'ctrl-o' }
   | { type: 'ctrl-g' }
+  | { type: 'alt-up' }
+  | { type: 'alt-down' }
   | { type: 'wheel'; delta: number }
   | { type: 'click'; row: number; column: number }
+  | { type: 'drag'; row: number; column: number }
+  | { type: 'release'; row: number; column: number }
 
 const SEQUENCES: Record<string, Key> = {
   '\u001b[A': { type: 'up' },
@@ -58,6 +62,11 @@ const SEQUENCES: Record<string, Key> = {
   '\u001b[Z': { type: 'shift-tab' },
   '\u001b[1;2A': { type: 'up' },
   '\u001b[1;2B': { type: 'down' },
+  // Alt+arrows recall prompt history; plain arrows scroll the transcript.
+  '\u001b[1;3A': { type: 'alt-up' },
+  '\u001b[1;3B': { type: 'alt-down' },
+  '\u001b[1;5A': { type: 'up' },
+  '\u001b[1;5B': { type: 'down' },
   '\u001b\r': { type: 'newline' },
 }
 
@@ -144,7 +153,12 @@ export class KeyParser {
       const button = code & ~(4 | 8 | 16)
       if (button === 64) return { type: 'wheel', delta: -1 }
       if (button === 65) return { type: 'wheel', delta: 1 }
-      if (button === 0 && !release) return { type: 'click', row, column }
+      if (button === 0) {
+        if (release) return { type: 'release', row, column }
+        return { type: 'click', row, column }
+      }
+      // 32 is the motion bit: a left-button drag (selection).
+      if (button === 32 || button === 33) return { type: 'drag', row, column }
       return { type: 'text', text: '' }
     }
 

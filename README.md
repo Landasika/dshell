@@ -224,8 +224,10 @@ the official API.
 | `Enter` | send / run command |
 | `Alt+Enter`, `Ctrl-J` | newline |
 | `Tab` | complete `/` command or `@` file |
-| `↑`/`↓`, `Ctrl-P/N` | completion, picker, or history navigation |
-| `PgUp`/`PgDn` | scroll the transcript |
+| `↑`/`↓` | scroll the transcript (one message at a time); multi-line drafts keep caret movement |
+| `Alt+↑`/`Alt+↓`, `Ctrl-P/N` | completion, picker, or prompt history |
+| `PgUp`/`PgDn`, wheel | page or line scroll |
+| drag | select transcript text and copy it (OSC 52); `Shift+drag` uses the terminal's own selection |
 | `Ctrl-R` | search prompts sent in this session |
 | `Ctrl-B` | session panel: context breakdown, session spend, tokens, speed, todos, agents |
 | `Ctrl-G` | subagent list; `Enter` opens that child's transcript |
@@ -233,7 +235,7 @@ the official API.
 | `End` / `Enter` / `Esc` | jump back to the live tail while scrolled up |
 | wheel, `PgUp`/`PgDn` | scroll the transcript |
 | `Ctrl-T` | fold/show the todo strip |
-| `Ctrl-O` | toggle verbose reasoning/lifecycle blocks |
+| `Ctrl-O` | expand/fold thinking and lifecycle blocks |
 | `?` | help & shortcuts (when the composer is empty) |
 | `Esc` | close a menu/overlay or clear the composer; double-`Esc` on an empty idle composer opens rewind |
 | `Ctrl-C` | clear input, cancel a running turn, or quit |

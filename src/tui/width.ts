@@ -157,3 +157,100 @@ export function wrapText(input: string, width: number): string[] {
 export function expandTabs(input: string): string {
   return input.replace(/\t/g, '    ')
 }
+
+export interface SelectionRange {
+  /** 1-based screen row of the anchor and focus. */
+  startRow: number
+  startColumn: number
+  endRow: number
+  endColumn: number
+}
+
+export function normalizeSelection(range: SelectionRange): SelectionRange {
+  const forward = range.endRow > range.startRow
+    || (range.endRow === range.startRow && range.endColumn >= range.startColumn)
+  return forward
+    ? range
+    : {
+        startRow: range.endRow,
+        startColumn: range.endColumn,
+        endRow: range.startRow,
+        endColumn: range.startColumn,
+      }
+}
+
+/** How many plain characters fit before `column` (1-based). */
+function charsBeforeColumn(plain: string, column: number): number {
+  let width = 0
+  let count = 0
+  for (const char of plain) {
+    const cells = char === '\t' ? 4 : Math.max(1, displayWidth(char))
+    if (width + cells >= column) break
+    width += cells
+    count += 1
+  }
+  return count
+}
+
+/** How many plain characters are covered up to and including `column`. */
+function charsThroughColumn(plain: string, column: number): number {
+  let width = 0
+  let count = 0
+  for (const char of plain) {
+    const cells = char === '\t' ? 4 : Math.max(1, displayWidth(char))
+    width += cells
+    count += 1
+    if (width >= column) break
+  }
+  return count
+}
+
+/** Raw-string index just after `plainChars` visible characters. */
+function rawIndexAfter(line: string, plainChars: number): number {
+  let index = 0
+  let seen = 0
+  while (index < line.length && seen < plainChars) {
+    if (line[index] === '\u001b') {
+      const rest = line.slice(index)
+      const match = /^[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/.exec(rest)
+      index += match?.[0].length ?? 1
+      continue
+    }
+    const char = String.fromCodePoint(line.codePointAt(index) ?? 0)
+    index += char.length
+    seen += 1
+  }
+  return index
+}
+
+/** Plain text inside a display-column span (1-based, inclusive end). */
+export function columnSlice(text: string, from: number, to: number): string {
+  const plain = stripAnsi(text)
+  return plain.slice(charsBeforeColumn(plain, from), charsThroughColumn(plain, to))
+}
+
+/** Wrap the display-column span of one ANSI row in reverse video. */
+export function highlightColumns(line: string, from: number, to: number): string {
+  const plain = stripAnsi(line)
+  const startChars = charsBeforeColumn(plain, from)
+  const endChars = charsThroughColumn(plain, to)
+  if (endChars <= startChars) return line
+  const start = rawIndexAfter(line, startChars)
+  const end = rawIndexAfter(line, endChars)
+  return `${line.slice(0, start)}\u001b[7m${plain.slice(startChars, endChars)}\u001b[27m${line.slice(end)}`
+}
+
+/** Extract the selected rows as plain text, trimming trailing padding. */
+export function selectionText(lines: readonly string[], range: SelectionRange): string {
+  const normalized = normalizeSelection(range)
+  const rows = lines.slice(normalized.startRow - 1, normalized.endRow)
+  const out: string[] = []
+  for (let index = 0; index < rows.length; index += 1) {
+    const rowNumber = normalized.startRow + index
+    const plain = stripAnsi(rows[index] ?? '')
+    const from = rowNumber === normalized.startRow ? normalized.startColumn : 1
+    const to = rowNumber === normalized.endRow ? normalized.endColumn : displayWidth(plain)
+    out.push(columnSlice(plain, from, to))
+  }
+  return out.join('\n').replace(/\s+$/u, '')
+}

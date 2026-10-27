@@ -740,9 +740,13 @@ test('wheel and click sequences parse without leaking into the composer', () => 
   assert.deepEqual(parser.feed('\u001b[<64;10;5M'), [{ type: 'wheel', delta: -1 }])
   assert.deepEqual(parser.feed('\u001b[<65;10;5M'), [{ type: 'wheel', delta: 1 }])
   assert.deepEqual(parser.feed('\u001b[<0;7;12M'), [{ type: 'click', row: 12, column: 7 }])
-  // Release and other buttons are swallowed, never typed as text.
-  assert.deepEqual(parser.feed('\u001b[<0;7;12m'), [{ type: 'text', text: '' }])
+  // Releases carry coordinates for selection; other buttons are swallowed.
+  assert.deepEqual(parser.feed('\u001b[<0;7;12m'), [{ type: 'release', row: 12, column: 7 }])
   assert.deepEqual(parser.feed('\u001b[<66;1;1M'), [{ type: 'text', text: '' }])
+  assert.deepEqual(parser.feed('\u001b[<32;8;6M'), [{ type: 'drag', row: 6, column: 8 }])
+  assert.deepEqual(parser.feed('\u001b[<0;8;6m'), [{ type: 'release', row: 6, column: 8 }])
+  assert.deepEqual(parser.feed('\u001b[1;3A'), [{ type: 'alt-up' }])
+  assert.deepEqual(parser.feed('\u001b[1;3B'), [{ type: 'alt-down' }])
 })
 
 test('assistant stream splits reasoning deltas from visible text', () => {
@@ -753,20 +757,30 @@ test('assistant stream splits reasoning deltas from visible text', () => {
   assert.deepEqual(streamChunkParts({ type: 'start' }), { text: '', reasoning: '' })
 })
 
-test('thinking renders folded with a ctrl+o hint and expands under verbose', () => {
-  const reasoning = 'first line\nsecond line\nthird line\nfourth line'
+test('thinking folds to one header per turn and expands under verbose', () => {
   const events = [
-    { type: 'assistant/message', seq: 1, data: { message: { role: 'assistant', content: [{ type: 'reasoning', text: reasoning }, { type: 'text', text: 'done' }] } } },
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', content: [{ type: 'text', text: 'go' }] } } },
+    { type: 'assistant/message', seq: 2, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'reasoning', text: 'first line\nsecond line' }, { type: 'text', text: 'one' }] } } },
+    { type: 'tool/call', seq: 3, data: { name: 'bash', callId: 'c1', arguments: '{}' } },
+    { type: 'assistant/message', seq: 4, data: { turn: 1, step: 2, message: { role: 'assistant', content: [{ type: 'reasoning', text: 'third line' }, { type: 'text', text: 'two' }] } } },
   ]
-  const folded = renderBlocks(buildBlocks(events), 60, theme).map(stripAnsi)
+  const blocks = buildBlocks(events)
+  const reasoning = blocks.filter((block) => block.kind === 'reasoning')
+  assert.equal(reasoning.length, 1)
+  assert.equal(reasoning[0].steps, 2)
+  assert.match(reasoning[0].full, /first line[\s\S]*third line/)
+
+  const folded = renderBlocks(blocks, 60, theme).map(stripAnsi)
   const header = folded.find((line) => line.includes('thinking'))
   assert.ok(header)
+  assert.match(header, /2 steps/)
   assert.match(header, /ctrl\+o expand/)
   assert.equal(folded.some((line) => line.includes('first line')), false)
-  assert.equal(folded.some((line) => line.includes('fourth line')), true)
+  assert.equal(folded.some((line) => line.includes('third line')), false)
 
   const full = renderBlocks(buildBlocks(events, true), 60, theme).map(stripAnsi)
   assert.ok(full.some((line) => line.includes('first line')))
+  assert.ok(full.some((line) => line.includes('third line')))
   assert.ok(full.some((line) => line.includes('ctrl+o fold')))
 })
 
@@ -888,6 +902,123 @@ test('TUI opens on the picker with real titles instead of flashing the chat shel
   const loaded = stripAnsi(output.text)
   assert.match(loaded, /Design session/)
   input.push('q')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('plain arrows scroll the transcript and Alt+arrows still recall history', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = []
+  for (let index = 0; index < 30; index += 1) {
+    events.push({ type: 'user/message', seq: index * 2 + 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `prompt number ${index}` }] } } })
+    events.push({ type: 'assistant/message', seq: index * 2 + 2, data: { message: { role: 'assistant', content: [{ type: 'text', text: `answer number ${index}` }] } } })
+  }
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', title: 'Long session', events }])
+  await backend.connect()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 150; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error('timed out waiting for arrow scroll')
+  }
+
+  await waitFor(() => output.text.includes('idle'))
+  input.push('\u001b[A')
+  await waitFor(() => output.text.slice(-2000).includes('Jump to bottom'))
+  const at = output.text.length
+  input.push('\u001b[F')
+  await waitFor(() => output.text.length > at && !output.text.slice(at).includes('Jump to bottom'))
+
+  // Alt+Up recalls the previous prompt instead of scrolling.
+  input.push('prompt number 3')
+  input.push('\r')
+  await waitFor(() => output.text.includes('echo: prompt number 3'))
+  input.push('\u001b[1;3A')
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  const tail = stripAnsi(output.text.slice(-1200))
+  assert.match(tail, /prompt number 3/)
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('drag selects text and copies it through OSC 52', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 24
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const backend = new FakeBackend([{
+    sessionId: 's1',
+    cwd: '/work',
+    events: [
+      { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'HELLO-TARGET' }] } } },
+      { type: 'assistant/message', seq: 2, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'reply' }] } } },
+    ],
+  }])
+  await backend.connect()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 150; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error('timed out waiting for selection')
+  }
+
+  await waitFor(() => output.text.includes('HELLO-TARGET'))
+  input.push('\u001b[<0;1;4M')
+  input.push('\u001b[<32;20;4M')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.match(output.text, /\u001b\[7m/)
+  input.push('\u001b[<0;20;4m')
+  await waitFor(() => output.text.includes('copied'))
+  const match = /\u001b\]52;c;([A-Za-z0-9+/=]+)\u0007/.exec(output.text)
+  assert.ok(match)
+  assert.match(Buffer.from(match[1], 'base64').toString('utf8'), /HELLO-TARGET/)
+  input.push('\u0003')
+  input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
 })
