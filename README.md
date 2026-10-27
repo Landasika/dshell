@@ -224,9 +224,9 @@ the official API.
 | `Enter` | send / run command |
 | `Alt+Enter`, `Ctrl-J` | newline |
 | `Tab` | complete `/` command or `@` file |
-| `↑`/`↓` | scroll the transcript (one message at a time); multi-line drafts keep caret movement |
-| `Alt+↑`/`Alt+↓`, `Ctrl-P/N` | completion, picker, or prompt history |
-| `PgUp`/`PgDn`, wheel | page or line scroll |
+| `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history |
+| `Alt+↑`/`Alt+↓` | scroll the transcript three lines (same as the wheel) |
+| `PgUp`/`PgDn`, wheel | page or line scroll of the transcript |
 | drag | select transcript text and copy it (OSC 52); `Shift+drag` uses the terminal's own selection |
 | `Ctrl-R` | search prompts sent in this session |
 | `Ctrl-B` | session panel: context breakdown, session spend, tokens, speed, todos, agents |

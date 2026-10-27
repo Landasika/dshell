@@ -906,7 +906,7 @@ test('TUI opens on the picker with real titles instead of flashing the chat shel
   await backend.disconnect()
 })
 
-test('plain arrows scroll the transcript and Alt+arrows still recall history', async () => {
+test('wheel and Alt+arrows scroll the transcript while plain arrows recall history', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
   const { FakeBackend } = await import('../dist/backend/index.js')
@@ -946,20 +946,27 @@ test('plain arrows scroll the transcript and Alt+arrows still recall history', a
   }
 
   await waitFor(() => output.text.includes('idle'))
-  input.push('\u001b[A')
+
+  // The wheel scrolls the transcript; End returns to the tail.
+  input.push('\u001b[<64;10;10M')
   await waitFor(() => output.text.slice(-2000).includes('Jump to bottom'))
-  const at = output.text.length
+  let at = output.text.length
   input.push('\u001b[F')
   await waitFor(() => output.text.length > at && !output.text.slice(at).includes('Jump to bottom'))
 
-  // Alt+Up recalls the previous prompt instead of scrolling.
-  input.push('prompt number 3')
-  input.push('\r')
-  await waitFor(() => output.text.includes('echo: prompt number 3'))
+  // Alt+Up scrolls as well.
+  at = output.text.length
   input.push('\u001b[1;3A')
-  await new Promise((resolve) => setTimeout(resolve, 60))
-  const tail = stripAnsi(output.text.slice(-1200))
-  assert.match(tail, /prompt number 3/)
+  await waitFor(() => output.text.slice(at).includes('Jump to bottom'))
+  input.push('\u001b[F')
+  await new Promise((resolve) => setTimeout(resolve, 40))
+
+  // Plain Up still recalls the previous prompt into the composer.
+  input.push('recall-me')
+  input.push('\r')
+  await waitFor(() => output.text.includes('echo: recall-me'))
+  input.push('\u001b[A')
+  await waitFor(() => stripAnsi(output.text.slice(-1200)).includes('❯ recall-me'))
   input.push('\u0003')
   input.push('\u0004')
   assert.equal(await app, 0)

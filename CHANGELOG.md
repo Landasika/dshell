@@ -7,11 +7,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
-- **Transcript arrows and text selection**: `↑`/`↓` now scroll the transcript
-  (multi-line drafts keep caret movement; `Alt+↑/↓` and `Ctrl-P/N` still recall
-  prompt history). Dragging with the mouse selects transcript text, highlights
-  it in reverse video and copies it through OSC 52; `Shift+drag` keeps the
-  terminal's native selection.
+- **Text selection and transcript scroll keys**: the wheel, `PgUp/PgDn` and
+  `Alt+↑/↓` scroll the transcript, while `↑/↓` keep their readline job of
+  recalling prompt history. Dragging with the mouse selects transcript text,
+  highlights it in reverse video and copies it through OSC 52; `Shift+drag`
+  keeps the terminal's native selection.
 - **One thinking block per turn**: reasoning used to render a three-line rail
   per assistant message (91 rails in one real session). It now folds to a
   single `⚓ thinking · N tok · N steps · ctrl+o expand` header per turn, and

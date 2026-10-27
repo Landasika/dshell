@@ -1064,11 +1064,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
-    if ((key.type === 'up' || key.type === 'down') && !state.editor.text.includes('\n')) {
-      // Plain arrows always move the transcript, never prompt history, so the
-      // conversation can be read without leaving the composer. History is on
-      // Alt+arrows and Ctrl-P/N; multi-line drafts keep caret movement.
-      viewport.scroll(key.type === 'up' ? 3 : -3, transcriptLineCount(), transcriptHeight())
+    if (key.type === 'alt-up' || key.type === 'alt-down') {
+      // The wheel and Alt+arrows move the transcript; plain arrows stay on
+      // prompt history so readline muscle memory keeps working.
+      viewport.scroll(key.type === 'alt-up' ? 3 : -3, transcriptLineCount(), transcriptHeight())
       schedule()
       return
     }
@@ -1142,8 +1141,6 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       'ctrl-w': 'ctrl-w',
       'ctrl-a': 'ctrl-a',
       'ctrl-e': 'ctrl-e',
-      'alt-up': 'up',
-      'alt-down': 'down',
       'ctrl-p': 'up',
       'ctrl-n': 'down',
       newline: '',
@@ -1293,7 +1290,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
       body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'keys')), '')
       body.push(`${paint(theme, 'text', pad('enter', 15))} send · ${paint(theme, 'text', 'alt+enter')} newline · ${paint(theme, 'text', 'tab')} complete`)
-      body.push(`${paint(theme, 'text', pad('up / down', 15))} scroll transcript · ${paint(theme, 'text', 'alt+up/down')} prompt history`)
+      body.push(`${paint(theme, 'text', pad('up / down', 15))} prompt history · ${paint(theme, 'text', 'alt+up/down')} scroll transcript`)
       body.push(`${paint(theme, 'text', pad('pgup / pgdn', 15))} page scroll · ${paint(theme, 'text', 'wheel')} 3 lines`)
       body.push(`${paint(theme, 'text', pad('drag', 15))} select & copy text (shift+drag: terminal)`)
       body.push(`${paint(theme, 'text', pad('ctrl+r', 15))} history search · ${paint(theme, 'text', 'ctrl+b')} session panel`)
