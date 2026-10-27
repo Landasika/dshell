@@ -3,6 +3,46 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [Unreleased]
+
+### Added
+
+- **TUI design layer**: truecolor mist-blue palette with 256-colour fallback,
+  list-only session picker, rounded composer with the shortcut hint in its
+  bottom border, segmented context bar, live activity line with elapsed time,
+  and a `Ctrl-B` session panel.
+- **Usage & spend rail** below the composer: session input / cache / output
+  totals, estimated DeepSeek spend (`~¥`, CNY, peak/idle rates), model, context
+  pressure and live TPS. The panel adds cache read/write, the peak/idle split,
+  per-model rows and unpriced tokens.
+- **Spend estimation** (`src/tui/cost.ts`) from durable
+  `assistant/message.usage`, deduplicated per `turn`/`step`; unknown models are
+  reported as unpriced rather than guessed.
+- **Navigation**: prompt history search (`Ctrl-R`), double-`Esc` rewind that
+  restores a previous prompt into the composer, `Ctrl-T` todo folding,
+  `Ctrl-O` detail toggle, `?` shortcut help, and `/rewind`, `/history`,
+  `/panel`, `/status` commands.
+- Metrics are derived from the durable log only (`assistant/message.usage`,
+  `request/context`, todos, tool calls); no second source of truth.
+- `scripts/dev-host.sh` and `scripts/dev-tui.sh`: boot an isolated
+  `.dsh-dev` Host with the plugin loaded and open the TUI against it, including
+  auto-detection of a bundled DSH runtime when `dsh` is not on `PATH`.
+
+### Removed
+
+- The pixel-whale launch art and block wordmark. The TUI is a daily tool; the
+  launch screen is now the session list.
+
+### Fixed
+
+- Host handshake no longer enumerates sessions before replying. A slow or
+  contended DSH home could block the welcome for minutes and make a listening
+  Host look absent (`timed out waiting for dshell-host`). Session listing is
+  now a separate request, bounded to 4s, with a 1.5s title-fold budget.
+- Composer now grows with the draft instead of always reserving seven rows.
+- Splash and panel layouts adapt to terminal width/height without clipping the
+  picker or composer.
+
 ## [0.1.0] — 2026-10-23
 
 First V1 candidate for Linux.

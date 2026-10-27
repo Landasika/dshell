@@ -76,7 +76,25 @@ Look for:
 The plugin must be present when the Host boots; it cannot be injected into an
 already-running Host.
 
-### 2. Install the CLI
+### 2. Local development Host (no global `dsh`)
+
+If `dsh` is not on `PATH`, use the development wrappers. They boot a Host with
+the plugin in an isolated `.dsh-dev/` home (never touching `~/.dsh`) and
+auto-detect a bundled DSH runtime:
+
+```bash
+# terminal 1 — Host and Web UI
+./scripts/dev-host.sh
+
+# terminal 2 — TUI against that Host
+./scripts/dev-tui.sh
+```
+
+`./scripts/dev-host.sh` installs this checkout into a dedicated `dshell`
+profile and rebuilds the profile when the plugin changes. Override `DSH_BIN`,
+`DSH_HOME`, or `DSH_PROFILE` to use another CLI/home/profile.
+
+### 3. Install the CLI
 
 While developing, run the built binary directly:
 
@@ -93,7 +111,7 @@ npm install -g @landasika/dshell
 npm install -g ./landasika-dshell-0.1.0.tgz
 ```
 
-### 3. Open the TUI
+### 4. Open the TUI
 
 ```bash
 dshell
@@ -110,18 +128,95 @@ dshell --resume <sessionId>
 dshell --no-color
 ```
 
-- Enter sends; `Alt+Enter` / `Ctrl-J` inserts a newline.
-- typing `/` opens a live command menu; `↑/↓`/`Ctrl-P/N` select, `Tab` inserts, `Enter` runs/selects, `Esc` closes;
-  typing `@` opens a file-reference menu; `Tab` completes `/` commands and `@` file paths.
-- `PgUp`/`PgDn` scroll; `Ctrl-C` clears input, cancels a running turn, or exits.
-- `Ctrl-D` exits when the composer is empty.
-- startup chooser: pick an existing session in the current workspace or create a new one;
-  if the workspace does not exist yet, create it or quit;
-- `/sessions`, `/workspaces`, `/new`, `/attach`, `/cancel`, `/clear`,
-  `/reconnect`, `/verbose`, `/help`, `/quit`.
-- Approvals appear as a modal: `a` allow once, `r` reject, `d` details.
-- Exiting never cancels the Host turn. Cancel explicitly with `Ctrl-C` or
-  `/cancel`.
+The terminal is a daily tool, so the first screen is the session list you
+actually need — no splash art:
+
+```text
+◆ dshell · DeepSeek Harness
+────────────────────────────────────────────────────────────────────────────
+
+choose session
+/home/landasika/dshell
+
+↑/↓ move · enter attach · n new session · q quit
+
+▸ Socket client hardening                                    live 2m ago
+  TUI redesign notes                                        cold 1h ago
+  Release checklist                                         cold 3d ago
+```
+
+Inside a session:
+
+```text
+◆ dshell · session title                              ● running · /project
+────────────────────────────────────────────────────────────────────────────
+  transcript: streaming markdown, reasoning, tool cards, diffs, approvals
+⢿ Running command · rg reconnect src · 12s · ctx 84%
+▸ 1/3 · Adding bounded backoff                                    ctrl+t hide
+╭─ prompt ─────────────────────────────────────────────────────────────╮
+│ ❯ ask anything                                                       │
+╰─ enter send · / commands · @ files · ctrl+r history · ? help ────────╯
+↑12.4k  cache 3k  ↓840  ~¥0.42  deepseek-v4.1-flash     ctx ███░░░░░ 25% · 42 tps
+```
+
+- header: brand, session title, status (idle / running / approval / error) and
+  working directory.
+- live activity: spinner, current tool/verb, elapsed turn time and context
+  pressure. Only shown while a turn runs; the header carries the idle state.
+- usage rail (bottom, under the composer): session-cumulative input, cache,
+  output, estimated spend (`~¥`), model, context pressure and live TPS. On
+  narrow terminals it drops cache → model → gauge → TPS, keeping the totals and
+  cost. Model and provider details, the peak/idle split and per-model rows live
+  in `Ctrl-B`.
+- context bar: measured occupancy from the latest usage, split into
+  system / prompt / assistant / thinking / tools; amber at 80%, red at 95%.
+  The bar is the readout's boundary, local estimates only divide the used span.
+- todo strip: current task and completion count, foldable with `Ctrl-T`; the
+  session panel keeps the full list.
+- composer: rounded frame that grows with the draft (up to seven rows); the
+  shortcut hint sits in its bottom border.
+
+### Spend estimate
+
+DSH reports tokens, not money. The usage rail converts durable
+`assistant/message.usage` events with DeepSeek's published per-million-token
+rates (CNY, idle price; peak hours are doubled). Cache reads use the hit rate;
+cache writes and uncached input use the miss rate; output uses the output rate.
+Peak hours are Beijing time, Monday–Friday 09:00–12:00 and 14:00–18:00.
+
+`~¥0.42` is an **estimate, not a bill**: prices can change, and the balance is
+deducted on DeepSeek's side. Models missing from the rate table show tokens but
+no amount (`unpriced`); the same applies to routes whose billing differs from
+the official API.
+
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `Enter` | send / run command |
+| `Alt+Enter`, `Ctrl-J` | newline |
+| `Tab` | complete `/` command or `@` file |
+| `↑`/`↓`, `Ctrl-P/N` | completion, picker, or history navigation |
+| `PgUp`/`PgDn` | scroll the transcript |
+| `Ctrl-R` | search prompts sent in this session |
+| `Ctrl-B` | session panel: context breakdown, session spend, tokens, speed, todos |
+| `Ctrl-T` | fold/show the todo strip |
+| `Ctrl-O` | toggle verbose reasoning/lifecycle blocks |
+| `?` | help & shortcuts (when the composer is empty) |
+| `Esc` | close a menu/overlay or clear the composer; double-`Esc` on an empty idle composer opens rewind |
+| `Ctrl-C` | clear input, cancel a running turn, or quit |
+| `Ctrl-D` | quit when the composer is empty |
+
+`Ctrl-C`/`Ctrl-D`/`Esc` quitting only closes this view; it never cancels the
+Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
+`/cancel`.
+
+Commands: `/sessions`, `/workspaces`, `/new`, `/attach`, `/cancel`, `/clear`,
+`/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/verbose`, `/help`,
+`/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
+
+See [TUI design](docs/TUI-DESIGN.md) for the palette, metric sources and
+responsive rules.
 
 ## Scriptable CLI
 
@@ -218,7 +313,7 @@ There is no token or Cookie. Run dshell as the same user that started the Host.
 
 | Symptom | Fix |
 | --- | --- |
-| `HOST_NOT_RUNNING` / no socket | Start `dsh --profile web` with the plugin installed. |
+| `HOST_NOT_RUNNING` / no socket | Start `dsh --profile web` with the plugin installed, or run `./scripts/dev-host.sh`. |
 | `PLUGIN_MISSING` | The Host booted without `dshell-host`; add the plugin to the web profile and restart. |
 | `PROTOCOL_MISMATCH` | Install the CLI and plugin from the same dshell version. |
 | `SOCKET_PERMISSION_DENIED` | Run dshell as the Host user; check `DSH_HOME` ownership and socket mode `0600`. |
