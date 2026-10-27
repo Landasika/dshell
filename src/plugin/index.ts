@@ -230,6 +230,32 @@ function jsonLine(socket: Socket, message: unknown): void {
   }
 }
 
+/**
+ * Bound a host-side query that may contend with another Host over the same
+ * DSH home. Resolves to `undefined` on timeout so callers can degrade to an
+ * empty/summary view instead of blocking every connected client.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      console.error(`[dshell-host] ${label} timed out after ${timeoutMs}ms`)
+      resolve(undefined)
+    }, timeoutMs)
+    timer.unref?.()
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        console.error(`[dshell-host] ${label} failed: ${error instanceof Error ? error.message : String(error)}`)
+        resolve(undefined)
+      },
+    )
+  })
+}
+
 function canConnect(socketPath: string, timeoutMs = 300): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new Socket()
@@ -326,14 +352,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   }
 
   const listSessions = async (workspaceId?: string): Promise<SessionSummary[]> => {
-    const records = await ctx.sessionQuery.listSessions()
+    const records = await withTimeout(ctx.sessionQuery.listSessions(), 4_000, 'session list')
+    if (records === undefined) return []
     const workspaces = workspaceList()
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
     const titles = new Map<string, string>()
     if (ctx.sessionQuery.readTitleSnapshots !== undefined && records.length > 0) {
       try {
-        const observations = await ctx.sessionQuery.readTitleSnapshots(records.map((record) => record.header.id))
-        for (const observation of observations) {
+        const observations = await withTimeout(
+          ctx.sessionQuery.readTitleSnapshots(records.map((record) => record.header.id)),
+          1_500,
+          'session titles',
+        )
+        for (const observation of observations ?? []) {
           const title = observation.value?.title?.title
           if (observation.status === 'fulfilled' && typeof title === 'string' && title.length > 0) {
             titles.set(observation.sessionId, title)
@@ -730,7 +761,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             dshVersion: inferDshVersion(),
             capabilities: [...CAPABILITIES] as Capability[],
             socketPath,
-            sessions: await listSessions(),
+            // Keep the handshake O(1). Session enumeration can block on a
+            // shared DSH home (other live Hosts, locked stores); clients issue
+            // an explicit `list` after connecting, where a slow path can be
+            // reported without making the whole Host look absent.
+            sessions: [],
             workspaces: workspaceList(),
           })
           return
