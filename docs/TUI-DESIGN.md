@@ -9,9 +9,9 @@ rules:
 2. **One truth.** The durable session log is the only source. Metrics are
    projections of `SessionView.events`; the TUI never keeps a second counter
    that can drift from the Host.
-3. **Responsive by dropping optional fields.** The prompt frame keeps `ctx`
-   longest but trades the bar for a percentage and then drops it; the usage
-   rail keeps the model route longest and drops totals, spend, cwd, git,
+3. **Responsive by dropping optional fields.** The composer's top rule keeps
+   `ctx` longest but trades the bar for a percentage and then drops it; the
+   usage rail keeps the model route longest and drops totals, spend, cwd, git,
    agents and cache first. The launch picker and the composer are never
    clipped to make room for decoration.
 
@@ -35,9 +35,10 @@ rules:
 ├ status strip (only when agents/jobs/todos exist) ──────────────────────┤
 │ ✓ agents 1/1  ● jobs 1  ● todo 0/6                                     │
 ├ composer ──────────────────────────────────────────────────────────────┤
-│ ╭─ prompt ─────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps ───────────────────╮ │
-│ │ ❯ draft                                                            │ │
-│ ╰─ enter send · / commands · @ files · ctrl+r history · ? help ───────╯ │
+│ ────────────────────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps                 │
+│ ❯ draft                                                                │
+│ ───────────────────────────────────────────────────────────────────────│
+│   enter send · / commands · @ files · ctrl+r history · ? help          │
 ├ jump pill (only while scrolled up) ────────────────────────────────────┤
 │                                        ↓ 12 new · End                 │
 ├ usage rail ────────────────────────────────────────────────────────────┤
@@ -226,9 +227,9 @@ turn.
 
 ## Responsiveness
 
-- The prompt frame's `ctx`/TPS variants degrade with width: bar + TPS, bar,
-  percentage + TPS, percentage, TPS only, then nothing. The frame is always
-  exactly `columns` wide.
+- The composer rule's `ctx`/TPS variants degrade with width: bar + TPS, bar,
+  percentage + TPS, percentage, TPS only, then nothing. The bar is skipped
+  below 32 columns; every composer row is exactly `columns` wide.
 - Usage-rail segments drop in this order: input/output totals → spend → cwd →
   git breadcrumb → agents → cache. The provider/model route never drops. The
   cache bar only appears from 96 columns; below that it collapses to a

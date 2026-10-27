@@ -157,9 +157,10 @@ Inside a session:
 ⇢ agent started  接入 OctoPrint harness · 18b9d1cc
 ⢿ Running command · rg reconnect src · 12s · ctx 84%
 ▸ 1/3 · Adding bounded backoff                                    ctrl+t hide
-╭─ prompt ──────────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps ───────────────╮
-│ ❯ ask anything                                                       │
-╰─ enter send · / commands · @ files · ctrl+r history · ? help ────────╯
+────────────────────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps
+❯ ask anything
+──────────────────────────────────────────────────────────────────────
+  enter send · / commands · @ files · ctrl+r history · ? help
 deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cache ▰▰▰▰▰ 91%  ↑12.4k ↓840
 ```
 
@@ -186,10 +187,11 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   above the composer; click it, press `End`/`Enter`, or `Esc` to return to the
   live tail. `DSHELL_NO_MOUSE=1` disables mouse capture so the terminal keeps
   its own scrollback and text selection.
-- prompt frame header (the composer's top border): the context gauge
-  (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and token speed (`42 tps`), right-aligned. Wide
+- composer (frameless, Claude-Code style): a horizontal rule, the `❯` input,
+  another rule, then a dim shortcut hint. The top rule carries the context
+  gauge (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and token speed (`42 tps`) right-aligned. Wide
   terminals get the 10-cell bar with TPS; narrower ones drop TPS, then collapse
-  the bar to a plain percentage, then drop the gauge. The frame never wraps.
+  the bar to a plain percentage, then drop the gauge. Rules never wrap.
 - usage rail (bottom, under the composer): provider/model route (`provider/model`),
   the cwd (`~/…`), the Git branch with ahead/behind counts (`main [↑10]`, `*`
   when dirty), subagent progress (`✓ agents 1/1`, `✗` plus a failed count),

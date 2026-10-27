@@ -7,11 +7,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
-- **Context and speed in the prompt frame**: the composer's top border now
-  carries the context gauge (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and token speed
-  (`42 tps`) right-aligned. It degrades with width (bar + TPS → bar → pct +
-  TPS → pct → TPS → nothing) instead of wrapping. The context gauge and TPS
-  moved out of the bottom rail to avoid showing them twice.
+- **Frameless composer**: the boxed prompt is now Claude-Code-style horizontal
+  rules — top rule (with the context gauge and token speed right-aligned),
+  the `❯` input, a bottom rule, then a dim shortcut hint. Input text starts
+  two columns from the left edge and grows the same way as before.
+- **Context and speed in the prompt rule**: `ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps`
+  degrades with width (bar + TPS → bar → pct + TPS → pct → TPS → nothing)
+  instead of wrapping; the bar is skipped below 32 columns. Both moved out of
+  the bottom rail to avoid showing them twice.
 - **Herdr integration**: when dshell runs inside a Herdr pane it reports its
   agent state (`working` / `blocked` on approvals / `idle`), the DSH session id
   and a resume command over Herdr's socket API, and releases the pane on quit.
