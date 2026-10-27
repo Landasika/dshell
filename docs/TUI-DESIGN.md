@@ -157,6 +157,22 @@ showing `copied N lines`/`copied N chars`. Holding Shift still hands the drag
 to the terminal's native selection for environments where OSC 52 is disabled.
 `DSHELL_NO_MOUSE=1` disables the whole mouse protocol.
 
+## Herdr
+
+Inside a Herdr pane (`HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH`) the
+TUI reports to Herdr's local socket directly: `pane.report_agent` for the
+semantic state and DSH session, `pane.release_agent` on quit. State is
+`working` while a turn runs, `blocked` with the tool name while an approval is
+waiting, and `idle` otherwise. The resume command is `dshell --resume <id>`
+when `dshell` is on `PATH`, otherwise `node <current bin> --resume <id>`.
+
+Reports are fire-and-forget with a 400 ms timeout; at most one request is in
+flight and intermediate states collapse into the newest, so a slow or dead
+Herdr can never stall rendering. Sequence numbers are millisecond timestamps,
+which Herdr uses to discard late reports. This is the protocol from Herdr's
+"Add Herdr support to your agent" guide; no hook installation or settings
+merge is involved, unlike the Claude Code integration.
+
 ## Scrolling, agents and thinking
 
 **Scrolling.** The alternate screen enables SGR mouse reporting

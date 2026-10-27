@@ -253,6 +253,22 @@ Commands: `/sessions`, `/workspaces`, `/new`, `/attach`, `/cancel`, `/clear`,
 `/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/agents`, `/verbose`, `/help`,
 `/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
 
+### Herdr
+
+Run the TUI inside a [Herdr](https://herdr.dev) pane and it integrates itself:
+
+- the pane shows `dshell` with `working`, `blocked` (approval waiting) or
+  `idle` state in Herdr's sidebar and in `herdr agent list`
+- the DSH session id and a resume command are reported, so a Herdr server
+  restart reopens the same conversation in that pane
+- quitting releases the agent from the pane
+- outside Herdr it is a no-op; `DSHELL_NO_HERDR=1` disables it explicitly
+
+Unlike Claude Code, which needs `herdr integration install claude` to write a
+`SessionStart` hook into its settings, dshell speaks Herdr's
+`pane.report_agent` socket protocol directly (the "Add Herdr support to your
+agent" path), so there is no hook or settings file to install.
+
 See [TUI design](docs/TUI-DESIGN.md) for the palette, metric sources and
 responsive rules.
 

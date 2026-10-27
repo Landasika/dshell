@@ -46,6 +46,7 @@ import {
   renderUsageRail,
 } from './activity.js'
 import { readGitInfo, type GitInfo } from './git.js'
+import { createHerdrReporter, resumeCommand, type HerdrReporter, type HerdrState } from './herdr.js'
 import {
   centerBlock,
   centerVertically,
@@ -232,6 +233,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let gitInfo: GitInfo | undefined
   let gitCwd: string | undefined
   let gitFetchedAt = 0
+  const herdrReporter: HerdrReporter | undefined = createHerdrReporter()
+  let herdrResume: { id: string; argv: string[] | undefined } | undefined
   let metricsCache: { key: string; value: SessionMetrics } | undefined
   let lastBodyHeight = 3
   let resolveDone: ((code: number) => void) | undefined
@@ -283,6 +286,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const quit = (code = 0): void => {
     if (state.quitting) return
     state.quitting = true
+    herdrReporter?.release()
     if (renderTimer !== undefined) clearTimeout(renderTimer)
     if (escapeTimer !== undefined) clearTimeout(escapeTimer)
     if (pollTimer !== undefined) clearInterval(pollTimer)
@@ -337,9 +341,35 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     })
   }
 
+  const reportHerdr = (view: SessionView | undefined, override?: HerdrState): void => {
+    if (herdrReporter === undefined) return
+    let resume: string[] | undefined
+    if (view !== undefined) {
+      if (herdrResume?.id !== view.sessionId) {
+        herdrResume = { id: view.sessionId, argv: resumeCommand(view.sessionId) }
+      }
+      resume = herdrResume.argv
+    }
+    const session = view === undefined
+      ? {}
+      : { sessionId: view.sessionId, ...(resume === undefined ? {} : { resumeArgv: resume }) }
+    const approval = view?.pendingApproval
+    if (override !== undefined) {
+      herdrReporter.update({ state: override, ...session })
+      return
+    }
+    if (approval !== undefined) {
+      const tool = approval.toolName ?? 'tool'
+      herdrReporter.update({ state: 'blocked', message: `${tool} needs a decision`, ...session })
+      return
+    }
+    herdrReporter.update({ state: view?.status === 'running' ? 'working' : 'idle', ...session })
+  }
+
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
+    reportHerdr(view)
     refreshGit()
     // Surface a failed turn in the header and as a toast, not only inline.
     const failure = turnFailureMessage(view.events)
@@ -499,6 +529,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.editor = createEditor()
     state.status = 'sending'
     state.error = undefined
+    reportHerdr(state.view, 'working')
     schedule()
     try {
       await state.handle.send(trimmed)
@@ -1678,6 +1709,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   screen.start()
   refreshGit()
   gitTimer = setInterval(refreshGit, 4000)
+  reportHerdr(state.view)
 
   // Accept input before the first Host round-trip. A slow or broken Host must
   // never leave the user staring at an unresponsive alternate screen.

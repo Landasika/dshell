@@ -7,6 +7,12 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Herdr integration**: when dshell runs inside a Herdr pane it reports its
+  agent state (`working` / `blocked` on approvals / `idle`), the DSH session id
+  and a resume command over Herdr's socket API, and releases the pane on quit.
+  Herdr can then restore the same session after a server restart. Being a
+  native reporter (the "Add Herdr support" protocol) avoids the SessionStart
+  hook that the Claude Code integration installs. `DSHELL_NO_HERDR=1` opts out.
 - **Richer bottom rail**: one line now shows the provider/model route, `~/…`
   cwd, the Git branch with ahead/behind counts (and `*` when dirty), subagent
   progress, the cache hit rate and context pressure as segmented `▰/▱` bars,
