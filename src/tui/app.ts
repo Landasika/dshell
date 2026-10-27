@@ -77,6 +77,8 @@ interface StartupState {
   workspace?: WorkspaceSummary
   sessions: SessionSummary[]
   index: number
+  /** True until the Host answers the first workspace/session query. */
+  loading?: boolean
 }
 
 type Overlay =
@@ -361,15 +363,35 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
-  const refreshSessions = async (): Promise<void> => {
+  const refreshWorkspaces = async (): Promise<void> => {
     try {
-      state.sessions = await backend.listSessions()
       state.workspaces = await backend.listWorkspaces()
       schedule()
     } catch (error) {
       state.error = errorText(error)
       schedule()
     }
+  }
+
+  // Scope enumeration to one workspace when possible: a shared DSH home can
+  // hold hundreds of sessions, and titles only need resolving for the rows the
+  // picker will actually show.
+  const refreshSessions = async (workspaceId?: string): Promise<void> => {
+    try {
+      state.sessions = await backend.listSessions(workspaceId)
+      schedule()
+    } catch (error) {
+      state.error = errorText(error)
+      schedule()
+    }
+  }
+
+  const workspaceIdForCwd = (cwd: string): string | undefined => {
+    const workspace = findWorkspaceForCwd(state.workspaces, cwd)
+    if (workspace !== undefined) return workspace.id
+    const view = state.view
+    if (view === undefined) return undefined
+    return findWorkspaceForCwd(state.workspaces, canonicalPath(view.header.cwd ?? options.cwd))?.id
   }
 
   const createSession = async (cwd?: string, workspaceId?: string): Promise<void> => {
@@ -394,7 +416,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const pending = state.pendingPrompt
       state.pendingPrompt = undefined
       if (pending !== undefined) void send(pending)
-      await refreshSessions()
+      void refreshSessions(workspaceIdForCwd(canonicalPath(view.header.cwd ?? options.cwd)))
       toast(`created ${view.sessionId}`)
     } catch (error) {
       state.error = errorText(error)
@@ -403,14 +425,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
-  const prepareStartup = (): void => {
+  const prepareStartup = async (): Promise<void> => {
     const cwd = canonicalPath(options.cwd)
+    if (state.workspaces.length === 0) await refreshWorkspaces()
     const workspace = findWorkspaceForCwd(state.workspaces, cwd)
     if (workspace === undefined) {
       state.startup = { kind: 'missing', cwd, sessions: [], index: 0 }
       schedule()
       return
     }
+    await refreshSessions(workspace.id)
     const sessions = state.sessions
       .filter((session) => {
         if (session.workspaceId === workspace.id) return true
@@ -608,12 +632,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         return
       case '/sessions':
       case '/resume':
+        state.status = 'listing sessions'
+        schedule()
         await refreshSessions()
+        state.status = 'idle'
         state.overlay = { kind: 'sessions', index: 0 }
         schedule()
         return
       case '/workspaces':
+        state.status = 'listing sessions'
+        schedule()
         await refreshSessions()
+        state.status = 'idle'
         state.overlay = { kind: 'workspaces', index: 0 }
         schedule()
         return
@@ -844,6 +874,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     const startup = state.startup
     if (startup === undefined) return
+    if (startup.loading === true) {
+      // Ignore enter/n until the list is real: creating a session by accident
+      // while the Host is still answering would be surprising.
+      if (key.type === 'ctrl-c' || key.type === 'ctrl-d' || key.type === 'escape') quit(0)
+      else if (key.type === 'text' && key.text.toLowerCase() === 'q') quit(0)
+      return
+    }
     if (key.type === 'ctrl-c' || key.type === 'ctrl-d' || key.type === 'escape') {
       quit(0)
       return
@@ -1236,7 +1273,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
         const live = session.live === true ? paint(theme, 'success', 'live') : paint(theme, 'muted', 'cold')
         const age = timeAgo(session.createdAt)
-        const label = session.title?.trim() || session.sessionId.slice(0, 24)
+        const label = session.title?.trim() || 'untitled session'
         const row = `${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(label, 26))}`
         const right = `${live} ${paint(theme, 'muted', age)}`
         return `${row}${' '.repeat(Math.max(1, inner - displayWidth(row) - displayWidth(right)))}${right}`
@@ -1408,7 +1445,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const sessions: SplashSession[] = startup.sessions.map((session) => {
       const title = session.title?.trim()
       return {
-        label: title === undefined || title.length === 0 ? session.sessionId : title,
+        label: title === undefined || title.length === 0 ? 'untitled session' : title,
         live: session.live === true,
         cwd: session.cwd ?? '',
         age: timeAgo(session.createdAt),
@@ -1423,6 +1460,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       ...(startup.workspace === undefined ? {} : { workspaceTitle: startup.workspace.title, workspacePath: startup.workspace.path }),
       sessions,
       index: startup.index,
+      ...(startup.loading === true ? { loading: true } : {}),
       ...(state.error === undefined ? {} : { error: state.error }),
     })
   }
@@ -1535,6 +1573,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     ensureTick()
   }
 
+  // Show the picker immediately instead of flashing the chat shell while the
+  // first Host round-trip runs.
+  const pickerMode = options.resume === undefined && options.create !== true
+  if (pickerMode) {
+    state.startup = { kind: 'sessions', cwd: canonicalPath(options.cwd), sessions: [], index: 0, loading: true }
+  }
+
   screen.onResizeRequest(() => schedule())
   screen.start()
 
@@ -1548,19 +1593,23 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   render()
 
   try {
-    await refreshSessions()
+    await refreshWorkspaces()
     const resume = options.resume
     if (resume !== undefined) {
       await openSession(resume)
     } else if (options.create === true) {
       await createSession(options.cwd, options.workspaceId)
     } else {
-      prepareStartup()
+      await prepareStartup()
     }
     state.status = 'idle'
     schedule()
     pollTimer = setInterval(() => {
-      void refreshSessions()
+      if (state.startup !== undefined) {
+        void refreshSessions(state.startup.workspace?.id)
+      } else {
+        void refreshSessions(workspaceIdForCwd(canonicalPath(state.view?.header.cwd ?? options.cwd)))
+      }
     }, 5_000)
     const code = await done
     return code

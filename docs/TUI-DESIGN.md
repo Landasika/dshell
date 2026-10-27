@@ -127,6 +127,24 @@ usage and are ignored.
 `~¥0.42` is an estimate, not a bill. The panel shows the peak/idle split, the
 per-model breakdown and the unpriced remainder; the rail keeps only the total.
 
+## Startup
+
+The picker is the first frame: `runTui` installs a `loading` startup state
+before `screen.start()`, so a slow Host cannot flash the chat shell. The boot
+sequence then loads workspaces, resolves the workspace for the cwd, and asks
+the Host for that workspace's sessions only. While the answer is in flight the
+picker accepts only `q`/`Ctrl-C`; `Enter`/`n` are ignored so a stray keypress
+cannot create a session.
+
+Session rows come from `SessionSummary.title`, which the Host folds from the
+DSH title snapshot (falling back to the session header). Rows without a title
+show `untitled session`, never the raw UUID, and sessions whose header carries
+`origin: "subagent"` (or a `parentSession`) are excluded: children belong to
+their parent's roster, not the global picker. Session lists are cached for a
+few seconds and titles resolve a few rows per poll, because a shared `~/.dsh`
+can hold hundreds of sessions and every snapshot read costs hundreds of
+milliseconds.
+
 ## Scrolling, agents and thinking
 
 **Scrolling.** The alternate screen enables SGR mouse reporting

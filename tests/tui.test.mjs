@@ -204,6 +204,8 @@ test('TUI smoke: starts, renders a turn, and quits without a PTY', async () => {
 
   await waitFor(() => output.text.includes('dshell'))
   await waitFor(() => output.text.includes('choose session'))
+  // The picker paints while the Host is still listing; wait for the loaded row.
+  await waitFor(() => output.text.includes('untitled session'))
   input.push('\r')
   await waitFor(() => output.text.includes('idle'))
   input.push('hello')
@@ -338,6 +340,7 @@ test('TUI startup supports arrow selection and Enter attach', async () => {
   }
 
   await waitFor(() => output.text.includes('choose session'))
+  await waitFor(() => output.text.includes('First session'))
   assert.equal(output.text.includes('First session'), true)
   assert.equal(output.text.includes('Second session'), true)
   input.push('\u001b[B') // down: s1 -> s2 (CSI mode)
@@ -838,4 +841,53 @@ test('job events fold into running and failed counts', () => {
   ]
   const metrics = collectMetrics({ sessionId: 's', header: { id: 's' }, events, cursor: 4, status: 'running', streamText: '', streamReasoning: '' })
   assert.deepEqual(metrics.jobs, { running: 1, total: 2, failed: 1 })
+})
+
+test('TUI opens on the picker with real titles instead of flashing the chat shell', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 90
+    rows = 26
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/w', title: 'Design session' }])
+  await backend.connect()
+  const list = backend.listSessions.bind(backend)
+  backend.listSessions = async (workspaceId) => {
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    return list(workspaceId)
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/w', color: false, input, output })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  const early = stripAnsi(output.text)
+  assert.match(early, /choose session/)
+  assert.match(early, /reading sessions|waiting for the Host/)
+  assert.equal(early.includes('prompt'), false)
+
+  for (let index = 0; index < 100; index += 1) {
+    if (stripAnsi(output.text).includes('Design session')) break
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  const loaded = stripAnsi(output.text)
+  assert.match(loaded, /Design session/)
+  input.push('q')
+  assert.equal(await app, 0)
+  await backend.disconnect()
 })

@@ -22,6 +22,8 @@ export interface SplashInput {
   workspacePath?: string
   sessions: readonly SplashSession[]
   index: number
+  /** The Host has not answered the first session query yet. */
+  loading?: boolean
   error?: string
 }
 
@@ -61,9 +63,11 @@ function content(theme: Theme, input: SplashInput, width: number): string[] {
     lines.push(`${paint(theme, 'text', 'enter')} create workspace + new session`)
     lines.push(`${paint(theme, 'text', 'q')} quit without creating anything`)
   } else {
-    lines.push(paint(theme, 'muted', '↑/↓ move · enter attach · n new session · q quit'))
+    lines.push(paint(theme, 'muted', input.loading === true ? 'q quit · waiting for the Host' : '↑/↓ move · enter attach · n new session · q quit'))
     lines.push('')
-    if (input.sessions.length === 0) {
+    if (input.loading === true) {
+      lines.push(paint(theme, 'muted', 'reading sessions from the dsh Host…'))
+    } else if (input.sessions.length === 0) {
       lines.push(paint(theme, 'muted', 'No sessions in this workspace yet. Press n to create one.'))
     } else {
       const visible = Math.max(1, Math.min(12, input.rows - lines.length - 4))

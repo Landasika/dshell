@@ -7,6 +7,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Startup picker titles**: the picker is painted before the first Host call
+  (no chat-shell flash), lists only the current workspace's top-level
+  sessions, and shows DSH title snapshots instead of session UUIDs. Subagent
+  children are hidden from the picker and remain in the `Ctrl-G` roster.
+  Session enumeration is cached and scoped, and titles resolve progressively.
 - **Transcript scrolling**: SGR mouse capture routes the wheel to the
   transcript (3 lines per tick); `PgUp`/`PgDn` page. While scrolled up a
   clickable `↓ N new · End` pill returns to the live tail, as do `End`,

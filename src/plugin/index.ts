@@ -62,6 +62,9 @@ interface SessionRecordLike {
     cwd?: string
     createdAt?: number
     title?: string
+    origin?: string
+    parentSession?: string
+    delegationDepth?: number
   }
   live: boolean
   persisted: boolean
@@ -351,49 +354,90 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }))
   }
 
+  // Enumerating a large shared DSH home is the single slowest control call:
+  // hundreds of session logs plus their projection snapshots. Cache the folded
+  // list briefly, resolve titles only for the sessions we actually return, and
+  // keep subagent children out of the picker (they belong to a parent's roster).
+  const sessionCache = new Map<string, { at: number; sessions: SessionSummary[] }>()
+  const titleCache = new Map<string, { at: number; title: string }>()
+  const SESSION_LIST_TIMEOUT_MS = 15_000
+  const SESSION_CACHE_MS = 4_000
+
   const listSessions = async (workspaceId?: string): Promise<SessionSummary[]> => {
-    const records = await withTimeout(ctx.sessionQuery.listSessions(), 4_000, 'session list')
+    const cacheKey = workspaceId ?? ''
+    const cached = sessionCache.get(cacheKey)
+    if (cached !== undefined && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions
+    const records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
     if (records === undefined) return []
     const workspaces = workspaceList()
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
+    const workspaceOf = (record: SessionRecordLike): WorkspaceSummary | undefined =>
+      record.header.cwd === undefined ? undefined : workspaceByPath.get(record.header.cwd)
+    const visible = records
+      .filter((record) => record.header.origin !== 'subagent' && record.header.parentSession === undefined)
+      .map((record) => ({ record, workspace: workspaceOf(record) }))
+      .filter((entry) => workspaceId === undefined || entry.workspace?.id === workspaceId)
+      .sort((left, right) => (right.record.header.createdAt ?? 0) - (left.record.header.createdAt ?? 0))
+
     const titles = new Map<string, string>()
-    if (ctx.sessionQuery.readTitleSnapshots !== undefined && records.length > 0) {
-      try {
-        const observations = await withTimeout(
-          ctx.sessionQuery.readTitleSnapshots(records.map((record) => record.header.id)),
-          1_500,
-          'session titles',
-        )
-        for (const observation of observations ?? []) {
-          const title = observation.value?.title?.title
-          if (observation.status === 'fulfilled' && typeof title === 'string' && title.length > 0) {
-            titles.set(observation.sessionId, title)
-          }
+    const TITLE_CACHE_MS = 300_000
+    if (ctx.sessionQuery.readTitleSnapshots !== undefined) {
+      // Each snapshot read costs a few hundred ms, so resolve titles only for
+      // the rows the picker can show, in parallel, and cache them across polls.
+      const pending: string[] = []
+      for (const entry of visible.slice(0, 24)) {
+        const id = entry.record.header.id
+        const cachedTitle = titleCache.get(id)
+        if (cachedTitle !== undefined && Date.now() - cachedTitle.at < TITLE_CACHE_MS) {
+          titles.set(id, cachedTitle.title)
+        } else {
+          pending.push(id)
         }
-      } catch {
-        // A title is presentation metadata. A title-fold failure must not make
-        // the whole session list unusable.
+      }
+      // The projection store serializes snapshot reads, so ask one at a time
+      // with a whole-batch budget: a title must never hold the picker hostage.
+      // Each poll advances a few more rows, so older sessions fill in over time.
+      let deadline = Date.now() + 3_000
+      let resolved = 0
+      for (const id of pending) {
+        if (Date.now() > deadline || resolved >= 12) break
+        resolved += 1
+        try {
+          const observations = await withTimeout(
+            ctx.sessionQuery.readTitleSnapshots!([id]),
+            1_200,
+            'session title',
+          )
+          const observation = observations?.[0]
+          const title = observation?.value?.title?.title
+          if (observation?.status === 'fulfilled' && typeof title === 'string' && title.length > 0) {
+            titles.set(id, title)
+            titleCache.set(id, { at: Date.now(), title })
+          }
+        } catch {
+          // A title is presentation metadata; a slow or missing snapshot must
+          // not delay the session list.
+          deadline = Math.min(deadline, Date.now() + 500)
+        }
       }
     }
-    return records
-      .map((record) => {
-        const workspace = record.header.cwd === undefined
-          ? undefined
-          : workspaceByPath.get(record.header.cwd)
-        const title = titles.get(record.header.id) ?? record.header.title
-        return {
-          sessionId: record.header.id,
-          ...(title === undefined || title.length === 0 ? {} : { title }),
-          cwd: record.header.cwd,
-          createdAt: record.header.createdAt,
-          live: record.live,
-          persisted: record.persisted,
-          formatStatus: record.formatStatus,
-          ...(workspace === undefined ? {} : { workspaceId: workspace.id }),
-          status: record.live ? 'running' : 'idle',
-        }
-      })
-      .filter((session) => workspaceId === undefined || session.workspaceId === workspaceId)
+
+    const sessions = visible.map(({ record, workspace }) => {
+      const title = titles.get(record.header.id) ?? record.header.title
+      return {
+        sessionId: record.header.id,
+        ...(title === undefined || title.length === 0 ? {} : { title }),
+        cwd: record.header.cwd,
+        createdAt: record.header.createdAt,
+        live: record.live,
+        persisted: record.persisted,
+        formatStatus: record.formatStatus,
+        ...(workspace === undefined ? {} : { workspaceId: workspace.id }),
+        status: record.live ? 'running' : 'idle',
+      }
+    })
+    sessionCache.set(cacheKey, { at: Date.now(), sessions })
+    return sessions
   }
 
   const composeAgent = async (presetId: string | undefined): Promise<{

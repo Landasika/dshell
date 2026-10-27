@@ -163,6 +163,13 @@ Inside a session:
 ↑12.4k  cache 3k  ↓840  ~¥0.42  deepseek-v4.1-flash     ctx ███░░░░░ 25% · 42 tps
 ```
 
+- startup picker: drawn before the first Host round-trip, so the chat shell
+  never flashes while connecting. Rows use the DSH title snapshot (the same
+  one the Web UI shows) and fall back to `untitled session`, never to a bare
+  UUID; subagent child sessions are hidden and remain reachable through the
+  parent's `Ctrl-G` roster. Listing is scoped to the current workspace, cached
+  for a few seconds, and titles are resolved progressively so a large shared
+  `~/.dsh` stays responsive.
 - header: brand, session title, status (idle / running / approval / error) and
   working directory.
 - thinking: folded to a `⚓ thinking · N tok · ctrl+o` header plus the last
@@ -222,6 +229,7 @@ the official API.
 | `Ctrl-R` | search prompts sent in this session |
 | `Ctrl-B` | session panel: context breakdown, session spend, tokens, speed, todos, agents |
 | `Ctrl-G` | subagent list; `Enter` opens that child's transcript |
+| `q` | quit from the startup picker |
 | `End` / `Enter` / `Esc` | jump back to the live tail while scrolled up |
 | wheel, `PgUp`/`PgDn` | scroll the transcript |
 | `Ctrl-T` | fold/show the todo strip |

@@ -104,12 +104,14 @@ export class SocketBackend implements DshellBackend {
 
   async listSessions(workspaceId?: string): Promise<SessionSummary[]> {
     const connection = this.requireControl()
-    connection.send({ type: 'session/list' })
+    connection.send({ type: 'session/list', ...(workspaceId === undefined ? {} : { workspaceId }) })
     let message: SessionsMessage
     try {
+      // A shared DSH home can hold hundreds of sessions; enumeration plus
+      // title snapshots is allowed to take a while before it reports empty.
       message = await connection.waitFor<SessionsMessage>(
         (candidate) => candidate.type === 'sessions',
-        10_000,
+        25_000,
       )
     } catch (error) {
       throw mapError(error)
