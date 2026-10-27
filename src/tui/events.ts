@@ -290,9 +290,16 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
       }
       case 'turn/end':
       case 'turn/failed': {
-        if (verbose) {
-          const reason = (data.reason ?? {}) as Json
-          const label = reason.kind === 'completed' ? 'turn completed' : `turn ${String(reason.kind ?? 'ended')}`
+        const reason = (data.reason ?? {}) as Json
+        const kind = String(reason.kind ?? '')
+        if (kind === 'error' || kind === 'failed' || event.type === 'turn/failed') {
+          // A failed turn otherwise leaves the transcript silent: the user
+          // sees the prompt and then nothing. Always surface the reason.
+          const failure = (reason.error ?? reason.failure ?? {}) as Json
+          const message = String(failure.message ?? failure.code ?? 'the Host ended the turn with an error')
+          blocks.push({ kind: 'error', title: 'turn failed', body: truncate(message, 400) })
+        } else if (verbose) {
+          const label = kind === 'completed' ? 'turn completed' : `turn ${kind || 'ended'}`
           blocks.push({ kind: 'turn', title: label, body: '' })
         }
         break

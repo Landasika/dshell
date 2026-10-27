@@ -784,6 +784,24 @@ test('thinking folds to one header per turn and expands under verbose', () => {
   assert.ok(full.some((line) => line.includes('ctrl+o fold')))
 })
 
+test('a failed turn is always visible in the transcript', () => {
+  const failed = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] } } },
+    { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'error', error: { message: 'Insufficient Balance (request_id: abc)', code: 'QUOTA', status: 402 } } } },
+  ]
+  const lines = renderBlocks(buildBlocks(failed), 80, theme).map(stripAnsi)
+  const error = lines.find((line) => line.includes('turn failed'))
+  assert.ok(error)
+  assert.match(error, /Insufficient Balance/)
+  assert.ok(renderBlocks(buildBlocks(failed, true), 80, theme).some((line) => stripAnsi(line).includes('Insufficient Balance')))
+
+  const completed = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] } } },
+    { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+  ]
+  assert.equal(renderBlocks(buildBlocks(completed), 80, theme).some((line) => stripAnsi(line).includes('turn failed')), false)
+})
+
 test('subagent roster follows catalog and settlement events', () => {
   const child = '18b9d1cc-8488-44de-a495-3cc8babff2d5'
   const events = [
