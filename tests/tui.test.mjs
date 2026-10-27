@@ -324,8 +324,8 @@ test('TUI startup supports arrow selection and Enter attach', async () => {
   const input = new FakeInput()
   const output = new FakeOutput()
   const backend = new FakeBackend([
-    { sessionId: 's1', cwd: '/work', title: 'First session' },
-    { sessionId: 's2', cwd: '/work', title: 'Second session' },
+    { sessionId: 's1', cwd: '/work', title: 'First session', createdAt: 2 },
+    { sessionId: 's2', cwd: '/work', title: 'Second session', createdAt: 1 },
   ])
   await backend.connect()
   const app = runTui(backend, { cwd: '/work', color: false, input, output })
@@ -393,6 +393,321 @@ test('TUI slash completion menu filters and executes a command', async () => {
   input.push('q')
   await waitFor(() => output.text.includes('/quit'))
   input.push('\r')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+// ---------------------------------------------------------------------------
+// New TUI design layer: metrics, context bar, activity, brand art, chrome.
+// ---------------------------------------------------------------------------
+
+import {
+  collectMetrics,
+  estimateTokens,
+  formatDuration,
+  formatTokens,
+  nextSpeedSample,
+  normalizeUsage,
+  todoCounts,
+} from '../dist/tui/metrics.js'
+import { allocateColumns, contextBarLayout, renderContextBar } from '../dist/tui/contextbar.js'
+import { renderActivityLine, renderTodoStrip, renderTpsGauge, renderUsageRail } from '../dist/tui/activity.js'
+import { renderSplash } from '../dist/tui/splash.js'
+import { renderComposer } from '../dist/tui/chrome.js'
+import { estimateSessionCost, formatCostCny, isPeakHour, parseUsage, priceForModel } from '../dist/tui/cost.js'
+
+const metricsEvents = [
+  { type: 'request/context', seq: 1, time: 1_700_000_000_000 - 21_000, data: { provider: 'deepseek', model: 'deepseek-chat', contextWindow: 64_000 } },
+  { type: 'user/message', seq: 2, time: 1_700_000_000_000 - 20_000, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Refactor the socket client and add retries' }] } } },
+  {
+    type: 'assistant/message',
+    seq: 3,
+    time: 1_700_000_000_000 - 15_000,
+    data: {
+      usage: { inputTokens: 12_400, outputTokens: 840, cacheReadTokens: 3_000, totalTokens: 16_240 },
+      message: { role: 'assistant', content: [{ type: 'reasoning', text: 'Inspect the retry path.' }, { type: 'text', text: 'I will split the reconnect logic into a helper.' }] },
+    },
+  },
+  { type: 'tool/call', seq: 4, time: 1_700_000_000_000 - 14_000, data: { name: 'bash', callId: 'c1', arguments: '{"command":"rg reconnect src"}' } },
+  { type: 'tool/result', seq: 5, time: 1_700_000_000_000 - 13_000, data: { message: { toolCallId: 'c1', content: [{ type: 'text', text: 'src/client/socket-client.ts:120' }] } } },
+  { type: 'todo/write', seq: 6, data: { todos: [{ content: 'Inspect reconnect path', status: 'completed' }, { content: 'Add bounded backoff', status: 'in_progress', activeForm: 'Adding bounded backoff' }, { content: 'Add tests', status: 'pending' }] } },
+  { type: 'turn/start', seq: 7, time: 1_700_000_000_000 - 21_000 },
+  { type: 'turn/end', seq: 8, time: 1_700_000_000_000 - 12_000, data: { reason: { kind: 'completed' } } },
+]
+
+test('metrics project usage, context composition, todos, timing, and activity', () => {
+  const view = { sessionId: 's1', header: { id: 's1' }, events: metricsEvents, cursor: 8, status: 'idle', streamText: '' }
+  const metrics = collectMetrics(view, 1_700_000_000_000)
+  assert.equal(metrics.model, 'deepseek-chat')
+  assert.equal(metrics.provider, 'deepseek')
+  assert.equal(metrics.contextWindow, 64_000)
+  assert.equal(metrics.usedTokens, 16_240)
+  assert.equal(metrics.lastUsage.input, 12_400)
+  assert.equal(metrics.lastUsage.output, 840)
+  assert.equal(metrics.lastUsage.cacheRead, 3_000)
+  assert.equal(metrics.lastUsage.total, 16_240)
+  assert.equal(metrics.outputTokens, 840)
+  assert.equal(metrics.lastTurnMs, 9_000)
+  assert.equal(metrics.todos.length, 3)
+  assert.equal(metrics.todos[1].activeForm, 'Adding bounded backoff')
+  assert.equal(metrics.activity.phase, 'done')
+  assert.deepEqual(todoCounts(metrics.todos), { total: 3, completed: 1, active: metrics.todos[1] })
+  const segmentTotal = Object.values(metrics.segments).reduce((sum, value) => sum + value, 0)
+  assert.equal(segmentTotal, 16_240)
+  assert.ok(Math.abs(metrics.contextPct - 25.375) < 0.01)
+})
+
+test('metrics handle running tool calls, live streams, and normalized usage keys', () => {
+  const running = {
+    sessionId: 's2',
+    header: { id: 's2' },
+    cursor: 3,
+    status: 'running',
+    streamText: 'partial answer',
+    events: [
+      { type: 'turn/start', seq: 1, time: 1_000 },
+      { type: 'tool/call', seq: 2, data: { name: 'read', callId: 'x', arguments: '{"file_path":"a.ts"}' } },
+    ],
+  }
+  const metrics = collectMetrics(running, 5_000)
+  assert.equal(metrics.activity.phase, 'tool')
+  assert.equal(metrics.activity.toolName, 'read')
+  assert.match(metrics.activity.verb, /Reading/)
+  assert.match(metrics.activity.detail, /a\.ts/)
+  assert.ok(metrics.liveTokens > 0)
+  assert.equal(metrics.turnStartedAt, 1_000)
+
+  assert.deepEqual(normalizeUsage({ input_tokens: 10, output_tokens: 5 }), { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15 })
+  assert.deepEqual(normalizeUsage({ prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 }), { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, total: 5 })
+  assert.equal(normalizeUsage({}), undefined)
+  assert.equal(estimateTokens(''), 0)
+  assert.ok(estimateTokens('中文中文') >= 2)
+})
+
+test('formatting and TPS sampling are compact and bounded', () => {
+  assert.equal(formatTokens(0), '0')
+  assert.equal(formatTokens(999), '999')
+  assert.equal(formatTokens(16_240), '16.2k')
+  assert.equal(formatTokens(1_200_000), '1.2M')
+  assert.equal(formatDuration(9_000), '9s')
+  assert.equal(formatDuration(64_000), '1m 04s')
+  const first = nextSpeedSample([], undefined, 1_000, 10)
+  assert.deepEqual(first.samples, [])
+  assert.deepEqual(first.previous, { at: 1_000, tokens: 10 })
+  const second = nextSpeedSample(first.samples, first.previous, 2_000, 60)
+  assert.equal(second.samples.length, 1)
+  assert.equal(second.samples[0].tps, 50)
+  const reset = nextSpeedSample(second.samples, second.previous, 3_000, 5)
+  assert.deepEqual(reset.samples, second.samples)
+  assert.deepEqual(reset.previous, { at: 3_000, tokens: 5 })
+})
+
+test('context bar allocation always fills the requested width', () => {
+  const allocated = allocateColumns([3, 0, 5, 2, 1], 20)
+  assert.equal(allocated.reduce((sum, value) => sum + value, 0), 20)
+  assert.equal(allocated[1], 0)
+  assert.ok(allocated.filter((value) => value > 0).length >= 4)
+
+  const segments = { system: 100, prompt: 200, assistant: 300, thinking: 150, tools: 250 }
+  const layout = contextBarLayout(segments, 5_000, 10_000, 40)
+  assert.equal(layout.free, 20)
+  assert.equal(layout.used.reduce((sum, value) => sum + value, 0) + layout.unclassified, 20)
+  for (const themeValue of [createTheme(false), createTheme(true)]) {
+    const line = renderContextBar(themeValue, segments, 5_000, 10_000, 50)
+    assert.equal(displayWidth(line), 50)
+    assert.match(stripAnsi(line), /5k\/10k 50%/)
+  }
+})
+
+test('activity line, TPS gauge, and todo strip stay on one row', () => {
+  const line = renderActivityLine(theme, { phase: 'tool', verb: 'Running command', detail: 'rg reconnect src' }, { now: 0, elapsedMs: 12_000, contextPct: 84, width: 90 })
+  assert.match(stripAnsi(line), /Running command/)
+  assert.match(stripAnsi(line), /12s/)
+  assert.match(stripAnsi(line), /ctx 84%/)
+  assert.equal(displayWidth(renderTpsGauge(theme, 42, 100)), 10)
+  const todos = [
+    { content: 'one', status: 'completed' },
+    { content: 'two', status: 'in_progress', activeForm: 'Doing two' },
+    { content: 'three', status: 'pending' },
+  ]
+  const strip = renderTodoStrip(theme, todos, { width: 60, now: 0, folded: false })
+  assert.match(stripAnsi(strip), /1\/3/)
+  assert.match(stripAnsi(strip), /Doing two/)
+  assert.equal(displayWidth(strip) <= 60, true)
+})
+
+test('session cost folds durable usage, peak/idle rates, and unpriced models', () => {
+  assert.equal(isPeakHour(Date.UTC(2026, 9, 27, 2, 0)), true)
+  assert.equal(isPeakHour(Date.UTC(2026, 9, 27, 4, 0)), false)
+  assert.equal(isPeakHour(Date.UTC(2026, 9, 24, 2, 0)), false)
+  assert.ok(priceForModel('deepseek-v4.1-flash'))
+  assert.equal(priceForModel('unknown-model'), undefined)
+  assert.deepEqual(parseUsage({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 3 }), { input: 10, output: 5, cacheRead: 3, cacheWrite: 0, total: 18 })
+  assert.equal(formatCostCny(0.0042), '¥0.0042')
+  assert.equal(formatCostCny(1.2), '¥1.20')
+
+  const peak = Date.UTC(2026, 9, 27, 2, 0)
+  const idle = Date.UTC(2026, 9, 27, 5, 0)
+  const usage = { inputTokens: 1_000_000, outputTokens: 1_000_000, cacheReadTokens: 1_000_000, cacheWriteTokens: 0, totalTokens: 3_000_000 }
+  const events = [
+    { type: 'request/context', seq: 1, time: peak, data: { provider: 'deepseek', model: 'deepseek-v4.1-flash' } },
+    { type: 'assistant/message', seq: 2, time: peak, data: { usage } },
+    { type: 'assistant/message', seq: 3, time: idle, data: { usage } },
+  ]
+  const cost = estimateSessionCost(events)
+  assert.equal(cost.tokens.input, 2_000_000)
+  assert.equal(cost.tokens.cacheRead, 2_000_000)
+  assert.equal(cost.tokens.output, 2_000_000)
+  assert.equal(cost.tokens.total, 6_000_000)
+  assert.equal(cost.pricedTokens, 6_000_000)
+  assert.equal(cost.unpricedTokens, 0)
+  assert.ok(Math.abs((cost.cost ?? 0) - 15.06) < 1e-9)
+  assert.ok(Math.abs(cost.peak - 10.04) < 1e-9)
+  assert.ok(Math.abs(cost.idle - 5.02) < 1e-9)
+
+  const unpriced = estimateSessionCost([{ type: 'assistant/message', seq: 1, time: idle, data: { usage } }])
+  assert.equal(unpriced.cost, undefined)
+  assert.equal(unpriced.unpricedTokens, 3_000_000)
+
+  // A replayed snapshot repeats the same settlement; count it once.
+  const replayed = estimateSessionCost([
+    { type: 'request/context', seq: 1, time: idle, data: { provider: 'deepseek', model: 'deepseek-v4.1-flash' } },
+    { type: 'assistant/message', seq: 2, time: idle, data: { turn: 3, step: 1, usage } },
+    { type: 'assistant/message', seq: 2, time: idle, data: { turn: 3, step: 1, usage } },
+  ])
+  assert.equal(replayed.tokens.total, 3_000_000)
+  assert.equal(replayed.pricedTokens, 3_000_000)
+})
+
+test('usage rail keeps totals, cost, context and TPS on one row', () => {
+  const tokens = { input: 12_400, cacheRead: 3_000, cacheWrite: 0, output: 840 }
+  const wide = renderUsageRail(theme, { tokens, cost: 0.42, model: 'deepseek-v4.1-flash', contextPct: 25.4, tps: 42, width: 100 })
+  assert.equal(displayWidth(wide), 100)
+  assert.match(stripAnsi(wide), /↑12\.4k/)
+  assert.match(stripAnsi(wide), /cache 3k/)
+  assert.match(stripAnsi(wide), /↓840/)
+  assert.match(stripAnsi(wide), /~¥0\.42/)
+  assert.match(stripAnsi(wide), /deepseek-v4\.1-flash/)
+  assert.match(stripAnsi(wide), /25%/)
+  assert.match(stripAnsi(wide), /42 tps/)
+
+  const narrow = renderUsageRail(theme, { tokens, cost: 0.42, model: 'deepseek-v4.1-flash', contextPct: 25.4, tps: 42, width: 60 })
+  assert.equal(displayWidth(narrow), 60)
+  assert.match(stripAnsi(narrow), /~¥0\.42/)
+  assert.doesNotMatch(stripAnsi(narrow), /deepseek-v4\.1-flash/)
+
+  // Without a right group the row still occupies the full width.
+  const bare = renderUsageRail(theme, { tokens, cost: 0.42, width: 70 })
+  assert.equal(displayWidth(bare), 70)
+  assert.match(stripAnsi(bare), /↑12\.4k/)
+})
+
+test('splash is a list-only picker at every terminal size', () => {
+  const sessions = [
+    { label: 'Socket client hardening', live: true, cwd: '/work', age: '2m ago' },
+    { label: 'Release checklist', live: false, cwd: '/work', age: '1h ago' },
+  ]
+  const wide = renderSplash(theme, { columns: 100, rows: 30, now: 0, cwd: '/work', kind: 'sessions', workspaceTitle: 'work', workspacePath: '/work', sessions, index: 0 })
+  const wideText = stripAnsi(wide.join('\n'))
+  assert.equal(wide.length, 30)
+  assert.match(wideText, /choose session/)
+  assert.match(wideText, /dshell/)
+  assert.match(wideText, /Socket client hardening/)
+  // List-only launch: no pixel art or block wordmark above the picker.
+  assert.doesNotMatch(wideText, /[▀▄]/)
+  assert.doesNotMatch(wideText, /████/)
+
+  const narrow = renderSplash(theme, { columns: 80, rows: 24, now: 0, cwd: '/work', kind: 'sessions', sessions, index: 0 })
+  const narrowText = stripAnsi(narrow.join('\n'))
+  assert.equal(narrow.length, 24)
+  assert.match(narrowText, /choose session/)
+  assert.match(narrowText, /dshell/)
+})
+
+test('composer frame grows with content and keeps the caret inside', () => {
+  const empty = renderComposer(theme, createEditor(''), 60, 7)
+  assert.equal(empty.height, 3)
+  assert.equal(empty.cursorRow, 1)
+  assert.equal(empty.cursorColumn, 5)
+  const multiline = renderComposer(theme, createEditor('one\ntwo\nthree'), 60, 7)
+  assert.equal(multiline.height, 5)
+  const long = renderComposer(theme, createEditor(Array.from({ length: 20 }, (_, index) => `line ${index}`).join('\n')), 60, 7)
+  assert.equal(long.height, 9)
+  assert.ok(long.cursorRow >= 1 && long.cursorRow <= 7)
+  for (const line of long.lines) assert.equal(displayWidth(line), 60)
+  const hinted = renderComposer(theme, createEditor(''), 60, 7, 'enter send · ? help')
+  assert.equal(hinted.height, 3)
+  assert.match(stripAnsi(hinted.lines[2]), /enter send · \? help/)
+  assert.equal(displayWidth(hinted.lines[2]), 60)
+})
+
+test('TUI exposes history search, double-Esc rewind, and the session panel', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', title: 'Design session' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 150; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI state; got ${JSON.stringify(output.text.slice(-800))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'))
+  assert.equal(output.text.includes('Ready · last turn'), false)
+  input.push('first prompt')
+  input.push('\r')
+  await waitFor(() => output.text.includes('echo: first prompt'))
+
+  // Ctrl+R: filter the sent prompts, then restore the match into the composer.
+  input.push('\u0012')
+  await waitFor(() => output.text.includes('history search'))
+  input.push('first')
+  input.push('\r')
+  await waitFor(() => !output.text.slice(-1200).includes('history search'))
+  assert.equal(backend.requireSession('s1').events.filter((event) => event.type === 'user/message').length, 1)
+
+  // Ctrl+C clears the restored draft; double-Esc opens rewind on the empty idle composer.
+  input.push('\u0003')
+  input.push('\u001b')
+  await new Promise((resolve) => setTimeout(resolve, 45))
+  input.push('\u001b')
+  await waitFor(() => output.text.includes('rewind'))
+  input.push('\r')
+  await waitFor(() => !output.text.slice(-1200).includes('rewind'))
+
+  // Ctrl+B opens the session panel with the usage ledger, context and todos.
+  input.push('\u0002')
+  await waitFor(() => output.text.includes('session panel') && output.text.includes('context'))
+  assert.ok(output.text.includes('session usage'))
+  assert.ok(output.text.includes('cache read') || output.text.includes('unpriced'))
+  input.push('\u001b')
+  await waitFor(() => output.text.includes('idle'))
+
+  input.push('\u0003')
+  input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
 })

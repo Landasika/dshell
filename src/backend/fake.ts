@@ -40,6 +40,7 @@ export interface FakeSessionSeed {
   sessionId: string
   cwd?: string
   title?: string
+  createdAt?: number
   events?: SessionEvent[]
 }
 
@@ -53,7 +54,7 @@ export class FakeBackend implements DshellBackend {
 
   constructor(seeds: FakeSessionSeed[] = []) {
     for (const seed of seeds) {
-      const createdAt = Date.now()
+      const createdAt = seed.createdAt ?? Date.now()
       this.sessions.set(seed.sessionId, {
         header: { id: seed.sessionId, cwd: seed.cwd, createdAt, ...(seed.title === undefined ? {} : { title: seed.title }) },
         events: [...(seed.events ?? [])],

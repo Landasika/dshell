@@ -14,13 +14,44 @@ import type {
 import { BackendError } from '../backend/index.js'
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
-import { composerLines, createEditor, editKey, insertText, lineCol, type EditorState } from './editor.js'
-import { buildBlocks, renderBlocks, type Block } from './events.js'
+import { createEditor, editKey, insertText, type EditorState } from './editor.js'
+import { buildBlocks, isInjectedContext, renderBlocks, type Block } from './events.js'
 import { renderMarkdown } from './markdown.js'
 import { TerminalScreen, Viewport } from './screen.js'
-import { paint, type Theme } from './theme.js'
+import { paint, type Theme, type ThemeStyle } from './theme.js'
 import { createTheme } from './theme.js'
 import { displayWidth, pad, sanitizeText, truncate, wrapText } from './width.js'
+import {
+  averageTps,
+  collectMetrics,
+  currentTps,
+  estimateTokens,
+  formatDuration,
+  formatPercent,
+  formatTokens,
+  nextSpeedSample,
+  type SessionMetrics,
+  type TpsSample,
+} from './metrics.js'
+import { renderContextBar, renderContextLegendCompact } from './contextbar.js'
+import {
+  renderActivityLine,
+  renderTpsGauge,
+  renderTpsSparkline,
+  renderTodoList,
+  renderTodoStrip,
+  renderUsageRail,
+} from './activity.js'
+import {
+  centerBlock,
+  centerVertically,
+  panelBox,
+  renderComposer,
+  renderHeader,
+  renderHintLine,
+} from './chrome.js'
+import { formatCostCny } from './cost.js'
+import { renderSplash, type SplashSession } from './splash.js'
 
 export interface TuiOptions {
   cwd: string
@@ -49,6 +80,9 @@ type Overlay =
   | { kind: 'workspaces'; index: number }
   | { kind: 'help' }
   | { kind: 'approval'; details: boolean }
+  | { kind: 'history'; query: string; index: number }
+  | { kind: 'rewind'; index: number }
+  | { kind: 'dashboard' }
 
 interface AppState {
   sessions: SessionSummary[]
@@ -70,6 +104,10 @@ interface AppState {
   completion?: CompletionState
   pendingPrompt?: string
   quitting: boolean
+  todosFolded: boolean
+  tpsSamples: TpsSample[]
+  speedPrevious?: { at: number; tokens: number }
+  escapeAt: number
 }
 
 
@@ -166,11 +204,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     clearedAtSeq: 0,
     approvalBusy: false,
     quitting: false,
+    todosFolded: false,
+    tpsSamples: [],
+    escapeAt: 0,
   }
 
   let renderTimer: NodeJS.Timeout | undefined
   let escapeTimer: NodeJS.Timeout | undefined
   let pollTimer: NodeJS.Timeout | undefined
+  let tickTimer: NodeJS.Timeout | undefined
+  let metricsCache: { key: string; value: SessionMetrics } | undefined
+  let lastBodyHeight = 3
   let resolveDone: ((code: number) => void) | undefined
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve
@@ -184,8 +228,28 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }, 33)
   }
 
+  const needsTick = (): boolean => {
+    if (state.quitting) return false
+    if (state.view?.status === 'running') return true
+    if (state.view?.pendingApproval !== undefined) return true
+    if (state.toast !== undefined && state.toast.until > Date.now()) return true
+    return false
+  }
+  const ensureTick = (): void => {
+    if (tickTimer !== undefined || !needsTick()) return
+    tickTimer = setInterval(() => {
+      if (!needsTick()) {
+        if (tickTimer !== undefined) clearInterval(tickTimer)
+        tickTimer = undefined
+        return
+      }
+      schedule()
+    }, 110)
+  }
+
   const toast = (text: string): void => {
     state.toast = { text, until: Date.now() + 4_000 }
+    ensureTick()
     schedule()
   }
 
@@ -202,6 +266,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (renderTimer !== undefined) clearTimeout(renderTimer)
     if (escapeTimer !== undefined) clearTimeout(escapeTimer)
     if (pollTimer !== undefined) clearInterval(pollTimer)
+    if (tickTimer !== undefined) clearInterval(tickTimer)
     input.off('data', onData)
     input.off('end', onEnd)
     process.off('SIGTERM', onSignal)
@@ -215,14 +280,40 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const onSignal = (): void => quit(0)
   const onEnd = (): void => quit(0)
 
+  const sampleSpeed = (view: SessionView): void => {
+    if (view.status !== 'running') {
+      state.speedPrevious = undefined
+      return
+    }
+    const now = Date.now()
+    const next = nextSpeedSample(
+      state.tpsSamples,
+      state.speedPrevious,
+      now,
+      estimateTokens(view.streamText),
+    )
+    state.tpsSamples = next.samples
+    state.speedPrevious = next.previous
+  }
+
+  const currentMetrics = (): SessionMetrics => {
+    const view = state.view
+    if (view === undefined) return collectMetrics(undefined)
+    const key = `${view.sessionId}:${view.cursor}:${view.streamText.length}:${view.status}:${view.pendingApproval?.requestId ?? ''}:${state.clearedAtSeq}`
+    if (metricsCache?.key !== key) metricsCache = { key, value: collectMetrics(view) }
+    return metricsCache.value
+  }
+
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
+    sampleSpeed(view)
     if (view.pendingApproval !== undefined) {
       if (state.overlay?.kind !== 'approval') state.overlay = { kind: 'approval', details: false }
     } else if (state.overlay?.kind === 'approval') {
       state.overlay = null
     }
+    ensureTick()
     schedule()
   }
 
@@ -397,6 +488,57 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return state.sessions.filter((session) => session.workspaceId === workspaceId)
   }
 
+  const userPrompts = (): string[] => {
+    const view = state.view
+    if (view === undefined) return [...state.history].reverse()
+    const out: string[] = []
+    for (let index = view.events.length - 1; index >= 0; index -= 1) {
+      const event = view.events[index]
+      if (event?.type !== 'user/message') continue
+      const data = (event.data ?? {}) as Record<string, unknown>
+      const message = (data.message ?? data) as Record<string, unknown>
+      const source = (message.source ?? {}) as Record<string, unknown>
+      if (source.kind !== 'user') continue
+      const content = Array.isArray(message.content) ? message.content : []
+      let text = ''
+      for (const part of content) {
+        const item = (part ?? {}) as Record<string, unknown>
+        if (item.type === 'text' && typeof item.text === 'string') text += item.text
+      }
+      text = text.trim()
+      if (text.length > 0 && !isInjectedContext(text) && out.at(-1) !== text) out.push(text)
+    }
+    return out
+  }
+
+  const historyItems = (query: string): string[] => {
+    const needle = query.trim().toLowerCase()
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (let index = state.history.length - 1; index >= 0; index -= 1) {
+      const item = state.history[index]
+      if (item === undefined || seen.has(item)) continue
+      if (needle.length > 0 && !item.toLowerCase().includes(needle)) continue
+      seen.add(item)
+      out.push(item)
+    }
+    return out
+  }
+
+  const openHistory = (): void => {
+    state.overlay = { kind: 'history', query: '', index: 0 }
+    schedule()
+  }
+
+  const openRewind = (): void => {
+    if (userPrompts().length === 0) {
+      toast('no previous prompt to restore')
+      return
+    }
+    state.overlay = { kind: 'rewind', index: 0 }
+    schedule()
+  }
+
   const runCommand = async (text: string): Promise<void> => {
     const [command, ...rest] = text.trim().split(/\s+/)
     const argument = rest.join(' ')
@@ -453,6 +595,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         toast(`verbose ${state.verbose ? 'on' : 'off'}`)
         schedule()
         return
+      case '/rewind':
+        openRewind()
+        return
+      case '/history':
+        openHistory()
+        return
+      case '/panel':
+      case '/status':
+        state.overlay = { kind: 'dashboard' }
+        schedule()
+        return
       default:
         toast(`unknown command ${command}; try /help`)
     }
@@ -485,6 +638,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
 
+  const acceptEditorText = (text: string): void => {
+    state.editor = createEditor(text)
+    state.historyIndex = -1
+    state.completion = undefined
+    state.overlay = null
+    refreshCompletion()
+    schedule()
+  }
+
   const handleOverlayKey = (key: Key): void => {
     const overlay = state.overlay
     if (overlay === null) return
@@ -511,6 +673,52 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (overlay.kind === 'help') return
+    if (overlay.kind === 'dashboard') {
+      if (key.type === 'ctrl-b') state.overlay = null
+      schedule()
+      return
+    }
+    if (overlay.kind === 'rewind') {
+      const prompts = userPrompts()
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.index = Math.max(0, overlay.index - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') {
+        overlay.index = Math.min(Math.max(0, prompts.length - 1), overlay.index + 1)
+      } else if (key.type === 'enter' || key.type === 'tab') {
+        const chosen = prompts[overlay.index]
+        if (chosen !== undefined) acceptEditorText(chosen)
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'history') {
+      if (key.type === 'text') {
+        overlay.query += key.text
+        overlay.index = 0
+      } else if (key.type === 'paste') {
+        overlay.query += key.text.replace(/\s+/g, ' ')
+        overlay.index = 0
+      } else if (key.type === 'backspace') {
+        const characters = Array.from(overlay.query)
+        characters.pop()
+        overlay.query = characters.join('')
+        overlay.index = 0
+      } else if (key.type === 'up' || key.type === 'ctrl-p') {
+        overlay.index = Math.max(0, overlay.index - 1)
+      } else if (key.type === 'down' || key.type === 'ctrl-n') {
+        const items = historyItems(overlay.query)
+        overlay.index = Math.min(Math.max(0, items.length - 1), overlay.index + 1)
+      } else if (key.type === 'enter' || key.type === 'tab') {
+        const items = historyItems(overlay.query)
+        const chosen = items[overlay.index]
+        if (chosen !== undefined) acceptEditorText(chosen)
+        return
+      } else if (key.type === 'ctrl-r') {
+        state.overlay = null
+      }
+      schedule()
+      return
+    }
     if (overlay.kind === 'workspaces') {
       if (key.type === 'up') overlay.index = Math.max(0, overlay.index - 1)
       else if (key.type === 'down') overlay.index = Math.min(state.workspaces.length - 1, overlay.index + 1)
@@ -526,6 +734,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    if (overlay.kind !== 'sessions') return
     const overlaySessions = filteredSessions(overlay.workspaceId)
     if (key.type === 'up') overlay.index = Math.max(0, overlay.index - 1)
     else if (key.type === 'down') overlay.index = Math.min(overlaySessions.length - 1, overlay.index + 1)
@@ -583,6 +792,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.historyIndex = -1
         refreshCompletion()
         schedule()
+      } else if (state.view?.status === 'running') {
+        toast('ctrl-c cancels the running turn')
+      } else {
+        // Double-Esc on an empty, idle composer opens the rewind list. The
+        // first Esc is held for a short window so single-Esc stays harmless.
+        const now = Date.now()
+        if (now - state.escapeAt < 650) {
+          state.escapeAt = 0
+          openRewind()
+        } else {
+          state.escapeAt = now
+        }
       }
       return
     }
@@ -605,6 +826,25 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (key.type === 'ctrl-l') {
       screen.clear()
       schedule()
+      return
+    }
+    if (key.type === 'ctrl-r') {
+      openHistory()
+      return
+    }
+    if (key.type === 'ctrl-b') {
+      state.overlay = { kind: 'dashboard' }
+      schedule()
+      return
+    }
+    if (key.type === 'ctrl-t') {
+      state.todosFolded = !state.todosFolded
+      toast(`todos ${state.todosFolded ? 'hidden' : 'shown'}`)
+      return
+    }
+    if (key.type === 'ctrl-o') {
+      state.verbose = !state.verbose
+      toast(`details ${state.verbose ? 'on' : 'off'}`)
       return
     }
     if (
@@ -650,6 +890,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       } else {
         void send(text)
       }
+      return
+    }
+    if (key.type === 'text' && key.text === '?' && state.editor.text.length === 0) {
+      state.overlay = { kind: 'help' }
+      schedule()
       return
     }
     if (key.type === 'paste') {
@@ -711,166 +956,290 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const transcript = (): { lines: string[]; live: boolean } => {
     const view = state.view
-    if (view === undefined) return { lines: [paint(theme, 'dim', 'connecting to the dsh Host…')], live: false }
+    const width = Math.max(20, screen.size.columns - 2)
+    if (view === undefined) return { lines: [paint(theme, 'muted', 'connecting to the dsh Host…')], live: false }
     const events = view.events.filter((event) => event.seq > state.clearedAtSeq)
-    const blocks = buildBlocks(events, state.verbose)
-    const lines = renderBlocks(blocks, Math.max(20, screen.size.columns - 2), theme)
+    // Todos live in the footer strip and the session panel; keeping their
+    // historical snapshots inline would repeat the same list after every
+    // update.
+    const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
+    const lines = renderBlocks(blocks, width, theme)
     if (view.streamText.length > 0 && view.status === 'running') {
       lines.push('')
-      lines.push(paint(theme, 'green', 'dshell'))
-      lines.push(...renderMarkdown(view.streamText, Math.max(20, screen.size.columns - 2), theme))
-      lines.push(paint(theme, 'dim', '▌'))
+      lines.push(`${paint(theme, 'accent', 'dshell')} ${paint(theme, 'muted', '· live')}`)
+      lines.push(...renderMarkdown(view.streamText, width, theme))
+      lines.push(paint(theme, 'accent', '▌'))
     }
     return { lines, live: view.status === 'running' }
   }
 
-  const transcriptHeight = (menuHeight = 0): number => {
-    const { rows } = screen.size
-    const composer = Math.min(7, Math.max(1, composerLines(state.editor.text, Math.max(1, screen.size.columns - 4)).length))
-    return Math.max(3, rows - 2 - composer - menuHeight - 3)
-  }
-
+  // The renderer measures the footer, menu and composer each frame; PgUp/PgDn
+  // reuse that exact body height so a page never overshoots the viewport.
+  const transcriptHeight = (): number => Math.max(3, lastBodyHeight)
   const transcriptLineCount = (): number => transcript().lines.length
+
+  const sessionTitle = (): string => {
+    const view = state.view
+    const title = view?.header.title ?? (view === undefined ? undefined : latestSessionTitle(view.events))
+    return title === undefined ? shortId(view?.sessionId) : truncate(title, 42)
+  }
 
   const headerLines = (): string[] => {
     const view = state.view
     const status = statusLabel(state)
-    const title = view?.header.title ?? (view === undefined ? undefined : latestSessionTitle(view.events))
-    const session = title === undefined ? shortId(view?.sessionId) : truncate(title, 34)
     const cwd = view?.header.cwd ?? options.cwd
-    const left = `${paint(theme, 'bold', paint(theme, 'cyan', 'dshell'))} ${paint(theme, 'dim', '·')} ${session}`
-    const right = `${paint(theme, statusColor(status), status)} ${paint(theme, 'dim', `· ${truncate(cwd, Math.max(10, screen.size.columns - 36))}`)}`
-    const gap = Math.max(1, screen.size.columns - displayWidth(left) - displayWidth(right))
-    return [`${left}${' '.repeat(gap)}${right}`]
+    return [
+      renderHeader(theme, {
+        columns: screen.size.columns,
+        title: sessionTitle(),
+        cwd,
+        status,
+        statusStyle: statusColor(status),
+      }),
+      paint(theme, 'border', '─'.repeat(screen.size.columns)),
+    ]
   }
 
-  const footerLines: string[] = [
-    paint(theme, 'dim', 'enter send  alt+enter newline  tab complete  / commands  @ files  pgup/pgdn scroll'),
-    paint(theme, 'dim', 'ctrl-c cancel/quit  ctrl-d quit  esc clear/close  /help keys'),
-  ]
+  const speedFor = (metrics: SessionMetrics, now: number): number => {
+    const elapsed = metrics.turnStartedAt === undefined ? metrics.lastTurnMs ?? 0 : now - metrics.turnStartedAt
+    return metrics.turnStartedAt !== undefined
+      ? currentTps(state.tpsSamples, metrics.liveTokens, elapsed)
+      : averageTps(state.tpsSamples)
+  }
+
+  const usageRailLine = (metrics: SessionMetrics, now: number): string => {
+    return renderUsageRail(theme, {
+      tokens: metrics.cost.tokens,
+      ...(metrics.cost.cost === undefined ? {} : { cost: metrics.cost.cost }),
+      ...(metrics.model === undefined ? {} : { model: metrics.model }),
+      ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
+      tps: speedFor(metrics, now),
+      width: screen.size.columns,
+    })
+  }
+
+  const footerLines = (metrics: SessionMetrics, now: number): string[] => {
+    const columns = screen.size.columns
+    const lines: string[] = []
+    const phase = metrics.activity.phase
+    if (phase === 'thinking' || phase === 'streaming' || phase === 'tool' || phase === 'approval') {
+      const elapsed = metrics.turnStartedAt === undefined ? undefined : now - metrics.turnStartedAt
+      lines.push(renderActivityLine(theme, metrics.activity, {
+        now,
+        ...(elapsed === undefined ? {} : { elapsedMs: elapsed }),
+        ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
+        width: columns,
+      }))
+    }
+    if (!state.todosFolded && metrics.todos.length > 0) {
+      lines.push(renderTodoStrip(theme, metrics.todos, { width: columns, now, folded: false }))
+    }
+    return lines
+  }
 
   const overlayLines = (): string[] => {
     const overlay = state.overlay
     if (overlay === null) return []
-    const width = Math.max(28, Math.min(screen.size.columns - 4, 78))
+    const columns = screen.size.columns
+    const rows = screen.size.rows
+    const width = Math.max(30, Math.min(columns - 4, 88))
     const inner = width - 4
-    const lines: string[] = []
-    const box = (title: string, body: string[]): string[] => {
-      const top = `┌─ ${truncate(title, Math.max(1, width - 6))} ${'─'.repeat(Math.max(0, width - displayWidth(title) - 5))}┐`
-      const content = body.map((line) => `│ ${pad(line, inner)} │`)
-      const bottom = `└${'─'.repeat(width - 2)}┘`
-      return [paint(theme, 'cyan', top), ...content, paint(theme, 'cyan', bottom)]
-    }
     if (overlay.kind === 'help') {
-      const body: string[] = []
-      for (const { name, description } of COMMAND_SPECS) body.push(`${paint(theme, 'bold', pad(name, 14))} ${description}`)
-      body.push('')
-      body.push(paint(theme, 'dim', 'The TUI never owns the Agent: quitting only closes this view.'))
-      return box('help', body)
+      const body: string[] = [paint(theme, 'bold', paint(theme, 'accentSoft', 'commands')), '']
+      for (const { name, description } of COMMAND_SPECS) {
+        body.push(`${paint(theme, 'accent', pad(name, 15))} ${paint(theme, 'text', description)}`)
+      }
+      body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'keys')), '')
+      body.push(`${paint(theme, 'text', pad('enter', 15))} send · ${paint(theme, 'text', 'alt+enter')} newline · ${paint(theme, 'text', 'tab')} complete`)
+      body.push(`${paint(theme, 'text', pad('ctrl+r', 15))} history search · ${paint(theme, 'text', 'ctrl+b')} session panel`)
+      body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} details`)
+      body.push(`${paint(theme, 'text', pad('double esc', 15))} rewind prompt · ${paint(theme, 'text', 'pgup/pgdn')} scroll`)
+      body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} cancel/quit · ${paint(theme, 'text', 'ctrl-d')} quit`)
+      body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
+      return panelBox(theme, 'help & shortcuts', body, width)
     }
     if (overlay.kind === 'workspaces') {
-      const visibleCount = Math.max(1, Math.min(10, screen.size.rows - 10))
+      const visibleCount = Math.max(1, Math.min(12, rows - 10))
       const start = Math.max(0, Math.min(overlay.index - Math.floor(visibleCount / 2), state.workspaces.length - visibleCount))
       const body = state.workspaces.slice(start, start + visibleCount).map((workspace, offset) => {
         const index = start + offset
-        const marker = index === overlay.index ? '▸' : ' '
-        return `${marker} ${truncate(workspace.title, 18)}  ${truncate(workspace.path, Math.max(8, inner - 24))}`
+        const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
+        return `${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(workspace.title, 20))}  ${paint(theme, 'muted', truncate(workspace.path, Math.max(8, inner - 28)))}`
       })
-      if (body.length === 0) body.push(paint(theme, 'dim', 'no workspaces'))
-      body.push('', paint(theme, 'dim', '↑/↓ select  enter sessions  n new session  esc close'))
-      return box('workspaces', body)
+      if (body.length === 0) body.push(paint(theme, 'muted', 'no workspaces'))
+      return panelBox(theme, 'workspaces', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ select · enter sessions · n new session · esc close')],
+      })
     }
     if (overlay.kind === 'sessions') {
       const sessions = filteredSessions(overlay.workspaceId)
-      const visibleCount = Math.max(1, Math.min(10, screen.size.rows - 10))
+      const visibleCount = Math.max(1, Math.min(12, rows - 10))
       const start = Math.max(0, Math.min(overlay.index - Math.floor(visibleCount / 2), sessions.length - visibleCount))
       const body = sessions.slice(start, start + visibleCount).map((session, offset) => {
         const index = start + offset
-        const marker = index === overlay.index ? '▸' : ' '
-        const live = session.live === true ? 'live' : 'cold'
+        const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
+        const live = session.live === true ? paint(theme, 'success', 'live') : paint(theme, 'muted', 'cold')
         const age = timeAgo(session.createdAt)
-        return `${marker} ${session.sessionId.slice(0, 20)} ${pad(live, 4)} ${truncate(session.cwd ?? '', Math.max(6, inner - 34))} ${age}`
+        const label = session.title?.trim() || session.sessionId.slice(0, 24)
+        const row = `${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(label, 26))}`
+        const right = `${live} ${paint(theme, 'muted', age)}`
+        return `${row}${' '.repeat(Math.max(1, inner - displayWidth(row) - displayWidth(right)))}${right}`
       })
-      if (body.length === 0) body.push(paint(theme, 'dim', 'no sessions; press n to create one'))
-      body.push('', paint(theme, 'dim', '↑/↓ select  enter attach  n new  esc close'))
-      return box('sessions', body)
+      if (body.length === 0) body.push(paint(theme, 'muted', 'no sessions; press n to create one'))
+      return panelBox(theme, 'sessions', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ select · enter attach · n new · esc close')],
+      })
+    }
+    if (overlay.kind === 'history') {
+      const items = historyItems(overlay.query)
+      const index = Math.min(overlay.index, Math.max(0, items.length - 1))
+      const visible = items.slice(0, Math.max(1, Math.min(9, rows - 12)))
+      const body = [
+        `${paint(theme, 'muted', 'search')} ${paint(theme, 'text', overlay.query)}${paint(theme, 'accent', '▌')}`,
+        '',
+      ]
+      if (visible.length === 0) body.push(paint(theme, 'muted', 'no matching prompt in this session'))
+      for (const [offset, item] of visible.entries()) {
+        const marker = offset === index ? paint(theme, 'accent', '▸') : ' '
+        body.push(`${marker} ${paint(theme, offset === index ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
+      }
+      return panelBox(theme, 'history search', body, width, {
+        footer: [paint(theme, 'muted', 'type to filter · ↑/↓ select · enter insert · esc cancel')],
+      })
+    }
+    if (overlay.kind === 'rewind') {
+      const prompts = userPrompts()
+      const index = Math.min(overlay.index, Math.max(0, prompts.length - 1))
+      const visible = prompts.slice(0, Math.max(1, Math.min(10, rows - 12)))
+      const body = [paint(theme, 'muted', 'Restore a previous prompt into the composer.'), paint(theme, 'muted', 'The session itself is not truncated.'), '']
+      if (visible.length === 0) body.push(paint(theme, 'muted', 'no previous prompt'))
+      for (const [offset, item] of visible.entries()) {
+        const marker = offset === index ? paint(theme, 'accent', '▸') : ' '
+        body.push(`${marker} ${paint(theme, offset === index ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
+      }
+      return panelBox(theme, 'rewind', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ select · enter restore · esc cancel')],
+      })
+    }
+    if (overlay.kind === 'dashboard') {
+      const metrics = currentMetrics()
+      const view = state.view
+      if (view === undefined) {
+        return panelBox(theme, 'session panel', [paint(theme, 'muted', 'no session attached')], width)
+      }
+      const core: string[] = []
+      core.push(`${paint(theme, 'muted', 'session')}  ${paint(theme, 'bold', sessionTitle())}`)
+      core.push(`${paint(theme, 'muted', 'id')}       ${paint(theme, 'text', view.sessionId)}`)
+      core.push(`${paint(theme, 'muted', 'model')}    ${paint(theme, 'text', metrics.model ?? 'unknown')}${metrics.provider === undefined ? '' : paint(theme, 'muted', ` · ${metrics.provider}`)}`)
+      core.push('')
+      const occupancy = metrics.contextWindow === undefined
+        ? formatTokens(metrics.usedTokens)
+        : `${formatTokens(metrics.usedTokens)} / ${formatTokens(metrics.contextWindow)} ${formatPercent(metrics.contextPct ?? 0)}`
+      core.push(`${paint(theme, 'muted', 'context')}  ${paint(theme, 'text', occupancy)}`)
+      if (metrics.contextWindow !== undefined) {
+        core.push(renderContextBar(theme, metrics.segments, metrics.usedTokens, metrics.contextWindow, inner))
+      }
+      core.push(...renderContextLegendCompact(theme, metrics.segments, metrics.usedTokens, inner))
+      const sessionTokens = metrics.cost.tokens
+      core.push('')
+      core.push(paint(theme, 'bold', paint(theme, 'accentSoft', 'session usage')))
+      core.push(`${paint(theme, 'muted', 'in')}       ${formatTokens(sessionTokens.input)}${sessionTokens.cacheRead > 0 ? `${paint(theme, 'muted', ' · cache read ')}${formatTokens(sessionTokens.cacheRead)}` : ''}${sessionTokens.cacheWrite > 0 ? `${paint(theme, 'muted', ' · cache write ')}${formatTokens(sessionTokens.cacheWrite)}` : ''}${paint(theme, 'muted', ' · out ')}${formatTokens(sessionTokens.output)}`)
+      const spend = metrics.cost.cost
+      const spendText = spend === undefined
+        ? paint(theme, 'muted', 'unpriced')
+        : `${paint(theme, 'warning', `~${formatCostCny(spend)}`)} ${paint(theme, 'muted', 'est. CNY')}`
+      core.push(`${paint(theme, 'muted', 'total')}    ${formatTokens(sessionTokens.total)} tokens · ${spendText}`)
+      if (metrics.cost.pricedTokens > 0) {
+        core.push(`${paint(theme, 'muted', '         ')}peak ${formatCostCny(metrics.cost.peak)} · idle ${formatCostCny(metrics.cost.idle)}`)
+      }
+      if (metrics.cost.unpricedTokens > 0) {
+        core.push(`${paint(theme, 'muted', '         ')}${formatTokens(metrics.cost.unpricedTokens)} unpriced`)
+      }
+      if (metrics.cost.models.length > 1) {
+        for (const model of metrics.cost.models) {
+          core.push(`${paint(theme, 'muted', '         ')}${paint(theme, 'text', model.model)}${model.cost === undefined ? paint(theme, 'muted', ' · unpriced') : paint(theme, 'muted', ` · ~${formatCostCny(model.cost)}`)}`)
+        }
+      }
+      const elapsed = metrics.turnStartedAt === undefined ? metrics.lastTurnMs : Date.now() - metrics.turnStartedAt
+      const tps = metrics.turnStartedAt !== undefined
+        ? currentTps(state.tpsSamples, metrics.liveTokens, elapsed ?? 0)
+        : averageTps(state.tpsSamples)
+      const peak = Math.max(1, tps, ...state.tpsSamples.map((sample) => sample.tps))
+      core.push(`${paint(theme, 'muted', 'speed')}    ${paint(theme, 'text', tps.toFixed(1))} tps ${renderTpsGauge(theme, tps, peak)}${elapsed === undefined ? '' : paint(theme, 'muted', ` · turn ${formatDuration(elapsed)}`)}`)
+      if (state.tpsSamples.length > 1) core.push(`${paint(theme, 'muted', '         ')}${renderTpsSparkline(theme, state.tpsSamples)}`)
+
+      const todosSection: string[] = ['']
+      todosSection.push(paint(theme, 'bold', paint(theme, 'accentSoft', 'todos')))
+      todosSection.push(...renderTodoList(theme, metrics.todos, inner))
+
+      // Keep the panel inside the viewport: borders (2) + footer (2) + the
+      // header row and one slack row belong to the overlay frame, not the
+      // body. Todos are the first section to go, then the tail is clipped.
+      const maxBody = Math.max(6, rows - 7)
+      let body: string[]
+      if (core.length + todosSection.length <= maxBody) {
+        body = [...core, ...todosSection]
+      } else {
+        body = core.slice(0, maxBody)
+        if (core.length > maxBody) {
+          body = [...core.slice(0, maxBody - 1), paint(theme, 'muted', '…')]
+        } else if (core.length < maxBody) {
+          body.push(paint(theme, 'muted', 'todos hidden (terminal too short)'))
+        }
+      }
+      return panelBox(theme, 'session panel', body, width, {
+        footer: [paint(theme, 'muted', 'ctrl+b / esc close · ctrl+r history · double esc rewind')],
+      })
     }
     const pending = state.view?.pendingApproval
-    if (pending === undefined) return box('approval', [paint(theme, 'dim', 'no approval pending')])
+    if (pending === undefined) return panelBox(theme, 'approval', [paint(theme, 'muted', 'no approval pending')], width)
     const body = [
-      paint(theme, 'bold', `tool: ${pending.toolName}`),
-      `reason: ${truncate(pending.reason ?? '(no reason)', inner - 8)}`,
-      `request: ${pending.requestId}`,
+      `${paint(theme, 'muted', 'tool')}     ${paint(theme, 'bold', pending.toolName)}`,
+      `${paint(theme, 'muted', 'reason')}   ${truncate(pending.reason ?? '(no reason)', inner - 10)}`,
+      `${paint(theme, 'muted', 'request')}  ${truncate(pending.requestId, inner - 10)}`,
     ]
     if (overlay.details) {
-      body.push('', paint(theme, 'dim', 'The full tool arguments are in the transcript above.'))
+      body.push('', paint(theme, 'muted', 'The full tool arguments are in the transcript above.'))
     }
-    body.push('', paint(theme, 'yellow', '[a] allow once   [r] reject   [d] details   [esc] later'))
-    body.push(paint(theme, 'dim', 'A timeout, disconnect, or non-TTY frontend fails closed.'))
-    return box('approval required', body)
+    body.push('', paint(theme, 'warning', '[a] allow once   [r] reject   [d] details   [esc] later'))
+    body.push(paint(theme, 'muted', 'A timeout, disconnect, or non-TTY frontend fails closed.'))
+    return panelBox(theme, 'approval required', body, width, { tone: 'warning' })
   }
 
   const startupLines = (): string[] => {
     const startup = state.startup
     if (startup === undefined) return []
-    const width = Math.max(34, Math.min(screen.size.columns - 4, 86))
-    const inner = width - 4
-    const title = startup.kind === 'missing' ? 'workspace not created' : 'choose session'
-    const body: string[] = []
-    body.push(`${paint(theme, 'bold', 'directory')}  ${truncate(startup.cwd, Math.max(8, inner - 12))}`)
-    if (startup.kind === 'missing') {
-      body.push('')
-      body.push(paint(theme, 'yellow', 'No workspace exists for this directory yet.'))
-      body.push(paint(theme, 'dim', 'Create one now, or quit and cd to an existing workspace.'))
-      body.push('')
-      body.push(`${paint(theme, 'bold', 'c')} / ${paint(theme, 'bold', 'enter')}  create workspace + new session`)
-      body.push(`${paint(theme, 'bold', 'q')} / ${paint(theme, 'bold', 'esc')}    quit without creating anything`)
-    } else {
-      const workspace = startup.workspace
-      body.push(`${paint(theme, 'bold', 'workspace')}  ${truncate(workspace?.title ?? '', 28)}`)
-      body.push(`${paint(theme, 'bold', 'path')}       ${truncate(workspace?.path ?? '', Math.max(8, inner - 12))}`)
-      body.push('')
-      body.push(paint(theme, 'bold', 'sessions'))
-      if (startup.sessions.length === 0) {
-        body.push(paint(theme, 'dim', '  (no sessions yet; press n to create one)'))
-      } else {
-        const visibleCount = Math.max(1, Math.min(10, screen.size.rows - 13))
-        const start = Math.max(
-          0,
-          Math.min(startup.index - Math.floor(visibleCount / 2), startup.sessions.length - visibleCount),
-        )
-        for (const [offset, session] of startup.sessions.slice(start, start + visibleCount).entries()) {
-          const index = start + offset
-          const marker = index === startup.index ? '▸' : ' '
-          const live = session.live === true ? 'live' : 'cold'
-          const age = timeAgo(session.createdAt)
-          const title = session.title?.trim()
-          const label = title === undefined || title.length === 0 ? session.sessionId : title
-          body.push(
-            `${marker} ${pad(truncate(label, 24), 24)} ${pad(live, 4)} ${truncate(session.cwd ?? '', Math.max(6, inner - 40))} ${age}`,
-          )
-        }
+    const sessions: SplashSession[] = startup.sessions.map((session) => {
+      const title = session.title?.trim()
+      return {
+        label: title === undefined || title.length === 0 ? session.sessionId : title,
+        live: session.live === true,
+        cwd: session.cwd ?? '',
+        age: timeAgo(session.createdAt),
       }
-      body.push('')
-      body.push(`${paint(theme, 'bold', '↑/↓')} select   ${paint(theme, 'bold', 'enter')} attach   ${paint(theme, 'bold', 'n')} new session   ${paint(theme, 'bold', 'q')} quit`)
-    }
-    const top = `┌─ ${truncate(title, Math.max(1, width - 6))} ${'─'.repeat(Math.max(0, width - displayWidth(title) - 5))}┐`
-    const bottom = `└${'─'.repeat(width - 2)}┘`
-    return [
-      paint(theme, 'cyan', top),
-      ...body.map((line) => `│ ${pad(line, inner)} │`),
-      paint(theme, 'cyan', bottom),
-    ]
+    })
+    return renderSplash(theme, {
+      columns: screen.size.columns,
+      rows: screen.size.rows,
+      now: Date.now(),
+      cwd: startup.kind === 'missing' ? startup.cwd : startup.workspace?.path ?? startup.cwd,
+      kind: startup.kind,
+      ...(startup.workspace === undefined ? {} : { workspaceTitle: startup.workspace.title, workspacePath: startup.workspace.path }),
+      sessions,
+      index: startup.index,
+      ...(state.error === undefined ? {} : { error: state.error }),
+    })
   }
 
   const completionMenuLines = (): string[] => {
     const completion = state.completion
     if (completion === undefined) return []
-    const width = Math.max(30, Math.min(screen.size.columns - 4, 78))
+    const columns = screen.size.columns
+    const width = Math.max(30, Math.min(columns - 4, 80))
     const inner = width - 4
     const title = completion.context.kind === 'command' ? 'commands' : 'files'
     const body: string[] = []
-    const visibleCount = Math.max(1, Math.min(12, screen.size.rows - 12))
+    const visibleCount = Math.max(1, Math.min(8, screen.size.rows - 14))
     const start = Math.max(
       0,
       Math.min(completion.index - Math.floor(visibleCount / 2), completion.items.length - visibleCount),
@@ -878,82 +1247,84 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const visible = completion.items.slice(start, start + visibleCount)
     for (const [offset, item] of visible.entries()) {
       const index = start + offset
-      const marker = index === completion.index ? '▸' : ' '
+      const marker = index === completion.index ? paint(theme, 'accent', '▸') : ' '
       body.push(
-        `${marker} ${paint(theme, 'bold', pad(item.label, 16))} ${truncate(item.description, Math.max(6, inner - 20))}`,
+        `${marker} ${paint(theme, 'bold', pad(item.label, 16))} ${paint(theme, 'muted', truncate(item.description, Math.max(6, inner - 20)))}`,
       )
     }
     if (completion.items.length === 0) {
-      body.push(paint(theme, 'dim', completion.context.kind === 'command' ? 'no matching command' : 'no matching file'))
+      body.push(paint(theme, 'muted', completion.context.kind === 'command' ? 'no matching command' : 'no matching file'))
     }
-    body.push(paint(theme, 'dim', '↑/↓ select  tab insert  enter run/select  esc close'))
-    const top = `┌─ ${title} ${'─'.repeat(Math.max(0, width - displayWidth(title) - 5))}┐`
-    const bottom = `└${'─'.repeat(width - 2)}┘`
-    return [paint(theme, 'gray', top), ...body.map((line) => `│ ${pad(line, inner)} │`), paint(theme, 'gray', bottom)]
+    return panelBox(theme, title, body, width, {
+      footer: [paint(theme, 'muted', '↑/↓ select · tab insert · enter run/select · esc close')],
+    })
   }
 
   const render = (): void => {
     if (state.quitting) return
     const { rows, columns } = screen.size
-    const transcriptData = transcript()
-    const overlay = overlayLines()
-    const menu = completionMenuLines()
-    let lines: string[] = []
-    let cursor: { row: number; column: number } | undefined
-    lines.push(...headerLines())
-    lines.push(paint(theme, 'gray', '─'.repeat(columns)))
+
     if (state.startup !== undefined) {
-      const panel = startupLines()
-      const available = Math.max(4, rows - 4)
-      const top = Math.max(0, Math.floor((available - panel.length) / 2))
-      lines.push(...Array.from({ length: top }, () => ''))
-      lines.push(...panel.slice(0, available))
-      if (state.error !== undefined) lines.push('', paint(theme, 'red', `! ${state.error}`))
-    } else if (overlay.length > 0) {
-      const available = Math.max(4, rows - 4)
-      const visible = overlay.slice(0, available)
-      const top = Math.max(0, Math.floor((available - visible.length) / 2))
-      lines.push(...Array.from({ length: top }, () => ''))
-      lines.push(...visible)
-      if (state.toast !== undefined && state.toast.until > Date.now()) lines.push('', paint(theme, 'yellow', state.toast.text))
-      if (state.error !== undefined) lines.push(paint(theme, 'red', `! ${state.error}`))
-    } else {
-      const height = transcriptHeight(menu.length)
-      const visible = viewport.visible(transcriptData.lines, height)
-      lines.push(...visible.lines)
-      for (let index = visible.lines.length; index < height; index += 1) lines.push('')
-      if (state.toast !== undefined && state.toast.until > Date.now()) {
-        lines.push(paint(theme, 'yellow', truncate(state.toast.text, columns)))
-      } else if (state.error !== undefined) {
-        lines.push(paint(theme, 'red', truncate(`! ${state.error}`, columns)))
-      } else {
-        lines.push('')
-      }
-      lines.push(...menu)
-      const composerWidth = Math.max(1, columns - 4)
-      const composer = composerLines(state.editor.text, composerWidth)
-      const maxComposer = Math.min(7, composer.length)
-      for (let index = 0; index < maxComposer; index += 1) {
-        const prefix = index === 0 ? paint(theme, 'cyan', '❯ ') : '  '
-        lines.push(`${prefix}${composer[index] ?? ''}`)
-      }
-      const footer = footerLines.slice(0, Math.max(0, rows - lines.length - 1))
-      lines.push(...footer)
-      const position = lineCol(state.editor.text, state.editor.cursor)
-      const wrappedBefore = composerLines(state.editor.text.slice(0, state.editor.cursor), composerWidth)
-      const visualLine = Math.max(0, Math.min(maxComposer - 1, wrappedBefore.length - 1))
-      const visualColumn = displayWidth(wrappedBefore.at(-1) ?? '')
-      const composerStart = lines.length - footer.length - maxComposer
-      cursor = {
-        row: composerStart + visualLine + 1,
-        column: 3 + visualColumn,
-      }
+      screen.draw(startupLines().slice(0, rows), undefined)
+      ensureTick()
+      return
     }
-    if (state.status !== 'idle' && state.status !== 'sending' && overlay.length === 0) {
-      // Keep status in the header; the transient toast is enough for one-liners.
+
+    const now = Date.now()
+    const metrics = currentMetrics()
+    const header = headerLines()
+    const overlay = overlayLines()
+    const toastActive = state.toast !== undefined && state.toast.until > now
+    const notice = toastActive
+      ? state.toast?.text
+      : state.error === undefined
+        ? undefined
+        : `! ${state.error}`
+    const lines: string[] = []
+    let cursor: { row: number; column: number } | undefined
+
+    if (overlay.length > 0) {
+      const available = Math.max(4, rows - header.length - (notice === undefined ? 0 : 1) - 1)
+      lines.push(...header)
+      lines.push(...centerVertically(centerBlock(overlay, columns), available))
+      if (notice !== undefined) {
+        const tone: ThemeStyle = !toastActive && state.error !== undefined ? 'error' : 'warning'
+        lines.push(paint(theme, tone, truncate(notice, columns)))
+      }
+      screen.draw(lines.slice(0, rows), undefined)
+      if (state.toast !== undefined && state.toast.until <= now) state.toast = undefined
+      ensureTick()
+      return
     }
-    screen.draw(lines, cursor)
-    if (state.toast !== undefined && state.toast.until <= Date.now()) state.toast = undefined
+
+    const transcriptData = transcript()
+    const menu = completionMenuLines()
+    const footer = footerLines(metrics, now)
+    const usage = usageRailLine(metrics, now)
+    const composer = renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns))
+    const noticeRows = notice === undefined ? 0 : 1
+    const bodyHeight = Math.max(
+      3,
+      rows - header.length - footer.length - menu.length - composer.height - noticeRows - 1,
+    )
+    lastBodyHeight = bodyHeight
+    const visible = viewport.visible(transcriptData.lines, bodyHeight)
+    lines.push(...header)
+    lines.push(...visible.lines)
+    for (let index = visible.lines.length; index < bodyHeight; index += 1) lines.push('')
+    if (notice !== undefined) {
+      const tone: ThemeStyle = !toastActive && state.error !== undefined ? 'error' : 'warning'
+      lines.push(paint(theme, tone, truncate(notice, columns)))
+    }
+    lines.push(...footer)
+    lines.push(...menu)
+    const composerStart = lines.length
+    lines.push(...composer.lines)
+    cursor = { row: composerStart + composer.cursorRow + 1, column: composer.cursorColumn }
+    lines.push(usage)
+    screen.draw(lines.slice(0, rows), cursor)
+    if (state.toast !== undefined && state.toast.until <= now) state.toast = undefined
+    ensureTick()
   }
 
   screen.onResizeRequest(() => schedule())

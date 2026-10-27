@@ -49,7 +49,7 @@ function reasoningText(content: unknown): string {
     .join('\n')
 }
 
-function isInjectedContext(text: string): boolean {
+export function isInjectedContext(text: string): boolean {
   return (
     text.startsWith('<system-reminder>') ||
     text.startsWith('Current runtime context.') ||

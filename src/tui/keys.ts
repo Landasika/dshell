@@ -28,6 +28,10 @@ export type Key =
   | { type: 'ctrl-e' }
   | { type: 'ctrl-p' }
   | { type: 'ctrl-n' }
+  | { type: 'ctrl-r' }
+  | { type: 'ctrl-b' }
+  | { type: 'ctrl-t' }
+  | { type: 'ctrl-o' }
 
 const SEQUENCES: Record<string, Key> = {
   '\u001b[A': { type: 'up' },
@@ -70,6 +74,10 @@ const CONTROL: Record<string, Key> = {
   '\u0005': { type: 'ctrl-e' },
   '\u0010': { type: 'ctrl-p' },
   '\u000e': { type: 'ctrl-n' },
+  '\u0012': { type: 'ctrl-r' },
+  '\u0002': { type: 'ctrl-b' },
+  '\u0014': { type: 'ctrl-t' },
+  '\u000f': { type: 'ctrl-o' },
 }
 
 const PASTE_START = '\u001b[200~'
