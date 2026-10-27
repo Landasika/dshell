@@ -30,6 +30,8 @@ import {
   formatPercent,
   formatTokens,
   nextSpeedSample,
+  todoCounts,
+  type AgentInfo,
   type SessionMetrics,
   type TpsSample,
 } from './metrics.js'
@@ -39,6 +41,7 @@ import {
   renderTpsGauge,
   renderTpsSparkline,
   renderTodoList,
+  renderStatusStrip,
   renderTodoStrip,
   renderUsageRail,
 } from './activity.js'
@@ -49,6 +52,7 @@ import {
   renderComposer,
   renderHeader,
   renderHintLine,
+  renderJumpToBottom,
 } from './chrome.js'
 import { formatCostCny } from './cost.js'
 import { renderSplash, type SplashSession } from './splash.js'
@@ -83,6 +87,8 @@ type Overlay =
   | { kind: 'history'; query: string; index: number }
   | { kind: 'rewind'; index: number }
   | { kind: 'dashboard' }
+  | { kind: 'agents'; index: number }
+  | { kind: 'agentView'; childId: string; label: string; lines: string[]; scroll: number; loading: boolean; error?: string }
 
 interface AppState {
   sessions: SessionSummary[]
@@ -192,6 +198,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const screen = new TerminalScreen(input, output)
   const viewport = new Viewport()
   const parser = new KeyParser()
+  // 1-based terminal row of the "jump to bottom" pill, for click hit-testing.
+  let pillRow: number | null = null
+  let agentHandle: SessionHandle | null = null
+  let lastTranscriptTotal = 0
+  let seenTranscriptTotal = 0
   const state: AppState = {
     sessions: [],
     workspaces: [],
@@ -539,6 +550,49 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  const closeAgentView = (): void => {
+    agentHandle?.dispose()
+    agentHandle = null
+  }
+
+  const openAgents = (): void => {
+    if (state.view === undefined) {
+      toast('attach a session first')
+      return
+    }
+    const agents = currentMetrics().agents
+    if (agents.length === 0) {
+      toast('no subagents in this session yet')
+      return
+    }
+    state.overlay = { kind: 'agents', index: 0 }
+    schedule()
+  }
+
+  const openAgentView = async (agent: AgentInfo): Promise<void> => {
+    closeAgentView()
+    state.overlay = { kind: 'agentView', childId: agent.agentId, label: agent.label, lines: [], scroll: 0, loading: true }
+    schedule()
+    try {
+      const handle = await backend.openSession(agent.agentId)
+      agentHandle = handle
+      const view = handle.snapshot()
+      const width = Math.max(24, screen.size.columns - 6)
+      const blocks = buildBlocks(view.events, false).filter((block) => block.kind !== 'todo')
+      const lines = renderBlocks(blocks, width, theme)
+      const current = state.overlay
+      if (current !== null && current.kind === 'agentView' && current.childId === agent.agentId) {
+        state.overlay = { ...current, lines, loading: false }
+      }
+    } catch (error) {
+      const current = state.overlay
+      if (current !== null && current.kind === 'agentView' && current.childId === agent.agentId) {
+        state.overlay = { ...current, loading: false, error: errorText(error) }
+      }
+    }
+    schedule()
+  }
+
   const runCommand = async (text: string): Promise<void> => {
     const [command, ...rest] = text.trim().split(/\s+/)
     const argument = rest.join(' ')
@@ -606,6 +660,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.overlay = { kind: 'dashboard' }
         schedule()
         return
+      case '/agents':
+        openAgents()
+        return
       default:
         toast(`unknown command ${command}; try /help`)
     }
@@ -654,6 +711,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (overlay.kind === 'approval') {
         toast('approval still pending; answer with a/r or wait for the timeout')
       } else {
+        if (overlay.kind === 'agentView') closeAgentView()
         state.overlay = null
       }
       schedule()
@@ -673,6 +731,35 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (overlay.kind === 'help') return
+    if (overlay.kind === 'agents') {
+      const agents = currentMetrics().agents
+      const delta = key.type === 'up' || key.type === 'ctrl-p' ? -1 : key.type === 'down' || key.type === 'ctrl-n' ? 1 : key.type === 'wheel' ? key.delta : 0
+      if (delta !== 0) {
+        overlay.index = Math.max(0, Math.min(Math.max(0, agents.length - 1), overlay.index + delta))
+      } else if (key.type === 'enter' || key.type === 'tab') {
+        const chosen = agents[overlay.index]
+        if (chosen !== undefined) void openAgentView(chosen)
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'agentView') {
+      const lines = overlay.lines.length
+      const height = Math.max(4, lastBodyHeight)
+      const step = key.type === 'wheel' ? key.delta * 3 : 0
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.scroll = Math.max(0, overlay.scroll - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') overlay.scroll = Math.min(Math.max(0, lines - 1), overlay.scroll + 1)
+      else if (key.type === 'page-up') overlay.scroll = Math.max(0, overlay.scroll - height)
+      else if (key.type === 'page-down') overlay.scroll = Math.min(Math.max(0, lines - 1), overlay.scroll + height)
+      else if (key.type === 'wheel') overlay.scroll = Math.max(0, Math.min(Math.max(0, lines - 1), overlay.scroll - step))
+      else if (key.type === 'backspace') {
+        closeAgentView()
+        state.overlay = { kind: 'agents', index: 0 }
+      }
+      schedule()
+      return
+    }
     if (overlay.kind === 'dashboard') {
       if (key.type === 'ctrl-b') state.overlay = null
       schedule()
@@ -744,6 +831,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const handleStartupKey = (key: Key): void => {
+    if (key.type === 'wheel') {
+      const startup = state.startup
+      if (startup === undefined) return
+      const count = startup.kind === 'sessions' ? startup.sessions.length : 0
+      const next = Math.max(0, Math.min(Math.max(0, count - 1), startup.index + key.delta))
+      if (next !== startup.index) {
+        startup.index = next
+        schedule()
+      }
+      return
+    }
     const startup = state.startup
     if (startup === undefined) return
     if (key.type === 'ctrl-c' || key.type === 'ctrl-d' || key.type === 'escape') {
@@ -781,6 +879,35 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (state.overlay !== null) {
       handleOverlayKey(key)
+      return
+    }
+    if (key.type === 'wheel') {
+      viewport.scroll(-key.delta * 3, transcriptLineCount(), transcriptHeight())
+      schedule()
+      return
+    }
+    if (key.type === 'click') {
+      if (pillRow !== null && key.row === pillRow) {
+        viewport.reset()
+        schedule()
+      }
+      return
+    }
+    if ((key.type === 'end' || key.type === 'enter') && viewport.scrollOffset > 0) {
+      // less/vim semantics: End (or Enter) returns to the live tail instead of
+      // moving the caret or sending a prompt that the user cannot see.
+      viewport.reset()
+      schedule()
+      return
+    }
+    if (key.type === 'ctrl-g') {
+      openAgents()
+      return
+    }
+    if (key.type === 'escape' && viewport.scrollOffset > 0) {
+      // Codex semantics: Esc returns to the live tail before it clears input.
+      viewport.reset()
+      schedule()
       return
     }
     if (key.type === 'escape') {
@@ -860,12 +987,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (key.type === 'page-up') {
-      viewport.page(-1, transcriptLineCount(), transcriptHeight())
+      viewport.page(1, transcriptLineCount(), transcriptHeight())
       schedule()
       return
     }
     if (key.type === 'page-down') {
-      viewport.page(1, transcriptLineCount(), transcriptHeight())
+      viewport.page(-1, transcriptLineCount(), transcriptHeight())
       schedule()
       return
     }
@@ -964,6 +1091,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     // update.
     const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
     const lines = renderBlocks(blocks, width, theme)
+    if (view.streamReasoning.length > 0 && view.status === 'running') {
+      const recent = view.streamReasoning
+        .split('\n')
+        .map((line) => line.trimEnd())
+        .filter((line) => line.length > 0)
+        .slice(-3)
+      lines.push('')
+      lines.push(`${paint(theme, 'info', '✻')} ${paint(theme, 'muted', 'thinking · live')}`)
+      for (const line of recent) {
+        for (const wrapped of wrapText(line, Math.max(1, width - 2))) {
+          lines.push(paint(theme, 'muted', `│ ${wrapped}`))
+        }
+      }
+    }
     if (view.streamText.length > 0 && view.status === 'running') {
       lines.push('')
       lines.push(`${paint(theme, 'accent', 'dshell')} ${paint(theme, 'muted', '· live')}`)
@@ -1034,6 +1175,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (!state.todosFolded && metrics.todos.length > 0) {
       lines.push(renderTodoStrip(theme, metrics.todos, { width: columns, now, folded: false }))
     }
+    const counts = todoCounts(metrics.todos)
+    const statusStrip = renderStatusStrip(theme, {
+      agentsDone: metrics.agents.filter((agent) => agent.status !== 'running').length,
+      agentsTotal: metrics.agents.length,
+      agentsRunning: metrics.agents.filter((agent) => agent.status === 'running').length,
+      jobsRunning: metrics.jobs.running,
+      jobsFailed: metrics.jobs.failed,
+      jobsTotal: metrics.jobs.total,
+      todosDone: counts.completed,
+      todosTotal: counts.total,
+      width: columns,
+    })
+    if (statusStrip.length > 0) lines.push(statusStrip)
     return lines
   }
 
@@ -1052,8 +1206,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'keys')), '')
       body.push(`${paint(theme, 'text', pad('enter', 15))} send · ${paint(theme, 'text', 'alt+enter')} newline · ${paint(theme, 'text', 'tab')} complete`)
       body.push(`${paint(theme, 'text', pad('ctrl+r', 15))} history search · ${paint(theme, 'text', 'ctrl+b')} session panel`)
-      body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} details`)
-      body.push(`${paint(theme, 'text', pad('double esc', 15))} rewind prompt · ${paint(theme, 'text', 'pgup/pgdn')} scroll`)
+      body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} thinking/details`)
+      body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'ctrl+b')} session panel`)
+      body.push(`${paint(theme, 'text', pad('double esc', 15))} rewind prompt · ${paint(theme, 'text', 'pgup/pgdn/wheel')} scroll`)
+      body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
       body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} cancel/quit · ${paint(theme, 'text', 'ctrl-d')} quit`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
       return panelBox(theme, 'help & shortcuts', body, width)
@@ -1121,6 +1277,34 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         footer: [paint(theme, 'muted', '↑/↓ select · enter restore · esc cancel')],
       })
     }
+    if (overlay.kind === 'agents') {
+      const agents = currentMetrics().agents
+      const body: string[] = [paint(theme, 'muted', `${agents.length} subagent${agents.length === 1 ? '' : 's'} in this session`), '']
+      for (let index = 0; index < agents.length; index += 1) {
+        const agent = agents[index]!
+        const glyph = agent.status === 'running'
+          ? paint(theme, 'info', '●')
+          : agent.status === 'failed' ? paint(theme, 'error', '✗') : paint(theme, 'success', '✓')
+        const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
+        const age = agent.startedAt === undefined ? '' : ` · ${timeAgo(agent.startedAt)}`
+        const id = agent.agentId.length > 8 ? agent.agentId.slice(0, 8) : agent.agentId
+        body.push(`${marker} ${glyph} ${paint(theme, 'text', truncate(agent.label, Math.max(10, inner - 34)))} ${paint(theme, 'muted', `${id} · ${agent.status}${age}`)}`)
+      }
+      return panelBox(theme, 'agents', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ move · enter open transcript · esc close')],
+      })
+    }
+    if (overlay.kind === 'agentView') {
+      const height = Math.max(4, rows - 8)
+      const body = overlay.loading
+        ? ['', paint(theme, 'muted', 'attaching to the subagent session…')]
+        : overlay.error !== undefined
+          ? [paint(theme, 'error', overlay.error)]
+          : overlay.lines.slice(overlay.scroll, overlay.scroll + height)
+      return panelBox(theme, `agent · ${truncate(overlay.label, 40)}`, body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · backspace back · esc close')],
+      })
+    }
     if (overlay.kind === 'dashboard') {
       const metrics = currentMetrics()
       const view = state.view
@@ -1168,6 +1352,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       core.push(`${paint(theme, 'muted', 'speed')}    ${paint(theme, 'text', tps.toFixed(1))} tps ${renderTpsGauge(theme, tps, peak)}${elapsed === undefined ? '' : paint(theme, 'muted', ` · turn ${formatDuration(elapsed)}`)}`)
       if (state.tpsSamples.length > 1) core.push(`${paint(theme, 'muted', '         ')}${renderTpsSparkline(theme, state.tpsSamples)}`)
 
+      const agentsSection: string[] = []
+      if (metrics.agents.length > 0) {
+        agentsSection.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'agents')))
+        for (const agent of metrics.agents) {
+          const glyph = agent.status === 'running' ? paint(theme, 'info', '●') : agent.status === 'failed' ? paint(theme, 'error', '✗') : paint(theme, 'success', '✓')
+          agentsSection.push(`${glyph} ${paint(theme, 'text', truncate(agent.label, Math.max(10, inner - 18)))} ${paint(theme, 'muted', `${shortId(agent.agentId)} · ${agent.status}`)}`)
+        }
+      }
+
       const todosSection: string[] = ['']
       todosSection.push(paint(theme, 'bold', paint(theme, 'accentSoft', 'todos')))
       todosSection.push(...renderTodoList(theme, metrics.todos, inner))
@@ -1176,21 +1369,24 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       // header row and one slack row belong to the overlay frame, not the
       // body. Todos are the first section to go, then the tail is clipped.
       const maxBody = Math.max(6, rows - 7)
-      let body: string[]
-      if (core.length + todosSection.length <= maxBody) {
-        body = [...core, ...todosSection]
-      } else {
-        body = core.slice(0, maxBody)
-        if (core.length > maxBody) {
-          body = [...core.slice(0, maxBody - 1), paint(theme, 'muted', '…')]
-        } else if (core.length < maxBody) {
-          body.push(paint(theme, 'muted', 'todos hidden (terminal too short)'))
-        }
+      let body = [...core]
+      const append = (section: string[]): boolean => {
+        if (section.length === 0 || body.length + section.length > maxBody) return false
+        body.push(...section)
+        return true
+      }
+      const agentsShown = append(agentsSection)
+      const todosShown = append(todosSection)
+      if (body.length > maxBody) body = [...core.slice(0, maxBody - 1), paint(theme, 'muted', '…')]
+      const hidden = [!agentsShown && agentsSection.length > 0 ? 'agents' : '', !todosShown && metrics.todos.length > 0 ? 'todos' : ''].filter(Boolean)
+      if (hidden.length > 0 && body.length < maxBody) {
+        body.push(paint(theme, 'muted', `${hidden.join(' + ')} hidden (terminal too short)`))
       }
       return panelBox(theme, 'session panel', body, width, {
         footer: [paint(theme, 'muted', 'ctrl+b / esc close · ctrl+r history · double esc rewind')],
       })
     }
+    if (overlay.kind !== 'approval') return []
     const pending = state.view?.pendingApproval
     if (pending === undefined) return panelBox(theme, 'approval', [paint(theme, 'muted', 'no approval pending')], width)
     const body = [
@@ -1265,6 +1461,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const { rows, columns } = screen.size
 
     if (state.startup !== undefined) {
+      pillRow = null
       screen.draw(startupLines().slice(0, rows), undefined)
       ensureTick()
       return
@@ -1291,6 +1488,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const tone: ThemeStyle = !toastActive && state.error !== undefined ? 'error' : 'warning'
         lines.push(paint(theme, tone, truncate(notice, columns)))
       }
+      pillRow = null
       screen.draw(lines.slice(0, rows), undefined)
       if (state.toast !== undefined && state.toast.until <= now) state.toast = undefined
       ensureTick()
@@ -1303,9 +1501,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const usage = usageRailLine(metrics, now)
     const composer = renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns))
     const noticeRows = notice === undefined ? 0 : 1
+    const total = transcriptData.lines.length
+    lastTranscriptTotal = total
+    if (viewport.scrollOffset === 0) seenTranscriptTotal = total
+    const unseen = Math.max(0, total - seenTranscriptTotal)
+    const pill = viewport.scrollOffset === 0 ? undefined : renderJumpToBottom(theme, unseen, columns)
     const bodyHeight = Math.max(
       3,
-      rows - header.length - footer.length - menu.length - composer.height - noticeRows - 1,
+      rows - header.length - footer.length - menu.length - composer.height - noticeRows - (pill === undefined ? 0 : 1) - 1,
     )
     lastBodyHeight = bodyHeight
     const visible = viewport.visible(transcriptData.lines, bodyHeight)
@@ -1315,6 +1518,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (notice !== undefined) {
       const tone: ThemeStyle = !toastActive && state.error !== undefined ? 'error' : 'warning'
       lines.push(paint(theme, tone, truncate(notice, columns)))
+    }
+    pillRow = null
+    if (pill !== undefined) {
+      lines.push(pill)
+      pillRow = lines.length
     }
     lines.push(...footer)
     lines.push(...menu)

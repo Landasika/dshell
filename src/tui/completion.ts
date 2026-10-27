@@ -19,6 +19,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/rewind', description: 'restore a previous prompt into the composer' },
   { name: '/history', description: 'search prompts sent in this session' },
   { name: '/panel', description: 'session panel: context, spend, speed, todos' },
+  { name: '/agents', description: 'list subagents and open their transcripts' },
   { name: '/status', description: 'alias for /panel' },
   { name: '/verbose', description: 'toggle reasoning and lifecycle events' },
   { name: '/quit', description: 'leave the TUI (does not cancel the Host turn)' },

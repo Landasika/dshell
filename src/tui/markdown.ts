@@ -91,7 +91,8 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
     // would otherwise look like noise, style the whole line where useful.
     const cleaned = line
       .replace(/\*\*([^*]+)\*\*/g, '$1')
-      .replace(/__([^_]+)__/g, '$1')
+      // Intraword dunders are identifiers (`__init__.py`), not emphasis.
+      .replace(/(?<![\w])__([^_]+)__(?![\w./])/g, '$1')
       .replace(/`([^`]+)`/g, '$1')
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
     for (const part of wrapText(cleaned, width)) lines.push(part)

@@ -137,6 +137,48 @@ export function renderTodoList(theme: Theme, todos: readonly TodoItem[], width: 
   })
 }
 
+export interface StatusStripInput {
+  agentsDone: number
+  agentsTotal: number
+  agentsRunning: number
+  jobsRunning: number
+  jobsFailed: number
+  jobsTotal: number
+  todosDone: number
+  todosTotal: number
+  width: number
+}
+
+/**
+ * Claude-Code-style status strip above the composer: settled agent count,
+ * running background jobs and todo progress. Renders nothing when the session
+ * has none of them, so idle sessions keep their two-line footer.
+ */
+export function renderStatusStrip(theme: Theme, input: StatusStripInput): string {
+  const segments: string[] = []
+  if (input.agentsTotal > 0) {
+    const settled = input.agentsRunning === 0
+    const glyph = settled && input.agentsDone === input.agentsTotal ? '✓' : '●'
+    const style: ThemeStyle = settled ? 'success' : 'info'
+    segments.push(`${paint(theme, style, glyph)} ${paint(theme, 'muted', `agents ${input.agentsDone}/${input.agentsTotal}`)}`)
+  }
+  if (input.jobsRunning > 0 || input.jobsFailed > 0) {
+    const glyph = input.jobsRunning > 0 ? '●' : '✗'
+    const style: ThemeStyle = input.jobsRunning > 0 ? 'info' : 'error'
+    const failed = input.jobsFailed > 0 ? paint(theme, 'error', ` · ✗ ${input.jobsFailed}`) : ''
+    segments.push(`${paint(theme, style, glyph)} ${paint(theme, 'muted', 'jobs')} ${paint(theme, 'text', String(input.jobsRunning))}${failed}`)
+  }
+  if (input.todosTotal > 0) {
+    const done = input.todosDone === input.todosTotal
+    const glyph = done ? '✓' : '●'
+    const style: ThemeStyle = done ? 'success' : input.todosDone > 0 ? 'info' : 'muted'
+    segments.push(`${paint(theme, style, glyph)} ${paint(theme, 'muted', `todo ${input.todosDone}/${input.todosTotal}`)}`)
+  }
+  if (segments.length === 0) return ''
+  const line = segments.join('  ')
+  return displayWidth(line) <= input.width ? line : truncate(line, input.width)
+}
+
 /** Compact status chip used by the header. */
 export function splitLine(left: string, right: string, width: number): string {
   const gap = Math.max(1, width - displayWidth(left) - displayWidth(right))

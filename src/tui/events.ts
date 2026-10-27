@@ -23,6 +23,14 @@ export interface Block {
   toolName?: string
   failed?: boolean
   detail?: string
+  /** Expanded form (full reasoning); `body` holds the folded preview. */
+  full?: string
+  /** Right-aligned meta line under the header, e.g. token count. */
+  meta?: string
+}
+
+function shortAgent(id: string): string {
+  return id.length <= 8 ? id : id.slice(0, 8)
 }
 
 function dataOf(event: SessionEvent): Json {
@@ -121,6 +129,7 @@ function todoBlock(data: Json): Block {
 export function buildBlocks(events: readonly SessionEvent[], verbose = false): Block[] {
   const blocks: Block[] = []
   const callBlocks = new Map<string, Block>()
+  const agentBlocks = new Map<string, Block>()
 
   for (const event of events) {
     const data = dataOf(event)
@@ -140,10 +149,14 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
         const text = contentText(message.content)
         const reasoning = reasoningText(message.content)
         if (reasoning.length > 0) {
+          const lines = reasoning.split('\n').map((line) => line.trimEnd()).filter((line) => line.length > 0)
+          const preview = lines.slice(-3)
           blocks.push({
             kind: 'reasoning',
             title: 'thinking',
-            body: verbose ? reasoning : truncate(reasoning.replace(/\s+/g, ' '), 160),
+            body: verbose ? reasoning : preview.join('\n'),
+            full: reasoning,
+            meta: `${Math.max(1, Math.round(reasoning.length / 4))} tok · ${verbose ? 'ctrl+o fold' : 'ctrl+o expand'}`,
           })
         }
         if (text.length > 0) blocks.push({ kind: 'assistant', body: text })
@@ -194,16 +207,53 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
         blocks.push(todoBlock(data))
         break
       }
+      case 'subagent/catalog': {
+        const childId = String(data.childId ?? '')
+        const label = typeof data.label === 'string' && data.label.length > 0 ? data.label : childId
+        blocks.push({
+          kind: 'notice',
+          title: '⇢ agent started',
+          body: `${label} · ${shortAgent(childId)}`,
+          callId: childId,
+        })
+        agentBlocks.set(childId, blocks[blocks.length - 1]!)
+        break
+      }
+      case 'agent/inbox/spliced': {
+        // Settlement notices arrive as spliced inbox items, not as subagent/*.
+        const inserted = Array.isArray(data.inserted) ? (data.inserted as Json[]) : []
+        for (const item of inserted) {
+          const source = (item.source ?? {}) as Json
+          if (source.kind !== 'subagent-settled') continue
+          const childId = String(source.senderSessionId ?? '')
+          const target = agentBlocks.get(childId)
+          const text = contentText(item.content)
+          const failed = /failed/i.test(text)
+          if (target !== undefined) {
+            target.title = failed ? '✗ agent failed' : '✓ agent finished'
+            target.failed = failed
+          }
+        }
+        break
+      }
+      case 'subagent/descriptor': {
+        // The child session's own header descriptor: no row for the parent.
+        if (verbose) blocks.push({ kind: 'notice', title: 'agent descriptor', body: truncate(JSON.stringify(data), 200) })
+        break
+      }
       case 'subagent/start':
       case 'subagent/end':
       case 'subagent/status': {
-        const label = event.type === 'subagent/start' ? 'subagent started' : event.type === 'subagent/end' ? 'subagent finished' : 'subagent'
-        const id = data.agentId ?? data.sessionId ?? data.id
-        blocks.push({
-          kind: 'notice',
-          title: label,
-          body: id === undefined ? truncate(JSON.stringify(data), 200) : String(id),
-        })
+        const id = String(data.agentId ?? data.sessionId ?? data.id ?? '')
+        const target = agentBlocks.get(id)
+        const settled = event.type === 'subagent/end'
+        const failed = data.status === 'failed' || data.status === 'cancelled'
+        if (target !== undefined) {
+          target.title = `${failed ? '✗' : settled ? '✓' : '⇢'} agent ${failed ? 'failed' : settled ? 'finished' : 'running'}`
+          target.failed = failed
+        } else if (verbose) {
+          blocks.push({ kind: 'notice', title: `subagent ${event.type.split('/')[1] ?? 'event'}`, body: id })
+        }
         break
       }
       case 'approval/asked': {
@@ -249,6 +299,11 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
     }
   }
 
+  // A spawn call and its catalog row describe the same event; when the roster
+  // exists, the agent card replaces the generic tool card.
+  if (agentBlocks.size > 0) {
+    return blocks.filter((block) => !(block.kind === 'tool' && block.toolName === 'subagent'))
+  }
   return blocks
 }
 
@@ -302,10 +357,15 @@ export function renderBlocks(
         break
       }
       case 'reasoning': {
-        const label = paint(theme, 'dim', `✻ ${block.title ?? 'thinking'}`)
-        out.push(label)
-        for (const line of wrapText(block.body, Math.max(1, width - 2))) {
-          out.push(paint(theme, 'dim', `  ${line}`))
+        // Folded by default: a header plus the last few reasoning lines on a
+        // dim rail. Ctrl-O swaps `body` for the full text at build time.
+        const head = `${paint(theme, 'info', '⚓')} ${paint(theme, 'dim', block.title ?? 'thinking')}`
+        const meta = block.meta === undefined ? '' : ` ${paint(theme, 'dim', `· ${block.meta}`)}`
+        out.push(`${head}${meta}`)
+        for (const line of block.body.split('\n')) {
+          for (const wrapped of wrapText(line, Math.max(1, width - 2))) {
+            out.push(paint(theme, 'dim', `│ ${wrapped}`))
+          }
         }
         break
       }
@@ -334,7 +394,13 @@ export function renderBlocks(
         break
       }
       case 'notice': {
-        out.push(paint(theme, 'dim', `· ${block.title ?? ''}${block.body.length > 0 ? ` ${block.body}` : ''}`))
+        const title = block.title ?? ''
+        if (title.startsWith('⇢') || title.startsWith('✓') || title.startsWith('✗')) {
+          const style = block.failed === true || title.startsWith('✗') ? 'red' : title.startsWith('✓') ? 'green' : 'magenta'
+          out.push(`${paint(theme, style, title)} ${paint(theme, 'dim', block.body)}`)
+        } else {
+          out.push(paint(theme, 'dim', `· ${title}${block.body.length > 0 ? ` ${block.body}` : ''}`))
+        }
         break
       }
       case 'error': {

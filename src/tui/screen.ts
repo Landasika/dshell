@@ -10,6 +10,7 @@ export interface ScreenSize {
 /** Minimal alternate-screen renderer. One full repaint per frame, throttled by the caller. */
 export class TerminalScreen {
   private started = false
+  private mouseEnabled = false
   private readonly onResize = (): void => this.resizeHandler?.()
   private resizeHandler: (() => void) | undefined
 
@@ -31,7 +32,15 @@ export class TerminalScreen {
     this.input.setRawMode(true)
     this.input.resume()
     this.output.write('\u001b[?1049h\u001b[?25l\u001b[2J\u001b[H')
+    // Bracketed paste + SGR mouse reporting. Wheel ticks are routed to the
+    // transcript; hold Shift for the terminal's native text selection.
+    // DSHELL_NO_MOUSE=1 keeps the terminal's own scrollback and selection.
     this.output.write('\u001b[?2004h')
+    this.mouseEnabled = process.env.DSHELL_NO_MOUSE !== '1'
+    if (this.mouseEnabled) {
+      // 1007 off: the terminal must not turn wheel ticks into arrow keys.
+      this.output.write('\u001b[?1007l\u001b[?1000h\u001b[?1006h')
+    }
     this.output.on('resize', this.onResize)
   }
 
@@ -39,7 +48,10 @@ export class TerminalScreen {
     if (!this.started) return
     this.started = false
     this.output.off('resize', this.onResize)
-    this.output.write('\u001b[?2004l\u001b[?25h\u001b[?1049l')
+    // Restore alternate-scroll so the user's shell wheel keeps working.
+    const mouseReset = this.mouseEnabled ? '\u001b[?1000l\u001b[?1006l\u001b[?1007h' : ''
+    this.mouseEnabled = false
+    this.output.write(`${mouseReset}\u001b[?2004l\u001b[?25h\u001b[?1049l`)
     try {
       this.input.setRawMode(false)
     } catch {

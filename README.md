@@ -151,6 +151,10 @@ Inside a session:
 ◆ dshell · session title                              ● running · /project
 ────────────────────────────────────────────────────────────────────────────
   transcript: streaming markdown, reasoning, tool cards, diffs, approvals
+⚓ thinking · 412 tok · ctrl+o expand
+│ 先确认每个应用的启动方式，再分派给子代理。
+│ venv 已就绪，可以直接跑冒烟门。
+⇢ agent started  接入 OctoPrint harness · 18b9d1cc
 ⢿ Running command · rg reconnect src · 12s · ctx 84%
 ▸ 1/3 · Adding bounded backoff                                    ctrl+t hide
 ╭─ prompt ─────────────────────────────────────────────────────────────╮
@@ -161,8 +165,20 @@ Inside a session:
 
 - header: brand, session title, status (idle / running / approval / error) and
   working directory.
+- thinking: folded to a `⚓ thinking · N tok · ctrl+o` header plus the last
+  three reasoning lines on a dim rail. `Ctrl-O` expands the full text; live
+  reasoning streams on the same rail while the model is thinking.
+- subagents: a `⇢ agent started` card when a child is spawned, updated to
+  `✓ finished` / `✗ failed` from the durable settlement notice. `Ctrl-G` (or
+  `/agents`) lists every child with its status; `Enter` opens that child's
+  transcript in a read-only panel.
 - live activity: spinner, current tool/verb, elapsed turn time and context
   pressure. Only shown while a turn runs; the header carries the idle state.
+- scrolling: the mouse wheel (and `PgUp`/`PgDn`) scrolls the transcript, never
+  the composer. While scrolled up a right-aligned `↓ N new · End` pill appears
+  above the composer; click it, press `End`/`Enter`, or `Esc` to return to the
+  live tail. `DSHELL_NO_MOUSE=1` disables mouse capture so the terminal keeps
+  its own scrollback and text selection.
 - usage rail (bottom, under the composer): session-cumulative input, cache,
   output, estimated spend (`~¥`), model, context pressure and live TPS. On
   narrow terminals it drops cache → model → gauge → TPS, keeping the totals and
@@ -173,6 +189,11 @@ Inside a session:
   The bar is the readout's boundary, local estimates only divide the used span.
 - todo strip: current task and completion count, foldable with `Ctrl-T`; the
   session panel keeps the full list.
+- status strip (above the composer, only when non-empty):
+  `✓ agents 1/1  ● jobs 1  ● todo 0/6`. `✓` means every subagent settled,
+  `●` a child/job is still running; `✗` flags failed jobs. Jobs are folded from
+  durable `job/registered` / `job/settled` events, so the count survives
+  reconnects and history replay.
 - composer: rounded frame that grows with the draft (up to seven rows); the
   shortcut hint sits in its bottom border.
 
@@ -199,7 +220,10 @@ the official API.
 | `↑`/`↓`, `Ctrl-P/N` | completion, picker, or history navigation |
 | `PgUp`/`PgDn` | scroll the transcript |
 | `Ctrl-R` | search prompts sent in this session |
-| `Ctrl-B` | session panel: context breakdown, session spend, tokens, speed, todos |
+| `Ctrl-B` | session panel: context breakdown, session spend, tokens, speed, todos, agents |
+| `Ctrl-G` | subagent list; `Enter` opens that child's transcript |
+| `End` / `Enter` / `Esc` | jump back to the live tail while scrolled up |
+| wheel, `PgUp`/`PgDn` | scroll the transcript |
 | `Ctrl-T` | fold/show the todo strip |
 | `Ctrl-O` | toggle verbose reasoning/lifecycle blocks |
 | `?` | help & shortcuts (when the composer is empty) |
@@ -212,7 +236,7 @@ Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
 `/cancel`.
 
 Commands: `/sessions`, `/workspaces`, `/new`, `/attach`, `/cancel`, `/clear`,
-`/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/verbose`, `/help`,
+`/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/agents`, `/verbose`, `/help`,
 `/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
 
 See [TUI design](docs/TUI-DESIGN.md) for the palette, metric sources and

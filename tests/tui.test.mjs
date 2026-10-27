@@ -402,6 +402,7 @@ test('TUI slash completion menu filters and executes a command', async () => {
 // ---------------------------------------------------------------------------
 
 import {
+  collectAgents,
   collectMetrics,
   estimateTokens,
   formatDuration,
@@ -413,7 +414,9 @@ import {
 import { allocateColumns, contextBarLayout, renderContextBar } from '../dist/tui/contextbar.js'
 import { renderActivityLine, renderTodoStrip, renderTpsGauge, renderUsageRail } from '../dist/tui/activity.js'
 import { renderSplash } from '../dist/tui/splash.js'
-import { renderComposer } from '../dist/tui/chrome.js'
+import { renderComposer, renderJumpToBottom } from '../dist/tui/chrome.js'
+import { renderStatusStrip } from '../dist/tui/activity.js'
+import { streamChunkParts } from '../dist/backend/stream.js'
 import { estimateSessionCost, formatCostCny, isPeakHour, parseUsage, priceForModel } from '../dist/tui/cost.js'
 
 const metricsEvents = [
@@ -681,13 +684,30 @@ test('TUI exposes history search, double-Esc rewind, and the session panel', asy
   input.push('\r')
   await waitFor(() => output.text.includes('echo: first prompt'))
 
+  // Grow the transcript past one viewport so there is something to scroll.
+  for (let index = 0; index < 6; index += 1) {
+    input.push(`filler ${index}`)
+    input.push('\r')
+    await waitFor(() => output.text.includes(`echo: filler ${index}`))
+  }
+
+  // Wheel scrolls the transcript and surfaces the jump-to-bottom pill; End
+  // returns to the live tail without touching the composer.
+  for (let index = 0; index < 5; index += 1) input.push('\u001b[<64;10;5M')
+  await waitFor(() => output.text.includes('Jump to bottom'))
+  const scrolledAt = output.text.length
+  input.push('\u001b[F')
+  await waitFor(() => output.text.length > scrolledAt && !output.text.slice(scrolledAt).includes('Jump to bottom'))
+  assert.equal(output.text.includes('first prompt'), true)
+
   // Ctrl+R: filter the sent prompts, then restore the match into the composer.
   input.push('\u0012')
   await waitFor(() => output.text.includes('history search'))
   input.push('first')
   input.push('\r')
   await waitFor(() => !output.text.slice(-1200).includes('history search'))
-  assert.equal(backend.requireSession('s1').events.filter((event) => event.type === 'user/message').length, 1)
+  const firstPrompts = backend.requireSession('s1').events.filter((event) => event.type === 'user/message' && JSON.stringify(event).includes('first prompt'))
+  assert.equal(firstPrompts.length, 1)
 
   // Ctrl+C clears the restored draft; double-Esc opens rewind on the empty idle composer.
   input.push('\u0003')
@@ -710,4 +730,112 @@ test('TUI exposes history search, double-Esc rewind, and the session panel', asy
   input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
+})
+
+test('wheel and click sequences parse without leaking into the composer', () => {
+  const parser = new KeyParser()
+  assert.deepEqual(parser.feed('\u001b[<64;10;5M'), [{ type: 'wheel', delta: -1 }])
+  assert.deepEqual(parser.feed('\u001b[<65;10;5M'), [{ type: 'wheel', delta: 1 }])
+  assert.deepEqual(parser.feed('\u001b[<0;7;12M'), [{ type: 'click', row: 12, column: 7 }])
+  // Release and other buttons are swallowed, never typed as text.
+  assert.deepEqual(parser.feed('\u001b[<0;7;12m'), [{ type: 'text', text: '' }])
+  assert.deepEqual(parser.feed('\u001b[<66;1;1M'), [{ type: 'text', text: '' }])
+})
+
+test('assistant stream splits reasoning deltas from visible text', () => {
+  const reasoning = streamChunkParts({ type: 'chunk', chunk: { type: 'reasoning-delta', text: 'think' } })
+  assert.deepEqual(reasoning, { text: '', reasoning: 'think' })
+  const text = streamChunkParts({ type: 'chunk', chunk: { type: 'text-delta', text: 'hello' } })
+  assert.deepEqual(text, { text: 'hello', reasoning: '' })
+  assert.deepEqual(streamChunkParts({ type: 'start' }), { text: '', reasoning: '' })
+})
+
+test('thinking renders folded with a ctrl+o hint and expands under verbose', () => {
+  const reasoning = 'first line\nsecond line\nthird line\nfourth line'
+  const events = [
+    { type: 'assistant/message', seq: 1, data: { message: { role: 'assistant', content: [{ type: 'reasoning', text: reasoning }, { type: 'text', text: 'done' }] } } },
+  ]
+  const folded = renderBlocks(buildBlocks(events), 60, theme).map(stripAnsi)
+  const header = folded.find((line) => line.includes('thinking'))
+  assert.ok(header)
+  assert.match(header, /ctrl\+o expand/)
+  assert.equal(folded.some((line) => line.includes('first line')), false)
+  assert.equal(folded.some((line) => line.includes('fourth line')), true)
+
+  const full = renderBlocks(buildBlocks(events, true), 60, theme).map(stripAnsi)
+  assert.ok(full.some((line) => line.includes('first line')))
+  assert.ok(full.some((line) => line.includes('ctrl+o fold')))
+})
+
+test('subagent roster follows catalog and settlement events', () => {
+  const child = '18b9d1cc-8488-44de-a495-3cc8babff2d5'
+  const events = [
+    { type: 'subagent/catalog', seq: 1, time: 1_000, data: { childId: child, childCreatedAt: 900, mode: 'continuable', label: 'OctoPrint harness' } },
+    { type: 'agent/inbox/spliced', seq: 2, data: { inserted: [{ content: [{ type: 'text', text: 'Background subagent finished.' }], source: { kind: 'subagent-settled', senderSessionId: child } }] } },
+  ]
+  const agents = collectAgents(events)
+  assert.equal(agents.length, 1)
+  assert.equal(agents[0].label, 'OctoPrint harness')
+  assert.equal(agents[0].status, 'done')
+  assert.equal(agents[0].startedAt, 900)
+
+  const metrics = collectMetrics({ sessionId: 's', header: { id: 's' }, events, cursor: 2, status: 'idle', streamText: '', streamReasoning: '' })
+  assert.equal(metrics.agents.length, 1)
+  const failed = collectAgents([
+    events[0],
+    { type: 'agent/inbox/spliced', seq: 2, data: { inserted: [{ content: [{ type: 'text', text: 'subagent failed before it finished' }], source: { kind: 'subagent-settled', senderSessionId: child } }] } },
+  ])
+  assert.equal(failed[0].status, 'failed')
+})
+
+test('jump-to-bottom pill fits the row and switches label with unread output', () => {
+  const idle = renderJumpToBottom(theme, 0, 40)
+  assert.equal(displayWidth(idle), 40)
+  assert.match(stripAnsi(idle), /Jump to bottom/)
+  const unread = renderJumpToBottom(theme, 12, 40)
+  assert.equal(displayWidth(unread), 40)
+  assert.match(stripAnsi(unread), /12 new/)
+  assert.match(stripAnsi(unread), /End/)
+})
+
+test('footer status strip folds agents, jobs and todo progress', () => {
+  const allDone = renderStatusStrip(theme, {
+    agentsDone: 1, agentsTotal: 1, agentsRunning: 0,
+    jobsRunning: 0, jobsFailed: 0, jobsTotal: 0,
+    todosDone: 0, todosTotal: 6, width: 80,
+  })
+  assert.equal(stripAnsi(allDone), '✓ agents 1/1  ● todo 0/6')
+  const running = renderStatusStrip(theme, {
+    agentsDone: 1, agentsTotal: 2, agentsRunning: 1,
+    jobsRunning: 1, jobsFailed: 0, jobsTotal: 2,
+    todosDone: 1, todosTotal: 6, width: 80,
+  })
+  assert.equal(stripAnsi(running), '● agents 1/2  ● jobs 1  ● todo 1/6')
+  const failed = renderStatusStrip(theme, {
+    agentsDone: 0, agentsTotal: 0, agentsRunning: 0,
+    jobsRunning: 0, jobsFailed: 1, jobsTotal: 1,
+    todosDone: 0, todosTotal: 0, width: 80,
+  })
+  assert.equal(stripAnsi(failed), '✗ jobs 0 · ✗ 1')
+  assert.equal(renderStatusStrip(theme, {
+    agentsDone: 0, agentsTotal: 0, agentsRunning: 0,
+    jobsRunning: 0, jobsFailed: 0, jobsTotal: 0,
+    todosDone: 0, todosTotal: 0, width: 80,
+  }), '')
+  assert.ok(displayWidth(renderStatusStrip(theme, {
+    agentsDone: 1, agentsTotal: 2, agentsRunning: 1,
+    jobsRunning: 3, jobsFailed: 0, jobsTotal: 3,
+    todosDone: 4, todosTotal: 9, width: 18,
+  })) <= 18)
+})
+
+test('job events fold into running and failed counts', () => {
+  const events = [
+    { type: 'job/registered', seq: 1, data: { jobId: 'a', kind: 'bash' } },
+    { type: 'job/registered', seq: 2, data: { jobId: 'b', kind: 'bash' } },
+    { type: 'job/settled', seq: 3, data: { jobId: 'b', status: 'failed' } },
+    { type: 'job/settled', seq: 4, data: { jobId: 'b', status: 'failed' } },
+  ]
+  const metrics = collectMetrics({ sessionId: 's', header: { id: 's' }, events, cursor: 4, status: 'running', streamText: '', streamReasoning: '' })
+  assert.deepEqual(metrics.jobs, { running: 1, total: 2, failed: 1 })
 })

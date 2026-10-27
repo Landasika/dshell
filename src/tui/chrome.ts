@@ -144,3 +144,14 @@ export function centerVertically(lines: readonly string[], rows: number): string
     ...Array.from({ length: bottom }, () => ''),
   ]
 }
+
+/** Right-aligned "jump to bottom" pill shown while the transcript is scrolled up. */
+export function renderJumpToBottom(theme: Theme, unseen: number, columns: number): string {
+  const label = unseen > 0
+    ? `${paint(theme, 'text', `${unseen} new`)} ${paint(theme, 'muted', '· End')}`
+    : `${paint(theme, 'text', 'Jump to bottom')} ${paint(theme, 'muted', '· End')}`
+  const styled = `${paint(theme, 'accent', '↓')} ${label}`
+  const width = displayWidth(styled)
+  if (width >= columns) return truncate(styled, columns)
+  return `${' '.repeat(columns - width)}${styled}`
+}

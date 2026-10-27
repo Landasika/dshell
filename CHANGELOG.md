@@ -7,6 +7,22 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Transcript scrolling**: SGR mouse capture routes the wheel to the
+  transcript (3 lines per tick); `PgUp`/`PgDn` page. While scrolled up a
+  clickable `↓ N new · End` pill returns to the live tail, as do `End`,
+  `Enter`, `Esc`, or scrolling back. `DSHELL_NO_MOUSE=1` restores the
+  terminal's native scrollback/selection.
+- **Subagent visibility**: `subagent/catalog` spawns render as `⇢ agent
+  started` cards that settle to `✓`/`✗` from the durable settlement notice;
+  `Ctrl-G`/`/agents` lists the roster and `Enter` opens a child transcript.
+  `Ctrl-B` gains an `agents` section.
+- **Status strip**: one row above the composer summarising the session:
+  `✓ agents 1/1  ● jobs 1  ● todo 0/6`. Agents fold from the subagent roster,
+  jobs from `job/registered` / `job/settled`, todos from `todo/write`. Failed
+  jobs show `✗ N`; the row disappears when all three are empty.
+- **Thinking display**: reasoning folds to `⚓ thinking · N tok · ctrl+o` plus
+  the last three lines; `Ctrl-O` expands. Live `reasoning-delta` stream chunks
+  render on the same rail while the model thinks.
 - **TUI design layer**: truecolor mist-blue palette with 256-colour fallback,
   list-only session picker, rounded composer with the shortcut hint in its
   bottom border, segmented context bar, live activity line with elapsed time,

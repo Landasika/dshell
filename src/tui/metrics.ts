@@ -65,6 +65,25 @@ export interface SessionMetrics {
   contextPct?: number
   /** Session-cumulative totals and estimated CNY spend. */
   cost: SessionCost
+  /** Subagents spawned from this session, oldest first. */
+  agents: AgentInfo[]
+  /** Background jobs (bash tool) registered in this session. */
+  jobs: JobSummary
+}
+
+export interface JobSummary {
+  running: number
+  total: number
+  failed: number
+}
+
+export interface AgentInfo {
+  agentId: string
+  label: string
+  mode?: string
+  /** Epoch ms from `childCreatedAt` or the event time. */
+  startedAt?: number
+  status: 'running' | 'done' | 'failed'
 }
 
 export interface TpsSample {
@@ -373,6 +392,8 @@ export function collectMetrics(view: SessionView | undefined, now = Date.now()):
       activity: { phase: 'idle', verb: 'Ready' },
       liveTokens: 0,
       cost: estimateSessionCost([]),
+      agents: [],
+      jobs: { running: 0, total: 0, failed: 0 },
     }
   }
   let usedTokens = 0
@@ -381,6 +402,8 @@ export function collectMetrics(view: SessionView | undefined, now = Date.now()):
   let model: string | undefined
   let provider: string | undefined
   let todos: TodoItem[] = []
+  const jobs: JobSummary = { running: 0, total: 0, failed: 0 }
+  const liveJobs = new Set<string>()
 
   for (const event of view.events) {
     const data = asObject(event.data) ?? {}
@@ -397,6 +420,20 @@ export function collectMetrics(view: SessionView | undefined, now = Date.now()):
       if (usage !== undefined) {
         lastUsage = usage
         usedTokens = usage.total
+      }
+    }
+    if (event.type === 'job/registered') {
+      const jobId = String(data.jobId ?? '')
+      if (jobId.length > 0 && !liveJobs.has(jobId)) {
+        liveJobs.add(jobId)
+        jobs.total += 1
+        jobs.running += 1
+      }
+    } else if (event.type === 'job/settled') {
+      const jobId = String(data.jobId ?? '')
+      if (jobId.length > 0 && liveJobs.delete(jobId)) {
+        jobs.running = Math.max(0, jobs.running - 1)
+        if (String(data.status ?? 'completed') !== 'completed') jobs.failed += 1
       }
     }
     const nextTodos = parseTodos(event)
@@ -429,6 +466,7 @@ export function collectMetrics(view: SessionView | undefined, now = Date.now()):
   const liveTokens = estimateTokens(view.streamText)
   const activity = deriveActivity(view)
   const cost = estimateSessionCost(view.events)
+  const agents = collectAgents(view.events)
   const pct = contextWindow !== undefined && contextWindow > 0
     ? Math.max(0, (usedTokens / contextWindow) * 100)
     : undefined
@@ -448,7 +486,75 @@ export function collectMetrics(view: SessionView | undefined, now = Date.now()):
     liveTokens,
     ...(pct === undefined ? {} : { contextPct: pct }),
     cost,
+    agents,
+    jobs,
   }
+}
+
+/**
+ * Subagent roster derived from durable events only: `subagent/catalog` opens a
+ * row, and a spliced `subagent-settled` inbox item closes it. A child can also
+ * arrive through `subagent/start` / `subagent/end` on hosts that emit them.
+ */
+export function collectAgents(events: readonly SessionEvent[]): AgentInfo[] {
+  const agents = new Map<string, AgentInfo>()
+  const row = (agentId: string, label: string, mode: string | undefined, startedAt: number | undefined): AgentInfo => {
+    const existing = agents.get(agentId)
+    if (existing !== undefined) {
+      if (label.length > 0) existing.label = label
+      if (mode !== undefined) existing.mode = mode
+      if (startedAt !== undefined) existing.startedAt = startedAt
+      return existing
+    }
+    const created: AgentInfo = { agentId, label: label.length > 0 ? label : agentId.slice(0, 8), status: 'running' }
+    if (mode !== undefined) created.mode = mode
+    if (startedAt !== undefined) created.startedAt = startedAt
+    agents.set(agentId, created)
+    return created
+  }
+
+  for (const event of events) {
+    const data = asObject(event.data) ?? {}
+    if (event.type === 'subagent/catalog') {
+      const childId = typeof data.childId === 'string' ? data.childId : ''
+      if (childId.length === 0) continue
+      row(
+        childId,
+        typeof data.label === 'string' ? data.label : '',
+        typeof data.mode === 'string' ? data.mode : undefined,
+        pickNumber(data, ['childCreatedAt']) ?? event.time,
+      )
+      continue
+    }
+    if (event.type === 'subagent/start') {
+      const id = typeof data.agentId === 'string' ? data.agentId : typeof data.sessionId === 'string' ? data.sessionId : ''
+      if (id.length > 0) row(id, typeof data.label === 'string' ? data.label : '', undefined, event.time)
+      continue
+    }
+    if (event.type === 'subagent/end' || event.type === 'subagent/status') {
+      const id = typeof data.agentId === 'string' ? data.agentId : typeof data.sessionId === 'string' ? data.sessionId : ''
+      const target = agents.get(id)
+      if (target === undefined) continue
+      if (event.type === 'subagent/end') target.status = data.status === 'failed' || data.status === 'cancelled' ? 'failed' : 'done'
+      else if (data.status === 'failed') target.status = 'failed'
+      continue
+    }
+    if (event.type === 'agent/inbox/spliced') {
+      const inserted = Array.isArray(data.inserted) ? (data.inserted as Json[]) : []
+      for (const item of inserted) {
+        const source = asObject(item.source)
+        if (source?.kind !== 'subagent-settled') continue
+        const id = typeof source.senderSessionId === 'string' ? source.senderSessionId : ''
+        const target = agents.get(id)
+        if (target === undefined) continue
+        const text = Array.isArray(item.content)
+          ? (item.content as Json[]).map((part) => (typeof part.text === 'string' ? part.text : '')).join(' ')
+          : ''
+        target.status = /failed/i.test(text) ? 'failed' : 'done'
+      }
+    }
+  }
+  return [...agents.values()].sort((left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0))
 }
 
 /**

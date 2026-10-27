@@ -21,14 +21,23 @@ rules:
 ├ rule ──────────────────────────────────────────────────────────────────┤
 │ transcript (markdown, reasoning, tool cards, diffs, approvals)         │
 │                                                                        │
+├ thinking (folded, Ctrl-O expands) ─────────────────────────────────────┤
+│ ⚓ thinking · 412 tok · ctrl+o expand                                   │
+│ │ last three reasoning lines                                          │
+├ agent card (spawn/settle) ─────────────────────────────────────────────┤
+│ ⇢ agent started  接入 OctoPrint harness · 18b9d1cc                     │
 ├ activity (only while a turn runs) ─────────────────────────────────────┤
 │ ⠹ Running command · detail · 12s · ctx 84%                             │
 ├ todo strip (only when todos exist) ────────────────────────────────────┤
 │ ▸ 1/3 · current task                                      ctrl+t hide  │
+├ status strip (only when agents/jobs/todos exist) ──────────────────────┤
+│ ✓ agents 1/1  ● jobs 1  ● todo 0/6                                     │
 ├ composer ──────────────────────────────────────────────────────────────┤
 │ ╭─ prompt ────────────────────────────────────────────────────────────╮ │
 │ │ ❯ draft                                                            │ │
 │ ╰─ enter send · / commands · @ files · ctrl+r history · ? help ───────╯ │
+├ jump pill (only while scrolled up) ────────────────────────────────────┤
+│                                        ↓ 12 new · End                 │
 ├ usage rail ────────────────────────────────────────────────────────────┤
 │ ↑12.4k  cache 3k  ↓840  ~¥0.42  model      ctx ███░░░░░ 25% · 42 tps  │
 └────────────────────────────────────────────────────────────────────────┘
@@ -118,6 +127,41 @@ usage and are ignored.
 `~¥0.42` is an estimate, not a bill. The panel shows the peak/idle split, the
 per-model breakdown and the unpriced remainder; the rail keeps only the total.
 
+## Scrolling, agents and thinking
+
+**Scrolling.** The alternate screen enables SGR mouse reporting
+(`1007l`, `1000h`, `1006h`); the wheel scrolls the transcript three lines per
+tick and never the composer. `PgUp`/`PgDn` page by a viewport. While the
+offset is non-zero the renderer emits a right-aligned `↓ N new · End` pill
+above the composer and remembers its 1-based row for click hit-testing. `End`,
+`Enter`, `Esc`, a click on the pill, or scrolling back to the bottom all
+restore the tail; `N` counts transcript lines appended since the last time the
+tail was visible. `DSHELL_NO_MOUSE=1` skips mouse capture (native scrollback),
+and `Shift`+drag still selects in most terminals.
+
+**Subagents.** The roster is a pure fold over durable events:
+`subagent/catalog` opens a row (`childId`, `label`, `mode`, `childCreatedAt`),
+and a spliced `agent/inbox/spliced` item whose `source.kind` is
+`subagent-settled` closes it as `done` or `failed` (the notice text decides).
+`subagent/start`/`end`/`status` are accepted for hosts that emit them. The
+transcript shows the spawn as a `⇢ agent started` card that flips to `✓`/`✗`;
+`Ctrl-G`/`/agents` lists the roster and `Enter` attaches the child session for
+a read-only transcript view (`backspace` returns to the list).
+
+**Status strip.** One row above the composer folds three independent
+projections: agents (settled/total, `✓` when all settled), background jobs
+(`running`, plus `✗ N` failures) and todo completion. All three come from the
+durable log, so replaying history on attach reconstructs the same strip; the
+row is omitted entirely when every section is empty.
+
+**Thinking.** Each `assistant/message` reasoning part becomes a folded block:
+a `⚓ thinking · N tok · ctrl+o expand` header plus the last three reasoning
+lines on a `│ ` rail. `Ctrl-O` rebuilds the transcript expanded and shows the
+full reasoning (the hint flips to `ctrl+o fold`). Live `reasoning-delta`
+stream chunks render on the same rail above the streaming text as
+`✻ thinking · live`, so the model's reasoning is visible without leaving the
+turn.
+
 ## Interaction
 
 - `?` opens help only when the composer is empty, so `?` remains typable.
@@ -137,6 +181,8 @@ per-model breakdown and the unpriced remainder; the rail keeps only the total.
 
 - Usage-rail fields drop in this order: cache (76) → context gauge (72) →
   TPS (64) → model (92). Input, output and cost never drop.
+- The jump pill is one row; it shortens to `↓ N new · End` / `↓ Jump to
+  bottom · End` rather than wrapping over the transcript.
 - The session panel clips its body to the viewport; the todo section is
   dropped first, then the tail, and the footer hint always survives.
 - Activity detail is capped at 45% of the row; the whole line is truncated to

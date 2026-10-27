@@ -32,6 +32,9 @@ export type Key =
   | { type: 'ctrl-b' }
   | { type: 'ctrl-t' }
   | { type: 'ctrl-o' }
+  | { type: 'ctrl-g' }
+  | { type: 'wheel'; delta: number }
+  | { type: 'click'; row: number; column: number }
 
 const SEQUENCES: Record<string, Key> = {
   '\u001b[A': { type: 'up' },
@@ -78,6 +81,7 @@ const CONTROL: Record<string, Key> = {
   '\u0002': { type: 'ctrl-b' },
   '\u0014': { type: 'ctrl-t' },
   '\u000f': { type: 'ctrl-o' },
+  '\u0007': { type: 'ctrl-g' },
 }
 
 const PASTE_START = '\u001b[200~'
@@ -119,6 +123,29 @@ export class KeyParser {
       const text = this.buffer.slice(PASTE_START.length, end)
       this.buffer = this.buffer.slice(end + PASTE_END.length)
       return { type: 'paste', text }
+    }
+
+    // SGR mouse reports: ESC [ < button ; column ; row M/m. The app enables
+    // 1000+1006 in the alternate screen, so wheel ticks arrive here instead of
+    // being turned into arrow keys by the terminal.
+    if (this.buffer.startsWith('\u001b[<')) {
+      const match = /^\u001b\[<(\d+);(\d+);(\d+)([Mm])/.exec(this.buffer)
+      if (match === null) {
+        // A partial report: wait for the terminating M/m. Bound the wait so a
+        // stray ESC [ < can never wedge the parser.
+        if (this.buffer.length > 32) this.buffer = this.buffer.slice(3)
+        return null
+      }
+      const code = Number(match[1] ?? 0)
+      const column = Number(match[2] ?? 0)
+      const row = Number(match[3] ?? 0)
+      const release = match[4] === 'm'
+      this.buffer = this.buffer.slice(match[0].length)
+      const button = code & ~(4 | 8 | 16)
+      if (button === 64) return { type: 'wheel', delta: -1 }
+      if (button === 65) return { type: 'wheel', delta: 1 }
+      if (button === 0 && !release) return { type: 'click', row, column }
+      return { type: 'text', text: '' }
     }
 
     if (this.buffer.startsWith('\u001b')) {
