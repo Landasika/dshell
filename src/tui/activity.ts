@@ -192,8 +192,6 @@ export interface UsageRailInput {
   cwd?: string
   git?: { branch: string; ahead: number; behind: number; dirty: boolean }
   agents?: { done: number; total: number; running: number; failed?: number }
-  contextPct?: number
-  tps?: number
   width: number
 }
 
@@ -219,7 +217,7 @@ export function shortCwd(cwd: string, width = 28): string {
   return truncateLeft(tildified, width)
 }
 
-function blockBar(theme: Theme, pct: number, cells: number, style: ThemeStyle): string {
+export function blockBar(theme: Theme, pct: number, cells: number, style: ThemeStyle): string {
   const bounded = Math.max(0, Math.min(100, pct))
   const filled = Math.min(cells, Math.max(0, Math.round((bounded / 100) * cells)))
   return `${paint(theme, style, '▰'.repeat(filled))}${paint(theme, 'muted', '▱'.repeat(cells - filled))}`
@@ -281,17 +279,6 @@ export function renderUsageRail(theme: Theme, input: UsageRailInput): string {
       ...(bar.length === 0 ? {} : { compact: label }),
     })
   }
-  if (input.contextPct !== undefined) {
-    const pct = Math.max(0, Math.min(100, input.contextPct))
-    const style = pressureStyle(pct) ?? 'muted'
-    const label = `${paint(theme, 'muted', 'ctx')} ${paint(theme, style, formatPercent(pct))}`
-    const bar = width >= 88 ? `${blockBar(theme, pct, 10, style)} ` : ''
-    segments.push({
-      text: `${paint(theme, 'muted', 'ctx')} ${bar}${paint(theme, style, formatPercent(pct))}`,
-      drop: 0,
-      ...(bar.length === 0 ? {} : { compact: label }),
-    })
-  }
   if (input.tokens.input > 0 || input.tokens.output > 0) {
     segments.push({
       text: `${paint(theme, 'muted', '↑')}${paint(theme, 'text', formatTokens(input.tokens.input))} ${paint(theme, 'muted', '↓')}${paint(theme, 'text', formatTokens(input.tokens.output))}`,
@@ -300,9 +287,6 @@ export function renderUsageRail(theme: Theme, input: UsageRailInput): string {
   }
   if (input.cost !== undefined && input.cost > 0) {
     segments.push({ text: paint(theme, 'warning', `~${formatCostCny(input.cost)}`), drop: 8 })
-  }
-  if (input.tps !== undefined && input.tps > 0) {
-    segments.push({ text: paint(theme, 'muted', `${input.tps.toFixed(0)} tps`), drop: 9 })
   }
 
   const join = (): string => segments.map((segment) => segment.text).join(paint(theme, 'muted', '  '))
@@ -315,9 +299,8 @@ export function renderUsageRail(theme: Theme, input: UsageRailInput): string {
         candidate = index
       }
     }
-    // Token totals / spend / TPS are the first things to go; decorative bars
-    // collapse to a percentage only after those, and the remaining segments
-    // (cwd, git, agents, cache) are dropped last.
+    // Token totals / spend go first; the cache bar collapses to a percentage
+    // only after those, and cwd, git, agents and cache are dropped last.
     if (candidate >= 0 && rank >= 7) {
       segments.splice(candidate, 1)
       if (segments.length === 0) break

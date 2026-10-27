@@ -1,6 +1,8 @@
 /** Shared terminal chrome: panels, header, composer frame and hint rows. */
+import { blockBar } from './activity.js'
 import type { EditorState } from './editor.js'
 import { composerLines } from './editor.js'
+import { formatPercent, pressureStyle } from './metrics.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
 import { displayWidth, pad, truncate } from './width.js'
 
@@ -63,12 +65,74 @@ export interface ComposerFrame {
   height: number
 }
 
+export interface ComposerStatus {
+  /** Measured context occupancy, 0-100. */
+  contextPct?: number
+  /** Live or last-turn token speed. */
+  tps?: number
+}
+
+/**
+ * Build the right side of the prompt frame's top border. Rich variants are
+ * tried first and fall back to a bare percentage, then to nothing, so the
+ * frame never wraps.
+ */
+function composerTop(
+  theme: Theme,
+  total: number,
+  status: ComposerStatus | undefined,
+  title: string,
+): string {
+  const ctxPct = status?.contextPct === undefined
+    ? undefined
+    : Math.max(0, Math.min(100, status.contextPct))
+  const style: ThemeStyle = ctxPct === undefined ? 'muted' : pressureStyle(ctxPct) ?? 'muted'
+  const tps = status?.tps !== undefined && status.tps > 0 ? status.tps : undefined
+  const tpsText = tps === undefined ? undefined : `${tps >= 10 ? tps.toFixed(0) : tps.toFixed(1)} tps`
+  const ctxLabel = paint(theme, 'muted', 'ctx')
+  const tpsLabel = tpsText === undefined ? undefined : paint(theme, 'muted', tpsText)
+  const variants: { plain: string; painted: string }[] = []
+  if (ctxPct !== undefined) {
+    const pct = paint(theme, style, formatPercent(ctxPct))
+    const bar = blockBar(theme, ctxPct, 10, style)
+    const plainPct = formatPercent(ctxPct)
+    if (tpsText !== undefined) {
+      variants.push({
+        plain: `ctx ${'▰'.repeat(10)} ${plainPct} · ${tpsText}`,
+        painted: `${ctxLabel} ${bar} ${pct} ${paint(theme, 'muted', '·')} ${tpsLabel}`,
+      })
+    }
+    variants.push({
+      plain: `ctx ${'▰'.repeat(10)} ${plainPct}`,
+      painted: `${ctxLabel} ${bar} ${pct}`,
+    })
+    if (tpsText !== undefined) {
+      variants.push({
+        plain: `ctx ${plainPct} · ${tpsText}`,
+        painted: `${ctxLabel} ${pct} ${paint(theme, 'muted', '·')} ${tpsLabel}`,
+      })
+    }
+    variants.push({ plain: `ctx ${plainPct}`, painted: `${ctxLabel} ${pct}` })
+  }
+  if (tpsText !== undefined && tpsLabel !== undefined) {
+    variants.push({ plain: tpsText, painted: tpsLabel })
+  }
+  const left = `${paint(theme, 'border', '╭─')} ${title} `
+  for (const variant of variants) {
+    const rightWidth = displayWidth(variant.plain)
+    if (rightWidth > total - 15) continue
+    const fill = Math.max(1, total - rightWidth - 14)
+    return `${left}${paint(theme, 'border', '─'.repeat(fill))} ${variant.painted} ${paint(theme, 'border', '─╮')}`
+  }
+  return `${left}${paint(theme, 'border', `${'─'.repeat(Math.max(0, total - 11))}╮`)}`
+}
+
 /**
  * Prompt composer inside a rounded frame:
  *
- *     ╭─ prompt ───────────────────────────╮
- *     │ ❯ write a message                  │
- *     ╰────────────────────────────────────╯
+ *     ╭─ prompt ────────────── ctx ▰▰▰▱▱▱ 46% · 42 tps ─╮
+ *     │ ❯ write a message                                 │
+ *     ╰───────────────────────────────────────────────────╯
  */
 export function renderComposer(
   theme: Theme,
@@ -76,6 +140,7 @@ export function renderComposer(
   columns: number,
   maxLines = 7,
   hint?: string,
+  status?: ComposerStatus,
 ): ComposerFrame {
   const total = Math.max(20, columns)
   const textWidth = Math.max(4, total - 6)
@@ -99,9 +164,8 @@ export function renderComposer(
     return '  '
   }
   const body = visible.map((line, index) => `${border} ${marker(index)}${pad(line, textWidth)} ${border}`)
-  const label = ' prompt '
-  const title = paint(theme, 'bold', paint(theme, 'accentSoft', label.trim()))
-  const top = `${paint(theme, 'border', '╭─')} ${title} ${paint(theme, 'border', '─'.repeat(Math.max(0, total - displayWidth(label) - 3)))}${paint(theme, 'border', '╮')}`
+  const title = paint(theme, 'bold', paint(theme, 'accentSoft', 'prompt'))
+  const top = composerTop(theme, total, status, title)
   const bottom = hint === undefined || hint.trim().length === 0
     ? paint(theme, 'border', `╰${'─'.repeat(total - 2)}╯`)
     : (() => {

@@ -157,10 +157,10 @@ Inside a session:
 ⇢ agent started  接入 OctoPrint harness · 18b9d1cc
 ⢿ Running command · rg reconnect src · 12s · ctx 84%
 ▸ 1/3 · Adding bounded backoff                                    ctrl+t hide
-╭─ prompt ─────────────────────────────────────────────────────────────╮
+╭─ prompt ──────────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps ───────────────╮
 │ ❯ ask anything                                                       │
 ╰─ enter send · / commands · @ files · ctrl+r history · ? help ────────╯
-deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cache ▰▰▰▰▰ 91%  ctx ▰▰▰▱▱▱▱▱▱▱ 25%
+deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cache ▰▰▰▰▰ 91%  ↑12.4k ↓840
 ```
 
 - startup picker: drawn before the first Host round-trip, so the chat shell
@@ -186,15 +186,18 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   above the composer; click it, press `End`/`Enter`, or `Esc` to return to the
   live tail. `DSHELL_NO_MOUSE=1` disables mouse capture so the terminal keeps
   its own scrollback and text selection.
+- prompt frame header (the composer's top border): the context gauge
+  (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and token speed (`42 tps`), right-aligned. Wide
+  terminals get the 10-cell bar with TPS; narrower ones drop TPS, then collapse
+  the bar to a plain percentage, then drop the gauge. The frame never wraps.
 - usage rail (bottom, under the composer): provider/model route (`provider/model`),
   the cwd (`~/…`), the Git branch with ahead/behind counts (`main [↑10]`, `*`
   when dirty), subagent progress (`✓ agents 1/1`, `✗` plus a failed count),
-  cache hit rate (`cache ▰▰▰▰▰ 91%`), context pressure
-  (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and, when space allows, session input/output totals,
-  estimated spend (`~¥`) and live TPS. On narrow terminals it drops
-  TPS → totals → spend → cwd → git → agents → cache, keeping the model route
-  and context readout. Model and provider details, the peak/idle split and
-  per-model rows live in `Ctrl-B`.
+  the cache hit rate (`cache ▰▰▰▰▰ 91%`) and, when space allows, session
+  input/output totals and estimated spend (`~¥`). On narrow terminals it drops
+  totals → spend → cwd → git → agents → cache, keeping the model route.
+  Model and provider details, the peak/idle split and per-model rows live in
+  `Ctrl-B`.
 - context bar: measured occupancy from the latest usage, split into
   system / prompt / assistant / thinking / tools; amber at 80%, red at 95%.
   The bar is the readout's boundary, local estimates only divide the used span.

@@ -7,6 +7,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Context and speed in the prompt frame**: the composer's top border now
+  carries the context gauge (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and token speed
+  (`42 tps`) right-aligned. It degrades with width (bar + TPS → bar → pct +
+  TPS → pct → TPS → nothing) instead of wrapping. The context gauge and TPS
+  moved out of the bottom rail to avoid showing them twice.
 - **Herdr integration**: when dshell runs inside a Herdr pane it reports its
   agent state (`working` / `blocked` on approvals / `idle`), the DSH session id
   and a resume command over Herdr's socket API, and releases the pane on quit.

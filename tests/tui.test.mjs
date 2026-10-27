@@ -587,12 +587,12 @@ test('session cost folds durable usage, peak/idle rates, and unpriced models', (
   assert.equal(replayed.pricedTokens, 3_000_000)
 })
 
-test('usage rail carries model route, cwd, git, agents, cache and ctx', () => {
+test('usage rail carries model route, cwd, git, agents and cache', () => {
   const tokens = { input: 12_400, cacheRead: 3_000, cacheWrite: 0, output: 840 }
   const git = { branch: 'main', ahead: 10, behind: 0, dirty: false }
   const wide = renderUsageRail(theme, {
     tokens, cost: 0.42, model: 'deepseek-v4.1-flash', provider: 'deepseek-relay',
-    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, contextPct: 25.4, tps: 42, width: 150,
+    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, width: 150,
   })
   assert.equal(displayWidth(wide), 150)
   const text = stripAnsi(wide)
@@ -601,19 +601,17 @@ test('usage rail carries model route, cwd, git, agents, cache and ctx', () => {
   assert.match(text, /main \[↑10\]/)
   assert.match(text, /✓ agents 1\/1/)
   assert.match(text, /cache ▰+▱* 19%/)
-  assert.match(text, /ctx ▰+▱* 25%/)
   assert.match(text, /↑12\.4k ↓840/)
   assert.match(text, /~¥0\.42/)
-  assert.match(text, /42 tps/)
+  assert.doesNotMatch(text, /ctx|tps/)
 
   const narrow = renderUsageRail(theme, {
     tokens, model: 'deepseek-v4.1-flash', provider: 'deepseek-relay',
-    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, contextPct: 25.4, width: 60,
+    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, width: 60,
   })
   assert.equal(displayWidth(narrow), 60)
   assert.match(stripAnsi(narrow), /deepseek-relay\/deepseek-v4\.1-flash/)
-  assert.match(stripAnsi(narrow), /ctx .*25%/)
-  assert.doesNotMatch(stripAnsi(narrow), /42 tps/)
+  assert.match(stripAnsi(narrow), /cache/)
 
   const bare = renderUsageRail(theme, { tokens, cost: 0.42, width: 70 })
   assert.equal(displayWidth(bare), 70)
@@ -679,6 +677,19 @@ test('composer frame grows with content and keeps the caret inside', () => {
   assert.equal(hinted.height, 3)
   assert.match(stripAnsi(hinted.lines[2]), /enter send · \? help/)
   assert.equal(displayWidth(hinted.lines[2]), 60)
+
+  const gauged = renderComposer(theme, createEditor(''), 100, 7, undefined, { contextPct: 46.2, tps: 42 })
+  assert.match(stripAnsi(gauged.lines[0]), /ctx ▰+▱* 46% · 42 tps/)
+  assert.equal(displayWidth(gauged.lines[0]), 100)
+  const compact = renderComposer(theme, createEditor(''), 30, 7, undefined, { contextPct: 46.2, tps: 42 })
+  assert.match(stripAnsi(compact.lines[0]), /ctx 46%/)
+  assert.doesNotMatch(stripAnsi(compact.lines[0]), /tps|▰/)
+  assert.equal(displayWidth(compact.lines[0]), 30)
+  const bareGauge = renderComposer(theme, createEditor(''), 20, 7, undefined, { contextPct: 46.2, tps: 42 })
+  assert.doesNotMatch(stripAnsi(bareGauge.lines[0]), /ctx|tps/)
+  for (const line of bareGauge.lines) assert.equal(displayWidth(line), 20)
+  const speedOnly = renderComposer(theme, createEditor(''), 40, 7, undefined, { tps: 42 })
+  assert.match(stripAnsi(speedOnly.lines[0]), /42 tps/)
 })
 
 test('TUI exposes history search, double-Esc rewind, and the session panel', async () => {

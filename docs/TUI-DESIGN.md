@@ -9,8 +9,9 @@ rules:
 2. **One truth.** The durable session log is the only source. Metrics are
    projections of `SessionView.events`; the TUI never keeps a second counter
    that can drift from the Host.
-3. **Responsive by dropping optional fields.** The usage rail keeps the model
-   route and context readout longest and drops TPS, totals, spend, cwd, git,
+3. **Responsive by dropping optional fields.** The prompt frame keeps `ctx`
+   longest but trades the bar for a percentage and then drops it; the usage
+   rail keeps the model route longest and drops totals, spend, cwd, git,
    agents and cache first. The launch picker and the composer are never
    clipped to make room for decoration.
 
@@ -34,14 +35,14 @@ rules:
 ├ status strip (only when agents/jobs/todos exist) ──────────────────────┤
 │ ✓ agents 1/1  ● jobs 1  ● todo 0/6                                     │
 ├ composer ──────────────────────────────────────────────────────────────┤
-│ ╭─ prompt ────────────────────────────────────────────────────────────╮ │
+│ ╭─ prompt ─────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps ───────────────────╮ │
 │ │ ❯ draft                                                            │ │
 │ ╰─ enter send · / commands · @ files · ctrl+r history · ? help ───────╯ │
 ├ jump pill (only while scrolled up) ────────────────────────────────────┤
 │                                        ↓ 12 new · End                 │
 ├ usage rail ────────────────────────────────────────────────────────────┤
 │ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1 │
-│ cache ▰▰▰▰▰ 91%  ctx ▰▰▰▱▱▱▱▱▱▱ 25%  ↑12.4k ↓840  ~¥0.42  42 tps         │
+│ cache ▰▰▰▰▰ 91%  ↑12.4k ↓840  ~¥0.42                                    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -225,10 +226,13 @@ turn.
 
 ## Responsiveness
 
-- Usage-rail segments drop in this order: TPS → input/output totals → spend →
-  cwd → git breadcrumb → agents → cache. The provider/model route and the
-  context percentage never drop. The context bar only appears from 88 columns
-  and the cache bar from 96; below that they collapse to a percentage.
+- The prompt frame's `ctx`/TPS variants degrade with width: bar + TPS, bar,
+  percentage + TPS, percentage, TPS only, then nothing. The frame is always
+  exactly `columns` wide.
+- Usage-rail segments drop in this order: input/output totals → spend → cwd →
+  git breadcrumb → agents → cache. The provider/model route never drops. The
+  cache bar only appears from 96 columns; below that it collapses to a
+  percentage.
 - The jump pill is one row; it shortens to `↓ N new · End` / `↓ Jump to
   bottom · End` rather than wrapping over the transcript.
 - The session panel clips its body to the viewport; the todo section is

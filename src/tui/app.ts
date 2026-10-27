@@ -1313,8 +1313,6 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
               failed: metrics.agents.filter((agent) => agent.status === 'failed').length,
             },
           }),
-      ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
-      tps: speedFor(metrics, now),
       width: screen.size.columns,
     })
   }
@@ -1662,7 +1660,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const menu = completionMenuLines()
     const footer = footerLines(metrics, now)
     const usage = usageRailLine(metrics, now)
-    const composer = renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns))
+    const speed = speedFor(metrics, now)
+    const showSpeed = metrics.turnStartedAt !== undefined || state.tpsSamples.length > 0
+    const composer = renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns), {
+      ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
+      ...(showSpeed ? { tps: speed } : {}),
+    })
     const noticeRows = notice === undefined ? 0 : 1
     const total = transcriptData.lines.length
     lastTranscriptTotal = total
