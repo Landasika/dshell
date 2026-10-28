@@ -178,6 +178,10 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   `~/.dsh` stays responsive.
 - header: brand, session title, status (idle / running / approval / error) and
   working directory.
+- user prompts: drawn on a grey band with white text and a `>` marker, so the
+  prompt that started a turn is easy to find when scrolling back. Assistant
+  text carries a single `dshell` header per turn — later steps after a tool
+  call are not labelled again.
 - tool calls: folded to one line, Claude-Code style — `✓ Bash(rg --files -g "*.ts")`,
   with the identifying argument only and a trailing `…` when it does not fit.
   `Ctrl-O` expands every call's argument summary and output inline; selecting
@@ -242,7 +246,7 @@ the official API.
 | --- | --- |
 | `Enter` | send / run command; while a turn runs it **steers** (joins that turn) |
 | `Alt+Q` | queue the prompt for the next turn instead of steering (`Alt+Enter` also works when the terminal forwards it) |
-| `Ctrl-J`, `Shift+Enter` | newline |
+| `Ctrl+Enter`, `Shift+Enter` | newline (`Ctrl-J` also works everywhere; dshell enables the kitty keyboard protocol so `Ctrl+Enter` is distinguishable) |
 | `Tab` | complete `/` command or `@` file |
 | `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history (seeded from the session's durable transcript) |
 | `Alt+↑`/`Alt+↓` | move a selection from block to block: messages, tool calls, subagent rows, then the queued prompts |

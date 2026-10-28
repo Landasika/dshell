@@ -45,7 +45,10 @@ export class TerminalScreen {
     // Focus reporting: the TUI refreshes the session list when the window
     // regains focus. It is also why a terminal that reports focus without being
     // asked no longer leaks "[I" into the composer (the parser maps it).
-    this.output.write('\u001b[?1004h')
+    // Ask for the kitty keyboard protocol (disambiguate): Shift/Ctrl+Enter and
+    // Ctrl+letter arrive as CSI u instead of being flattened into Enter. The
+    // matching pop is in stop(); terminals without support ignore the request.
+    this.output.write('\u001b[>1u\u001b[?1004h')
     this.mouseEnabled = process.env.DSHELL_NO_MOUSE !== '1'
     if (this.mouseEnabled) {
       // 1007 off: the terminal must not turn wheel ticks into arrow keys.
@@ -63,7 +66,7 @@ export class TerminalScreen {
     // Restore alternate-scroll so the user's shell wheel keeps working.
     const mouseReset = this.mouseEnabled ? '\u001b[?1000l\u001b[?1002l\u001b[?1006l\u001b[?1007h' : ''
     this.mouseEnabled = false
-    this.output.write(`${mouseReset}\u001b[?1004l\u001b[?2004l\u001b[?25h\u001b[?1049l`)
+    this.output.write(`${mouseReset}\u001b[<u\u001b[?1004l\u001b[?2004l\u001b[?25h\u001b[?1049l`)
     try {
       this.input.setRawMode(false)
     } catch {

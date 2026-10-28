@@ -18,6 +18,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- User prompts render on a light-grey band with white text, so what you sent
+  is easy to find when scrolling back.
+- Only the first assistant block of a turn carries the `dshell` header; later
+  steps after tools stay label-free.
+- Newline is `Ctrl+Enter` now. dshell enables the kitty keyboard protocol
+  (`CSI > 1 u`, popped on exit) so the terminal reports it distinctly; `Ctrl-J`
+  and `Shift+Enter` keep working everywhere.
+
 - Queueing a prompt for the next turn is `Alt+Q` now. Many terminals claim
   `Alt+Enter` for fullscreen (WezTerm and Windows Terminal do) and never pass
   it to the TUI, which made the key look broken; `Alt+Enter` still works where

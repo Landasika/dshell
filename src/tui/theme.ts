@@ -51,6 +51,10 @@ export interface Theme {
   contextTools: string
   /** Selected-row fill. */
   selection: string
+  /** Background of a user prompt bubble. */
+  bgUser: string
+  /** Text colour inside a user prompt bubble. */
+  userText: string
 }
 
 export type ThemeStyle = Exclude<keyof Theme, 'enabled' | 'truecolor'>
@@ -79,6 +83,8 @@ const PALETTE = {
   bgPanel: '#1b2230',
   bgFree: '#252e3f',
   selection: '#2c3a58',
+  bgUser: '#5f6975',
+  userText: '#ffffff',
 } as const
 
 function parseHex(value: string): Rgb {
@@ -173,12 +179,25 @@ export function createTheme(explicit?: boolean): Theme {
     contextThinking: fg(PALETTE.contextThinking),
     contextTools: fg(PALETTE.contextTools),
     selection: bg(PALETTE.selection),
+    bgUser: bg(PALETTE.bgUser),
+    userText: fg(PALETTE.userText),
   }
 }
 
 export function paint(theme: Theme, style: ThemeStyle, text: string): string {
   if (!theme.enabled || text.length === 0) return text
   return `${theme[style]}${text}${theme.reset}`
+}
+
+/**
+ * Paint `text` on a background band, re-applying the surface after every
+ * nested reset so inline markdown colours never punch a hole in the band.
+ */
+export function paintBand(theme: Theme, background: string, foreground: string, text: string): string {
+  if (!theme.enabled || text.length === 0) return text
+  const surface = `${background}${foreground}`
+  const inner = text.split(theme.reset).join(`${theme.reset}${surface}`)
+  return `${surface}${inner}${theme.reset}`
 }
 
 /** Raw foreground SGR for per-cell sprite rendering (no text, no reset). */

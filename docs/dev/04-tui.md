@@ -97,11 +97,14 @@ dshell --no-color              # 禁用颜色
 - CJK/emoji 按 2 cell 计算，组合字符按 0 cell；窄屏每行强制 wrap/truncate；
 - `NO_COLOR` 或 `DSHELL_NO_COLOR` 关闭颜色；
 - 终端 resize 重新计算 composer/transcript 高度；
+- 启动时请求 kitty keyboard protocol（`\x1b[>1u`，escape 去歧义），
+  `Ctrl+Enter`/`Shift+Enter`/`Ctrl+字母` 才不会被压成 Enter；退出时
+  `\x1b[<u` 弹出该协议；
 - 退出时恢复 cursor、关闭 bracketed paste、离开 alternate screen、关闭 raw mode。
 
 ## 4. Composer 与命令
 
-- Enter 发送；`Ctrl-J` 插入换行；`Alt+Q` 排队（部分终端把 `Alt+Enter`
+- Enter 发送；`Ctrl+Enter`（或 `Ctrl-J`）插入换行；`Alt+Q` 排队（部分终端把 `Alt+Enter`
   抢去切全屏，所以排队用 `Alt`+字母，`Alt+Enter` 能收到时也照常生效）；
 - 左右/Home/End/Delete/Backspace；`Ctrl-A/E/K/U/W` 行编辑；
 - Up/Down 历史输入，保留 100 条内存历史；

@@ -2115,7 +2115,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     // historical snapshots inline would repeat the same list after every
     // update.
     const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
-    const rendered = renderBlocksWithRanges(blocks, width, theme, { expandTools: state.verbose })
+    const rendered = renderBlocksWithRanges(blocks, width, theme, {
+      expandTools: state.verbose,
+      surfaceWidth: screen.size.columns,
+    })
     const lines = rendered.lines
     const ranges = rendered.ranges
     if (view.streamReasoning.length > 0 && view.status === 'running') {
@@ -2384,7 +2387,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         body.push(`${paint(theme, 'accent', pad(name, 15))} ${paint(theme, 'text', description)}`)
       }
       body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'keys')), '')
-      body.push(`${paint(theme, 'text', pad('enter', 15))} send/steer · ${paint(theme, 'text', 'alt+q')} queue · ${paint(theme, 'text', 'ctrl+j')} newline`)
+      body.push(`${paint(theme, 'text', pad('enter', 15))} send/steer · ${paint(theme, 'text', 'alt+q')} queue · ${paint(theme, 'text', 'ctrl+enter')} newline`)
       body.push(`${paint(theme, 'text', pad('tab', 15))} complete · ${paint(theme, 'text', 'shift+enter')} newline (kitty-style terminals)`)
       body.push(`${paint(theme, 'text', pad('up / down', 15))} prompt history · ${paint(theme, 'text', 'pgup/pgdn')} scroll`)
       body.push(`${paint(theme, 'text', pad('alt+up/down', 15))} select blocks · ${paint(theme, 'text', 'enter')} open · ${paint(theme, 'text', 'esc')} clear`)

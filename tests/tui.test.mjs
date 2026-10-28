@@ -872,8 +872,45 @@ test('user prompts render as quoted > lines, not a you label', () => {
     { type: 'assistant/message', seq: 2, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } } },
   ]
   const lines = renderBlocks(buildBlocks(events), 60, theme).map(stripAnsi)
-  assert.ok(lines.includes('> hello there'))
+  assert.ok(lines.some((line) => line.trimEnd() === '> hello there'))
+  // The prompt sits on a full-width band, so every row is padded to the width.
+  assert.equal(lines.some((line) => line === '> hello there'), false, 'the band spans the transcript width')
+  assert.equal(lines.some((line) => line.trimEnd() === '> hello there' && line.length === 60), true)
   assert.equal(lines.some((line) => line === 'you'), false)
+})
+
+test('the dshell header appears once per turn, not before every assistant block', () => {
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'first' }] } } },
+    { type: 'assistant/message', seq: 2, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'one' }] } } },
+    { type: 'tool/call', seq: 3, data: { name: 'bash', callId: 'c1', arguments: '{"command":"ls"}' } },
+    { type: 'tool/result', seq: 4, data: { message: { toolCallId: 'c1', content: [{ type: 'text', text: 'a.txt' }] } } },
+    { type: 'assistant/message', seq: 5, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'two' }] } } },
+    { type: 'user/message', seq: 6, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'second' }] } } },
+    { type: 'assistant/message', seq: 7, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'three' }] } } },
+  ]
+  const lines = renderBlocks(buildBlocks(events), 80, theme).map(stripAnsi).map((line) => line.trimEnd())
+  assert.equal(lines.filter((line) => line === 'dshell').length, 2, 'one header per turn')
+  // The second turn's header sits right before its first answer, not the tools.
+  const headerIndex = lines.lastIndexOf('dshell')
+  assert.equal(lines[headerIndex + 1], 'three')
+})
+
+test('Ctrl+Enter is newline under the kitty keyboard protocol', async () => {
+  const { KeyParser } = await import('../dist/tui/keys.js')
+  const parser = new KeyParser()
+  const parse = (chunk) => parser.feed(chunk)
+  assert.deepEqual(parse('\u001b[13;5u'), [{ type: 'newline' }])
+  assert.deepEqual(parse('\u001b[13;2u'), [{ type: 'newline' }])
+  assert.deepEqual(parse('\u001b[13u'), [{ type: 'enter' }])
+  assert.deepEqual(parse('\u001b[27u'), [{ type: 'escape' }])
+  assert.deepEqual(parse('\u001b[99;5u'), [{ type: 'ctrl-c' }])
+  assert.deepEqual(parse('\u001b[9;2u'), [{ type: 'shift-tab' }])
+  assert.deepEqual(parse('\u001b[113;3u'), [{ type: 'alt-q' }])
+  assert.deepEqual(parse('\u001b[127;5u'), [{ type: 'ctrl-w' }])
+  assert.deepEqual(parse('\u001b[27;5;13~'), [{ type: 'newline' }])
+  // Unmodified text still arrives as text.
+  assert.deepEqual(parse('ok'), [{ type: 'text', text: 'o' }, { type: 'text', text: 'k' }])
 })
 
 test('a failed turn is always visible in the transcript', () => {

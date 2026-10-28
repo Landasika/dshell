@@ -1,7 +1,7 @@
 import type { SessionEvent } from '../protocol/index.js'
 import { renderDiff, renderMarkdown } from './markdown.js'
-import { paint, type Theme } from './theme.js'
-import { displayWidth, sanitizeText, truncate, wrapText } from './width.js'
+import { paint, paintBand, type Theme } from './theme.js'
+import { displayWidth, pad, sanitizeText, truncate, wrapText } from './width.js'
 
 type Json = Record<string, any>
 
@@ -426,6 +426,8 @@ export interface RenderOptions {
   maxToolChars?: number
   /** Show each tool call's argument summary and output inline (Ctrl-O). */
   expandTools?: boolean
+  /** Width a user-message band should span (defaults to the wrap width). */
+  surfaceWidth?: number
 }
 
 function renderBody(
@@ -487,21 +489,30 @@ export function renderBlocksWithRanges(
   const out: string[] = []
   const ranges: BlockRange[] = []
   const separatorWidth = Math.max(4, Math.min(width, 24))
+  let assistantLabelShown = false
   for (const block of blocks) {
+    if (block.kind === 'user') assistantLabelShown = false
     if (out.length > 0) out.push('')
     const start = out.length
     switch (block.kind) {
       case 'user': {
-        // Quote-style prompt: `> hello`, continuation lines aligned under it.
-        const body = renderBody(block, Math.max(8, width - 2), theme, options)
-        const marker = paint(theme, 'cyan', '>')
+        // Quote-style prompt on a light-grey bubble: `> hello`, continuation
+        // lines aligned under the marker and the band spanning the transcript.
+        const bandWidth = Math.max(width, options.surfaceWidth ?? width)
+        const body = renderBody(block, Math.max(8, width - 4), theme, options)
         body.forEach((line, index) => {
-          out.push(`${index === 0 ? marker : '  '} ${line}`)
+          const row = pad(`${index === 0 ? '> ' : '  '}${line}`, bandWidth)
+          out.push(paintBand(theme, theme.bgUser, theme.userText, row))
         })
         break
       }
       case 'assistant': {
-        out.push(paint(theme, 'bold', paint(theme, 'green', 'dshell')))
+        // One attribution per turn: only the first assistant block after a user
+        // prompt carries the `dshell` header, later steps stay label-free.
+        if (!assistantLabelShown) {
+          out.push(paint(theme, 'bold', paint(theme, 'green', 'dshell')))
+          assistantLabelShown = true
+        }
         out.push(...renderBody(block, width, theme, options))
         break
       }

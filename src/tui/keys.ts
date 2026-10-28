@@ -77,9 +77,6 @@ const SEQUENCES: Record<string, Key> = {
   '\u001bq': { type: 'alt-q' },
   '\u001bQ': { type: 'alt-q' },
   '\u001b\u007f': { type: 'alt-backspace' },
-  // Shift+Enter as reported by terminals with the kitty/modifyOtherKeys
-  // extensions; plain terminals send the same bytes as Enter.
-  '\u001b[13;2u': { type: 'newline' },
   // Focus reporting (xterm 1004). Terminals send these whenever the window
   // gains or loses focus; without a mapping they leaked into the composer as a
   // literal "[I".
@@ -108,6 +105,58 @@ const CONTROL: Record<string, Key> = {
   '\u0014': { type: 'ctrl-t' },
   '\u000f': { type: 'ctrl-o' },
   '\u0007': { type: 'ctrl-g' },
+}
+
+/** Ctrl+letter as reported by the kitty keyboard protocol. */
+const CTRL_LETTERS: Record<string, Key> = {
+  a: { type: 'ctrl-a' },
+  b: { type: 'ctrl-b' },
+  c: { type: 'ctrl-c' },
+  d: { type: 'ctrl-d' },
+  e: { type: 'ctrl-e' },
+  g: { type: 'ctrl-g' },
+  k: { type: 'ctrl-k' },
+  l: { type: 'ctrl-l' },
+  n: { type: 'ctrl-n' },
+  o: { type: 'ctrl-o' },
+  p: { type: 'ctrl-p' },
+  r: { type: 'ctrl-r' },
+  t: { type: 'ctrl-t' },
+  u: { type: 'ctrl-u' },
+  w: { type: 'ctrl-w' },
+}
+
+/**
+ * Decode a kitty-protocol `CSI code ; mods u` key. Only the codes dshell binds
+ * appear here: Escape, Enter/Tab/Backspace with modifiers, Ctrl+letter and
+ * plain text. Modifier bits are 1 = shift, 2 = alt, 4 = ctrl.
+ */
+function decodeCsiU(code: number, mods: number): Key {
+  // kitty encodes mods as 1 + (shift 1 | alt 2 | ctrl 4 | …).
+  const flags = Math.max(0, mods - 1)
+  const shift = (flags & 1) !== 0
+  const alt = (flags & 2) !== 0
+  const ctrl = (flags & 4) !== 0
+  if (code === 27) return { type: 'escape' }
+  if (code === 13) {
+    // Ctrl+Enter is the newline chord; Alt+Enter still queues where the
+    // terminal forwards it at all.
+    if (ctrl || shift) return { type: 'newline' }
+    if (alt) return { type: 'alt-enter' }
+    return { type: 'enter' }
+  }
+  if (code === 9) return shift ? { type: 'shift-tab' } : { type: 'tab' }
+  if (code === 127 || code === 8) return ctrl ? { type: 'ctrl-w' } : { type: 'backspace' }
+  const char = String.fromCodePoint(code)
+  if (ctrl) {
+    const mapped = CTRL_LETTERS[char.toLowerCase()]
+    return mapped ?? { type: 'text', text: '' }
+  }
+  if (alt) {
+    if (char.toLowerCase() === 'q') return { type: 'alt-q' }
+    return { type: 'text', text: '' }
+  }
+  return { type: 'text', text: shift ? char.toUpperCase() : char }
 }
 
 const PASTE_START = '\u001b[200~'
@@ -180,6 +229,18 @@ export class KeyParser {
     }
 
     if (this.buffer.startsWith('\u001b')) {
+      // Kitty keyboard protocol: dshell requests the "disambiguate" level, so
+      // Escape, Ctrl+letter and modified Enter/Tab/Backspace arrive here.
+      const kitty = /^\u001b\[(\d+)(?:;(\d+))?u/.exec(this.buffer)
+      if (kitty !== null) {
+        this.buffer = this.buffer.slice(kitty[0].length)
+        return decodeCsiU(Number(kitty[1] ?? 0), Number(kitty[2] ?? 1))
+      }
+      // xterm modifyOtherKeys level 2 reports Ctrl+Enter like this.
+      if (this.buffer.startsWith('\u001b[27;5;13~')) {
+        this.buffer = this.buffer.slice('\u001b[27;5;13~'.length)
+        return { type: 'newline' }
+      }
       for (const [sequence, key] of Object.entries(SEQUENCES)) {
         if (this.buffer.startsWith(sequence)) {
           this.buffer = this.buffer.slice(sequence.length)
