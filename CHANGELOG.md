@@ -15,6 +15,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Fixed
 
+- Focus reports no longer leak into the composer: terminals that report window
+  focus send `ESC [ I` / `ESC [ O`, which the parser treated as an unknown
+  escape and then typed the leftovers, so switching back to the terminal left a
+  literal `[I` in the prompt. They now map to a `focus` key (the TUI refreshes
+  the session list when the window regains focus), and any other unrecognised
+  CSI/SS3 report is swallowed whole instead of falling through as text. The app
+  also asks for focus reporting (`1004h`) and turns it off on exit.
+
 - **No more full-screen flicker**: `TerminalScreen.draw` now rewrites only the
   rows whose text changed instead of clearing and repainting every row on
   every tick; a stable screen costs a handful of cursor bytes per frame, so the

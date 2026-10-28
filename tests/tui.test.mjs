@@ -121,6 +121,23 @@ test('key parser handles arrows, control keys, and bracketed paste across chunks
   assert.deepEqual(split.feed('B'), [{ type: 'down' }])
 })
 
+test('focus reports and unknown CSI never leak into the composer as text', () => {
+  const parser = new KeyParser()
+  assert.deepEqual(parser.feed('\u001b[I'), [{ type: 'focus', focused: true }])
+  assert.deepEqual(parser.feed('\u001b[O'), [{ type: 'focus', focused: false }])
+  const split = new KeyParser()
+  assert.deepEqual(split.feed('\u001b['), [])
+  assert.deepEqual(split.feed('I'), [{ type: 'focus', focused: true }])
+  // Anything else the terminal reports is swallowed whole, never typed.
+  for (const report of ['\u001b[99X', '\u001b[?1;2c', '\u001bOq', '\u001b[>0;1;0M', '\u001b[2J']) {
+    const keys = new KeyParser().feed(report)
+    assert.equal(keys.every((key) => key.type !== 'text' || key.text === ''), true, report)
+  }
+  // A lone Escape still arrives as Escape.
+  parser.feed('\u001b')
+  assert.deepEqual(parser.flushEscape(), { type: 'escape' })
+})
+
 test('completion finds slash commands and @ files', () => {
   assert.equal(completionContext('/')?.kind, 'command')
   assert.equal(completionContext('/se')?.query, 'se')

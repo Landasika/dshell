@@ -35,6 +35,7 @@ export type Key =
   | { type: 'ctrl-g' }
   | { type: 'alt-up' }
   | { type: 'alt-down' }
+  | { type: 'focus'; focused: boolean }
   | { type: 'wheel'; delta: number }
   | { type: 'click'; row: number; column: number }
   | { type: 'drag'; row: number; column: number }
@@ -68,6 +69,11 @@ const SEQUENCES: Record<string, Key> = {
   '\u001b[1;5A': { type: 'up' },
   '\u001b[1;5B': { type: 'down' },
   '\u001b\r': { type: 'newline' },
+  // Focus reporting (xterm 1004). Terminals send these whenever the window
+  // gains or loses focus; without a mapping they leaked into the composer as a
+  // literal "[I".
+  '\u001b[I': { type: 'focus', focused: true },
+  '\u001b[O': { type: 'focus', focused: false },
 }
 
 const CONTROL: Record<string, Key> = {
@@ -170,7 +176,20 @@ export class KeyParser {
         }
       }
       // A partial CSI/SS3 sequence: wait for the rest.
-      if (/^\u001b(\[[0-9;?]*|[O])?$/.test(this.buffer)) return null
+      if (/^\u001b(\[[0-9;?<>]*|[O])?$/.test(this.buffer)) return null
+      // Any other complete CSI/SS3 report (focus, terminal queries, keys this
+      // parser does not know) is swallowed whole; only ESC alone is the Escape
+      // key, so the rest must never fall through as typed text.
+      const csi = /^\u001b\[[0-9;?<>]*[\u0040-\u007e]/.exec(this.buffer)
+      if (csi !== null) {
+        this.buffer = this.buffer.slice(csi[0].length)
+        return { type: 'text', text: '' }
+      }
+      const ss3 = /^\u001bO[\u0020-\u007e]/.exec(this.buffer)
+      if (ss3 !== null) {
+        this.buffer = this.buffer.slice(ss3[0].length)
+        return { type: 'text', text: '' }
+      }
       // Unknown escape: consume ESC and let the next char be text.
       this.buffer = this.buffer.slice(1)
       return { type: 'escape' }

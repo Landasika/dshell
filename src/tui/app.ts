@@ -1737,6 +1737,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const handleKey = (key: Key): void => {
     if (state.quitting) return
+    if (key.type === 'focus') {
+      // Coming back to the terminal: catch up on sessions and git state.
+      if (key.focused) {
+        void refreshSessions()
+        refreshGit()
+      }
+      return
+    }
     if (state.startup !== undefined) {
       handleStartupKey(key)
       return
