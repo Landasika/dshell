@@ -211,6 +211,20 @@ export interface ProviderUpdatedMessage {
   providers: ProviderEntry[]
 }
 
+export interface ProviderCreatedMessage {
+  type: 'provider-created'
+  file: string
+  providerId: string
+  providers: ProviderEntry[]
+}
+
+export interface ProviderDeletedMessage {
+  type: 'provider-deleted'
+  file: string
+  providerId: string
+  providers: ProviderEntry[]
+}
+
 export interface HostRestartingMessage {
   type: 'host-restarting'
   pid: number
@@ -301,6 +315,15 @@ export type ClientMessage =
   | { type: 'model/catalog' }
   | { type: 'provider/list' }
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
+  | {
+      type: 'provider/create'
+      providerId: string
+      baseURL: string
+      models: string[]
+      apiKeyEnv?: string
+      displayName?: string
+    }
+  | { type: 'provider/delete'; providerId: string }
   | { type: 'host/restart' }
   | { type: 'model/select'; sessionId: string; provider: string; model: string; reasoningEffort?: string }
   | { type: 'model/default'; provider: string; model: string; reasoningEffort?: string }
@@ -325,5 +348,7 @@ export type ServerMessage =
   | ModelSelectedMessage
   | ProviderListMessage
   | ProviderUpdatedMessage
+  | ProviderCreatedMessage
+  | ProviderDeletedMessage
   | HostRestartingMessage
   | ErrorMessage

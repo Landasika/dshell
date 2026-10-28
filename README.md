@@ -291,10 +291,17 @@ remembered per `provider/model` and shown in the bottom rail
 - `s` writes the changed fields back and raises a confirmation:
   `Restart the Host now?` — `y` re-execs the Host and reattaches the session,
   `n` keeps the file change for the next manual start
+- `a` adds a provider: `id`, optional `displayName` / `apiKeyEnv`, `baseURL`
+  and a comma- or space-separated model list; the block is appended to the
+  `providers` map and the same restart confirmation follows
+- `x` deletes the selected provider (after a `y` confirmation, then the same
+  restart prompt). The last remaining provider cannot be deleted
 - `r` restarts the Host without editing
 
-The editor rewrites only the targeted scalar lines, so comments, model lists
-and `!!js` expressions in the patch file survive. API keys themselves are
+The editor only touches the lines it needs — a field edit rewrites that
+scalar, `a` inserts one block, `x` splices one block out — so comments, model
+lists and `!!js` expressions elsewhere in the patch file survive, and an
+add/delete round trip leaves the file byte-identical. API keys themselves are
 never stored there: the file carries the environment-variable name
 (`apiKeyEnv`) and the secret stays in the environment or DSH's credential
 store. Providers are read at Host boot, so an edit needs the restart the

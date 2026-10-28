@@ -1331,3 +1331,97 @@ test('TUI provider screen edits a field and asks before restarting the Host', as
   assert.equal(await app, 0)
   await backend.disconnect()
 })
+
+test('TUI adds and removes providers like the Web UI models page', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 34
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 200; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+  const pause = (ms = 25) => new Promise((resolve) => setTimeout(resolve, ms))
+  await waitFor(() => output.text.includes('idle'))
+  // Let the first attach settle before typing, otherwise startup keys swallow
+  // the command (the same reason a real user sees the composer first).
+  await pause(80)
+  input.push('/provider')
+  input.push('\r')
+  await waitFor(() => output.text.includes('/fake/cordis.patch.yml'))
+
+  // Add: id, then baseURL, then the model list.
+  input.push('a')
+  await waitFor(() => output.text.includes('add provider'))
+  input.push('\r')
+  input.push('test-relay')
+  input.push('\r')
+  await pause()
+  input.push('\u001b[B')
+  input.push('\u001b[B')
+  await pause()
+  input.push('\r')
+  input.push('\u0015')
+  input.push('https://t.example/v1')
+  input.push('\r')
+  await pause()
+  input.push('\u001b[B')
+  input.push('\u001b[B')
+  await pause()
+  input.push('\r')
+  input.push('\u0015')
+  input.push('m1, m2')
+  input.push('\r')
+  await pause()
+  input.push('s')
+  await waitFor(() => output.text.includes('Restart it now to load this provider?'))
+  input.push('n')
+  await pause()
+  const added = (await backend.providerList()).providers.find((row) => row.id === 'test-relay')
+  assert.deepEqual(added, { id: 'test-relay', baseURL: 'https://t.example/v1', models: 2 })
+
+  // Remove: last row, confirm, then decline the restart.
+  input.push('/provider')
+  input.push('\r')
+  await waitFor(() => output.text.includes('test-relay'))
+  input.push('\u001b[B')
+  input.push('\u001b[B')
+  await pause()
+  input.push('x')
+  await waitFor(() => output.text.includes('Remove it?'))
+  input.push('y')
+  await waitFor(() => output.text.includes('Restart it now to drop it?'))
+  input.push('n')
+  await pause()
+  assert.equal((await backend.providerList()).providers.some((row) => row.id === 'test-relay'), false)
+
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})

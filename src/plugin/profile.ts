@@ -66,9 +66,19 @@ export function encodeScalar(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-/** Split the file into lines without normalising the trailing newline. */
+/** Split the file into lines, remembering whether it ended with a newline. */
 function splitLines(text: string): string[] {
   return text.split('\n')
+}
+
+function splitDocument(text: string): { lines: string[]; trailingNewline: boolean } {
+  const trailingNewline = text.endsWith('\n')
+  const body = trailingNewline ? text.slice(0, -1) : text
+  return { lines: body.split('\n'), trailingNewline }
+}
+
+function joinDocument(lines: string[], trailingNewline: boolean): string {
+  return `${lines.join('\n')}${trailingNewline ? '\n' : ''}`
 }
 
 /** Locate the `providers:` map and the byte-free line ranges of each entry. */
@@ -134,9 +144,16 @@ function providerRanges(
   return ranges
 }
 
+export type ProviderEditCode =
+  | 'PROVIDERS_NOT_FOUND'
+  | 'PROVIDER_NOT_FOUND'
+  | 'PROVIDER_EXISTS'
+  | 'EMPTY_PROVIDERS'
+  | 'BAD_FIELD'
+
 export class ProviderEditError extends Error {
-  readonly code: 'PROVIDERS_NOT_FOUND' | 'PROVIDER_NOT_FOUND' | 'BAD_FIELD'
-  constructor(code: 'PROVIDERS_NOT_FOUND' | 'PROVIDER_NOT_FOUND' | 'BAD_FIELD', message: string) {
+  readonly code: ProviderEditCode
+  constructor(code: ProviderEditCode, message: string) {
     super(message)
     this.name = 'ProviderEditError'
     this.code = code
@@ -156,7 +173,7 @@ export function setProviderField(text: string, providerId: string, field: Provid
     throw new ProviderEditError('BAD_FIELD', `field ${String(field)} cannot be edited from the TUI`)
   }
   const value = rawValue.trim()
-  const lines = splitLines(text)
+  const { lines, trailingNewline } = splitDocument(text)
   const block = findProviderBlock(lines)
   if (block === undefined) {
     throw new ProviderEditError('PROVIDERS_NOT_FOUND', 'no llm-pi-ai providers block in this patch file')
@@ -170,17 +187,17 @@ export function setProviderField(text: string, providerId: string, field: Provid
     const line = lines[index] ?? ''
     if (new RegExp(`^ {8}${field}:[ \\t]`).test(line) || line === `        ${field}:`) {
       lines[index] = replacement
-      return lines.join('\n')
+      return joinDocument(lines, trailingNewline)
     }
   }
   // Insert directly under the provider key so the insert sits above its models.
   lines.splice(range.start + 1, 0, replacement)
-  return lines.join('\n')
+  return joinDocument(lines, trailingNewline)
 }
 
 /** Remove one provider field; a missing key is not an error. */
 export function clearProviderField(text: string, providerId: string, field: ProviderField): string {
-  const lines = splitLines(text)
+  const { lines, trailingNewline } = splitDocument(text)
   const block = findProviderBlock(lines)
   if (block === undefined) {
     throw new ProviderEditError('PROVIDERS_NOT_FOUND', 'no llm-pi-ai providers block in this patch file')
@@ -193,8 +210,78 @@ export function clearProviderField(text: string, providerId: string, field: Prov
     const line = lines[index] ?? ''
     if (new RegExp(`^ {8}${field}:[ \\t]`).test(line) || line === `        ${field}:`) {
       lines.splice(index, 1)
-      return lines.join('\n')
+      return joinDocument(lines, trailingNewline)
     }
   }
   return text
+}
+
+/** A provider row the TUI asks the Host to create. */
+export interface NewProviderSpec {
+  id: string
+  baseURL: string
+  apiKeyEnv?: string
+  displayName?: string
+  models: string[]
+}
+
+const PROVIDER_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.:-]*$/
+
+/** Append a complete provider block, keeping the file's indentation style. */
+export function addProvider(text: string, spec: NewProviderSpec): string {
+  const id = spec.id.trim()
+  if (!PROVIDER_ID_PATTERN.test(id)) {
+    throw new ProviderEditError('BAD_FIELD', `provider id "${id}" is not a safe YAML key`)
+  }
+  const models = spec.models.map((model) => model.trim()).filter((model) => model.length > 0)
+  if (models.length === 0) {
+    throw new ProviderEditError('BAD_FIELD', 'a provider needs at least one model id')
+  }
+  const { lines, trailingNewline } = splitDocument(text)
+  const block = findProviderBlock(lines)
+  if (block === undefined) {
+    throw new ProviderEditError('PROVIDERS_NOT_FOUND', 'no llm-pi-ai providers block in this patch file')
+  }
+  if (providerRanges(lines, block).has(id)) {
+    throw new ProviderEditError('PROVIDER_EXISTS', `provider ${id} already exists`)
+  }
+  if (block.end === block.start + 1) {
+    throw new ProviderEditError('EMPTY_PROVIDERS', 'the providers block is empty; add the first provider by hand')
+  }
+  const row: string[] = [`      ${id}:`]
+  if (spec.apiKeyEnv !== undefined && spec.apiKeyEnv.trim().length > 0) {
+    row.push(`        apiKeyEnv: ${encodeScalar(spec.apiKeyEnv.trim())}`)
+  }
+  if (spec.displayName !== undefined && spec.displayName.trim().length > 0) {
+    row.push(`        displayName: ${encodeScalar(spec.displayName.trim())}`)
+  }
+  row.push(`        baseURL: ${encodeScalar(spec.baseURL.trim())}`)
+  row.push('        models:')
+  for (const model of models) row.push(`          - id: ${encodeScalar(model)}`)
+
+  // Insert after the last provider line, above the blank line that separates
+  // this entry from the next top-level one.
+  let insertAt = block.end
+  while (insertAt > block.start + 1 && (lines[insertAt - 1] ?? '').trim().length === 0) insertAt -= 1
+  lines.splice(insertAt, 0, ...row)
+  return joinDocument(lines, trailingNewline)
+}
+
+/** Remove a whole provider block; other providers stay byte-identical. */
+export function removeProvider(text: string, providerId: string): string {
+  const { lines, trailingNewline } = splitDocument(text)
+  const block = findProviderBlock(lines)
+  if (block === undefined) {
+    throw new ProviderEditError('PROVIDERS_NOT_FOUND', 'no llm-pi-ai providers block in this patch file')
+  }
+  const ranges = providerRanges(lines, block)
+  const range = ranges.get(providerId)
+  if (range === undefined) {
+    throw new ProviderEditError('PROVIDER_NOT_FOUND', `provider ${providerId} is not declared in this patch file`)
+  }
+  if (ranges.size <= 1) {
+    throw new ProviderEditError('EMPTY_PROVIDERS', 'refusing to remove the last provider')
+  }
+  lines.splice(range.start, range.end - range.start)
+  return joinDocument(lines, trailingNewline)
 }

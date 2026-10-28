@@ -9,6 +9,8 @@ import type {
   ModelCatalogMessage,
   ModelSelectedMessage,
   ModelSelection,
+  ProviderCreatedMessage,
+  ProviderDeletedMessage,
   ProviderField,
   ProviderListMessage,
   ProviderUpdatedMessage,
@@ -24,6 +26,7 @@ import {
   type CreateSessionOptions,
   type DshellBackend,
   type DshellCapabilities,
+  type NewProviderSpec,
   type ProviderList,
   type SendOptions,
   type SendReceipt,
@@ -147,6 +150,41 @@ export class SocketBackend implements DshellBackend {
     try {
       const message = await connection.waitFor<ProviderUpdatedMessage>(
         (candidate) => candidate.type === 'provider-updated',
+        15_000,
+      )
+      return { file: message.file, writable: true, providers: message.providers }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async createProvider(spec: NewProviderSpec): Promise<ProviderList> {
+    const connection = this.requireControl()
+    connection.send({
+      type: 'provider/create',
+      providerId: spec.id,
+      baseURL: spec.baseURL,
+      models: spec.models,
+      ...(spec.apiKeyEnv === undefined ? {} : { apiKeyEnv: spec.apiKeyEnv }),
+      ...(spec.displayName === undefined ? {} : { displayName: spec.displayName }),
+    })
+    try {
+      const message = await connection.waitFor<ProviderCreatedMessage>(
+        (candidate) => candidate.type === 'provider-created',
+        15_000,
+      )
+      return { file: message.file, writable: true, providers: message.providers }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async deleteProvider(providerId: string): Promise<ProviderList> {
+    const connection = this.requireControl()
+    connection.send({ type: 'provider/delete', providerId })
+    try {
+      const message = await connection.waitFor<ProviderDeletedMessage>(
+        (candidate) => candidate.type === 'provider-deleted',
         15_000,
       )
       return { file: message.file, writable: true, providers: message.providers }

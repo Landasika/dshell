@@ -13,6 +13,7 @@ import {
   type CreateSessionOptions,
   type DshellBackend,
   type DshellCapabilities,
+  type NewProviderSpec,
   type ProviderList,
   type SendOptions,
   type SendReceipt,
@@ -158,6 +159,29 @@ export class FakeBackend implements DshellBackend {
     const row = this.providerRows.find((candidate) => candidate.id === providerId)
     if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
     row[field] = value
+    return this.providerList()
+  }
+
+  async createProvider(spec: NewProviderSpec): Promise<ProviderList> {
+    this.assertConnected()
+    if (this.providerRows.some((row) => row.id === spec.id)) {
+      throw new BackendError('BAD_REQUEST', `provider ${spec.id} already exists`)
+    }
+    this.providerRows.push({
+      id: spec.id,
+      ...(spec.displayName === undefined ? {} : { displayName: spec.displayName }),
+      ...(spec.apiKeyEnv === undefined ? {} : { apiKeyEnv: spec.apiKeyEnv }),
+      baseURL: spec.baseURL,
+      models: spec.models.length,
+    })
+    return this.providerList()
+  }
+
+  async deleteProvider(providerId: string): Promise<ProviderList> {
+    this.assertConnected()
+    const index = this.providerRows.findIndex((row) => row.id === providerId)
+    if (index < 0) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
+    this.providerRows.splice(index, 1)
     return this.providerList()
   }
 

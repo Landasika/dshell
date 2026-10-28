@@ -3,10 +3,12 @@ import test from 'node:test'
 
 import {
   ProviderEditError,
+  addProvider,
+  clearProviderField,
   encodeScalar,
   readProviders,
+  removeProvider,
   setProviderField,
-  clearProviderField,
 } from '../dist/plugin/profile.js'
 
 const PATCH = `# home patch
@@ -98,4 +100,74 @@ test('clearProviderField removes only the requested scalar', () => {
   assert.equal(readProviders(next)[0].displayName, undefined)
   assert.equal(readProviders(next)[0].models, 2)
   assert.equal(next.split('\n').length, PATCH.split('\n').length - 1)
+})
+
+test('addProvider appends a well-formed block with models', () => {
+  const next = addProvider(PATCH, {
+    id: 'my-relay',
+    baseURL: 'https://relay.example/v1',
+    apiKeyEnv: 'MY_RELAY_API_KEY',
+    displayName: 'My Relay',
+    models: ['m1', 'm2'],
+  })
+  const providers = readProviders(next)
+  assert.deepEqual(providers.map((provider) => provider.id), ['kimi-relay', 'glm-sa', 'my-relay'])
+  assert.deepEqual(providers[2], {
+    id: 'my-relay',
+    apiKeyEnv: 'MY_RELAY_API_KEY',
+    displayName: 'My Relay',
+    baseURL: 'https://relay.example/v1',
+    models: 2,
+  })
+  // The inserted block sits inside the providers map, above the next entry.
+  assert.match(next, /      my-relay:\n {8}apiKeyEnv: MY_RELAY_API_KEY\n {8}displayName: 'My Relay'\n {8}baseURL: https:\/\/relay\.example\/v1\n {8}models:\n {10}- id: m1\n {10}- id: m2\n- id: other-plugin/)
+  // Existing providers are untouched byte for byte.
+  assert.equal(next.slice(0, next.indexOf('      my-relay:')), PATCH.slice(0, PATCH.indexOf('- id: other-plugin')))
+})
+
+test('addProvider refuses unsafe ids, duplicates and empty model lists', () => {
+  assert.throws(
+    () => addProvider(PATCH, { id: 'bad id', baseURL: 'https://a', models: ['m'] }),
+    (error) => error instanceof ProviderEditError && error.code === 'BAD_FIELD',
+  )
+  assert.throws(
+    () => addProvider(PATCH, { id: 'glm-sa', baseURL: 'https://a', models: ['m'] }),
+    (error) => error instanceof ProviderEditError && error.code === 'PROVIDER_EXISTS',
+  )
+  assert.throws(
+    () => addProvider(PATCH, { id: 'new', baseURL: 'https://a', models: [] }),
+    (error) => error instanceof ProviderEditError && error.code === 'BAD_FIELD',
+  )
+})
+
+test('removeProvider deletes exactly one block', () => {
+  const next = removeProvider(PATCH, 'kimi-relay')
+  assert.deepEqual(readProviders(next).map((provider) => provider.id), ['glm-sa'])
+  assert.equal(next.includes('KIMI_RELAY_API_KEY'), false)
+  assert.equal(next.includes('- id: other-plugin'), true)
+  assert.equal(next.includes('glm-5.3'), true)
+})
+
+test('removeProvider keeps the last provider and unknown ids', () => {
+  const single = '- id: llm-pi-ai\n  config:\n    providers:\n      only:\n        baseURL: https://a\n        models:\n          - id: m\n'
+  assert.throws(
+    () => removeProvider(single, 'only'),
+    (error) => error instanceof ProviderEditError && error.code === 'EMPTY_PROVIDERS',
+  )
+  assert.throws(
+    () => removeProvider(PATCH, 'nope'),
+    (error) => error instanceof ProviderEditError && error.code === 'PROVIDER_NOT_FOUND',
+  )
+})
+
+test('edits preserve a trailing newline and its absence', () => {
+  const withNewline = addProvider(PATCH, { id: 'n1', baseURL: 'https://a', models: ['m'] })
+  assert.equal(withNewline.endsWith('\n'), true)
+  assert.equal(removeProvider(withNewline, 'n1'), PATCH)
+  const withoutNewline = PATCH.slice(0, -1)
+  const added = addProvider(withoutNewline, { id: 'n2', baseURL: 'https://a', models: ['m'] })
+  assert.equal(added.endsWith('\n'), false)
+  assert.equal(removeProvider(added, 'n2'), withoutNewline)
+  assert.equal(setProviderField(withoutNewline, 'glm-sa', 'baseURL', 'https://b').endsWith('\n'), false)
+  assert.equal(clearProviderField(PATCH, 'glm-sa', 'apiKeyEnv').endsWith('\n'), true)
 })

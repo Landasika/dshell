@@ -17,7 +17,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   file the Host booted with (`$DSH_HOME/cordis.patch.yml`, else the active
   profile's), edits `baseURL` / `apiKeyEnv` / `displayName` in place, writes
   only the targeted YAML scalar lines (comments and model lists survive), and
-  then asks `Restart the Host now?`. Restart re-execs the Host with its own
+  then asks `Restart the Host now?`. `a` appends a whole provider block
+  (`id`, optional `displayName`/`apiKeyEnv`, `baseURL`, model list) and `x`
+  removes one (never the last); both end in the same restart prompt, and a
+  create-then-delete round trip restores the file byte for byte. Restart
+  re-execs the Host with its own
   argv and the TUI reattaches the session automatically; declining keeps the
   file change for the next start. Secrets stay out of the file — only the
   env-var name is stored.

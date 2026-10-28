@@ -128,8 +128,11 @@ Slash commands：
 `/provider`：读取 Host 启动用的 patch 文件（`$DSH_HOME/cordis.patch.yml`，否则
 当前 profile 的同名文件）中的 `llm-pi-ai` provider 行；`Enter` 编辑
 `baseURL`/`apiKeyEnv`/`displayName`，`s` 定点改写 YAML 标量行后弹出“是否立即
-重启 Host”，`y` 重新 exec Host 并自动 reattach，`n` 留待手动重启。密钥不落在
-patch 文件里，只有环境变量名。
+重启 Host”，`y` 重新 exec Host 并自动 reattach，`n` 留待手动重启。`a` 追加一个
+整块 provider（`id`、可选 `displayName`/`apiKeyEnv`、`baseURL`、模型 id 列表），
+`x` 删除选中的 provider（最后一个不允许删），两者都复用同一个重启确认。写入
+前后都会重新解析并比对 provider 列表，任何“意思变了”的改写都会被拒绝。密钥不
+落在 patch 文件里，只有环境变量名。
 
 `/clear` 只隐藏本地 transcript（记录 `clearedAtSeq`），不删除 Host 的 durable
 history；重新 attach 会重新看到。

@@ -57,6 +57,15 @@ export interface DshellCapabilities {
   providers: boolean
 }
 
+/** A provider row the TUI asks the Host to create. */
+export interface NewProviderSpec {
+  id: string
+  baseURL: string
+  apiKeyEnv?: string
+  displayName?: string
+  models: string[]
+}
+
 /** The provider rows of the Host's active patch file. */
 export interface ProviderList {
   file: string
@@ -167,6 +176,10 @@ export interface DshellBackend {
   providerList(): Promise<ProviderList>
   /** Rewrite one provider field; takes effect after the Host restarts. */
   updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>
+  /** Append a new provider block; takes effect after the Host restarts. */
+  createProvider(spec: NewProviderSpec): Promise<ProviderList>
+  /** Remove a provider block; takes effect after the Host restarts. */
+  deleteProvider(providerId: string): Promise<ProviderList>
   /** Re-exec the Host process; the socket disappears and comes back. */
   restartHost(): Promise<{ pid: number; argv: string[] }>
 }

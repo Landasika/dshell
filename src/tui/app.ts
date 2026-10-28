@@ -111,6 +111,12 @@ type Overlay =
       dirty: Set<ProviderField>
       editing?: { field: ProviderField; value: string }
     }
+  | {
+      kind: 'providerCreate'
+      index: number
+      draft: Record<ProviderCreateField, string>
+      editing?: { field: ProviderCreateField; value: string }
+    }
   | { kind: 'confirm'; title: string; lines: string[]; index: number; onYes: () => void }
   | { kind: 'agentView'; childId: string; label: string; lines: string[]; scroll: number; loading: boolean; error?: string }
 
@@ -149,6 +155,17 @@ interface AppState {
 }
 
 const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 'displayName']
+
+const PROVIDER_CREATE_FIELDS = ['id', 'displayName', 'baseURL', 'apiKeyEnv', 'models'] as const
+type ProviderCreateField = (typeof PROVIDER_CREATE_FIELDS)[number]
+
+const PROVIDER_CREATE_HINTS: Record<ProviderCreateField, string> = {
+  id: 'provider id, e.g. my-relay',
+  displayName: 'shown in the picker (optional)',
+  baseURL: 'https://gateway.example/v1',
+  apiKeyEnv: 'env var name (optional)',
+  models: 'model ids, comma or space separated',
+}
 
 const PROVIDER_FIELD_LABEL: Record<ProviderField, string> = {
   baseURL: 'baseURL',
@@ -928,6 +945,91 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
+  const submitNewProvider = async (overlay: Extract<Overlay, { kind: 'providerCreate' }>): Promise<void> => {
+    const id = overlay.draft.id.trim()
+    const baseURL = overlay.draft.baseURL.trim()
+    const displayName = overlay.draft.displayName.trim()
+    const apiKeyEnv = overlay.draft.apiKeyEnv.trim()
+    const models = overlay.draft.models.split(/[\s,]+/).map((model) => model.trim()).filter((model) => model.length > 0)
+    if (id.length === 0) {
+      toast('provider id is required')
+      return
+    }
+    if (!/^https?:\/\/[^\s]+$/.test(baseURL)) {
+      toast('baseURL must be an absolute http(s) URL')
+      return
+    }
+    if (models.length === 0) {
+      toast('add at least one model id')
+      return
+    }
+    state.status = 'adding provider'
+    schedule()
+    try {
+      state.providers = await backend.createProvider({
+        id,
+        baseURL,
+        models,
+        ...(displayName.length === 0 ? {} : { displayName }),
+        ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
+      })
+    } catch (error) {
+      state.status = 'idle'
+      toast(`provider add failed: ${errorText(error)}`)
+      schedule()
+      return
+    }
+    state.status = 'idle'
+    const file = state.providers?.file ?? 'cordis.patch.yml'
+    state.overlay = {
+      kind: 'confirm',
+      title: `add provider · ${id}`,
+      lines: [
+        `added ${id} with ${String(models.length)} model(s) to`,
+        file,
+        '',
+        'A running Host keeps the providers it booted with.',
+        'Restart it now to load this provider?',
+      ],
+      index: 0,
+      onYes: () => {
+        void restartHost()
+      },
+    }
+    schedule()
+  }
+
+  const deleteProviderRow = async (providerId: string): Promise<void> => {
+    state.status = 'removing provider'
+    schedule()
+    try {
+      state.providers = await backend.deleteProvider(providerId)
+    } catch (error) {
+      state.status = 'idle'
+      toast(`provider remove failed: ${errorText(error)}`)
+      schedule()
+      return
+    }
+    state.status = 'idle'
+    const file = state.providers?.file ?? 'cordis.patch.yml'
+    state.overlay = {
+      kind: 'confirm',
+      title: `remove provider · ${providerId}`,
+      lines: [
+        `removed ${providerId} from`,
+        file,
+        '',
+        'A running Host keeps the providers it booted with.',
+        'Restart it now to drop it?',
+      ],
+      index: 0,
+      onYes: () => {
+        void restartHost()
+      },
+    }
+    schedule()
+  }
+
   const providerIndex = (providerId: string): number => {
     const rows = state.providers?.providers ?? []
     const index = rows.findIndex((row) => row.id === providerId)
@@ -1191,6 +1293,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.editing = undefined
       } else if (overlay.kind === 'providerEdit') {
         state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
+      } else if (overlay.kind === 'providerCreate') {
+        state.overlay = { kind: 'providers', index: Math.max(0, (state.providers?.providers.length ?? 1) - 1) }
       } else {
         if (overlay.kind === 'agentView') closeAgentView()
         state.overlay = null
@@ -1368,6 +1472,64 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
             void restartHost()
           },
         }
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'a') {
+        state.overlay = {
+          kind: 'providerCreate',
+          index: 0,
+          draft: { id: '', displayName: '', baseURL: '', apiKeyEnv: '', models: '' },
+        }
+        schedule()
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'x') {
+        const entry = rows[overlay.index]
+        if (entry !== undefined) {
+          state.overlay = {
+            kind: 'confirm',
+            title: `remove provider · ${entry.id}`,
+            lines: [
+              `Delete the ${entry.id} block from`,
+              state.providers?.file ?? 'cordis.patch.yml',
+              '',
+              'Its API key, if any, stays in the environment.',
+              'Remove it?',
+            ],
+            index: 1,
+            onYes: () => {
+              void deleteProviderRow(entry.id)
+            },
+          }
+          schedule()
+        }
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'providerCreate') {
+      if (overlay.editing !== undefined) {
+        const editing = overlay.editing
+        if (key.type === 'enter' || key.type === 'tab') {
+          overlay.draft[editing.field] = editing.value
+          overlay.editing = undefined
+        } else if (key.type === 'backspace') {
+          editing.value = Array.from(editing.value).slice(0, -1).join('')
+        } else if (key.type === 'ctrl-u') {
+          editing.value = ''
+        } else if (key.type === 'text') {
+          editing.value += key.text
+        }
+        schedule()
+        return
+      }
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.index = Math.max(0, overlay.index - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') {
+        overlay.index = Math.min(PROVIDER_CREATE_FIELDS.length - 1, overlay.index + 1)
+      } else if (key.type === 'enter') {
+        const field = PROVIDER_CREATE_FIELDS[overlay.index]
+        if (field !== undefined) overlay.editing = { field, value: overlay.draft[field] }
+      } else if (key.type === 'text' && key.text.toLowerCase() === 's') {
+        void submitNewProvider(overlay)
         return
       }
       schedule()
@@ -1964,7 +2126,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(paint(theme, 'muted', list?.file ?? 'no patch file found'))
       if (list?.writable === false) body.push(paint(theme, 'error', 'read-only: fix the file permissions to edit'))
       return panelBox(theme, 'providers', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ select · enter edit · r restart host · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ select · enter edit · a add · x remove · r restart · esc close')],
       })
     }
     if (overlay.kind === 'providerEdit') {
@@ -1986,6 +2148,27 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return panelBox(theme, `provider · ${overlay.providerId}`, body, width, {
         footer: [paint(theme, 'muted', overlay.editing === undefined
           ? 'enter edit · s save · esc back'
+          : 'type to edit · enter commit · esc cancel')],
+      })
+    }
+    if (overlay.kind === 'providerCreate') {
+      const body: string[] = []
+      for (const [index, field] of PROVIDER_CREATE_FIELDS.entries()) {
+        const selected = index === overlay.index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        const editing = overlay.editing?.field === field
+        const raw = editing ? overlay.editing?.value ?? '' : overlay.draft[field]
+        const shown = raw.length === 0
+          ? paint(theme, 'muted', PROVIDER_CREATE_HINTS[field])
+          : paint(theme, selected ? 'text' : 'muted', raw)
+        body.push(`${marker} ${paint(theme, 'muted', pad(field, 12))} ${editing ? `${shown}${paint(theme, 'accent', '▏')}` : shown}`)
+      }
+      body.push('')
+      body.push(paint(theme, 'muted', 'the new block is appended to the providers map'))
+      body.push(paint(theme, 'muted', 'the API key itself stays in the environment'))
+      return panelBox(theme, 'add provider', body, width, {
+        footer: [paint(theme, 'muted', overlay.editing === undefined
+          ? 'enter edit · s add · esc back'
           : 'type to edit · enter commit · esc cancel')],
       })
     }

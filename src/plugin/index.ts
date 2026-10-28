@@ -34,7 +34,14 @@ import {
   type WorkspaceSummary,
 } from '../protocol/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
-import { ProviderEditError, isProviderField, readProviders, setProviderField } from './profile.js'
+import {
+  ProviderEditError,
+  addProvider,
+  isProviderField,
+  readProviders,
+  removeProvider,
+  setProviderField,
+} from './profile.js'
 
 export const name = 'dshell-host'
 export const inject = [
@@ -194,6 +201,22 @@ interface PluginContext {
   effect(setup: () => void | (() => void | Promise<void>)): void
 }
 
+/** Stable fingerprint of a provider list, compared before and after a write. */
+function providerSignature(rows: readonly ProviderEntry[]): string[] {
+  return rows.map((row) =>
+    [row.id, row.displayName ?? '', row.baseURL ?? '', row.apiKeyEnv ?? '', String(row.models)].join('\u0000'))
+}
+
+function readProviderEntries(text: string): ProviderEntry[] {
+  return readProviders(text).map((record) => ({
+    id: record.id,
+    ...(record.displayName === undefined ? {} : { displayName: record.displayName }),
+    ...(record.baseURL === undefined ? {} : { baseURL: record.baseURL }),
+    ...(record.apiKeyEnv === undefined ? {} : { apiKeyEnv: record.apiKeyEnv }),
+    models: record.models,
+  }))
+}
+
 function safeRead(path: string): string {
   try {
     return readFileSync(path, 'utf8')
@@ -243,6 +266,14 @@ function mappedError(error: unknown): ErrorMessage {
       code: 'SESSION_NOT_FOUND',
       message,
       action: 'Run `dshell list` and attach an existing session.',
+    }
+  }
+  if (/already owned by an active write/i.test(message)) {
+    return {
+      type: 'error',
+      code: 'SESSION_ALREADY_LIVE',
+      message,
+      action: 'Another Host or the Web UI is writing this session right now. Wait for that turn, or open a different session.',
     }
   }
   if (/already registered|already live/i.test(message)) {
@@ -635,14 +666,28 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
   const providerRows = (): ProviderEntry[] => {
     const file = providerFile()
-    if (file === undefined) return []
-    return readProviders(safeRead(file)).map((record) => ({
-      id: record.id,
-      ...(record.displayName === undefined ? {} : { displayName: record.displayName }),
-      ...(record.baseURL === undefined ? {} : { baseURL: record.baseURL }),
-      ...(record.apiKeyEnv === undefined ? {} : { apiKeyEnv: record.apiKeyEnv }),
-      models: record.models,
-    }))
+    return file === undefined ? [] : readProviderEntries(safeRead(file))
+  }
+
+  /**
+   * Persist a rewrite only when the re-parsed file still says exactly what was
+   * intended. A near-miss (indentation drift, quoting slip) refuses the write
+   * and leaves the file untouched.
+   */
+  const persistProviders = (socket: Socket, file: string, after: string, expected: ProviderEntry[]): boolean => {
+    if (JSON.stringify(providerSignature(expected)) !== JSON.stringify(providerSignature(readProviderEntries(after)))) {
+      sendError(socket, {
+        type: 'error',
+        code: 'INTERNAL',
+        message: 'refusing to write: the edited patch file no longer parses to the expected providers',
+        action: 'Edit the provider rows in cordis.patch.yml by hand.',
+      })
+      return false
+    }
+    const temporary = `${file}.dshell-tmp`
+    writeFileSync(temporary, after, { mode: 0o600 })
+    renameSync(temporary, file)
+    return true
   }
 
   const providerWritable = (file: string): boolean => {
@@ -732,10 +777,6 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       throw error
     }
     if (after !== before) {
-      // Never persist a rewrite whose meaning drifted: the parse of the new
-      // text must differ from the old one only in the requested scalar.
-      const normalise = (rows: ReturnType<typeof readProviders>): string[] =>
-        rows.map((row) => [row.id, row.displayName ?? '', row.baseURL ?? '', row.apiKeyEnv ?? '', String(row.models)].join('\u0000'))
       const expected = providerRows().map((row) => {
         if (row.id !== providerId) return row
         const edited: ProviderEntry = { ...row }
@@ -743,20 +784,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         else edited[field] = value.trim()
         return edited
       })
-      const expectedLines = expected.map((row) =>
-        [row.id, row.displayName ?? '', row.baseURL ?? '', row.apiKeyEnv ?? '', String(row.models)].join('\u0000'))
-      if (JSON.stringify(expectedLines) !== JSON.stringify(normalise(readProviders(after)))) {
-        sendError(socket, {
-          type: 'error',
-          code: 'INTERNAL',
-          message: 'refusing to write: the edited patch file no longer parses to the same providers',
-          action: 'Edit the provider row in cordis.patch.yml by hand.',
-        })
-        return
-      }
-      const temporary = `${file}.dshell-tmp`
-      writeFileSync(temporary, after, { mode: 0o600 })
-      renameSync(temporary, file)
+      if (!persistProviders(socket, file, after, expected)) return
     }
     jsonLine(socket, {
       type: 'provider-updated',
@@ -766,6 +794,103 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       value: value.trim(),
       providers: providerRows(),
     })
+  }
+
+  const createProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
+    const baseURL = typeof message.baseURL === 'string' ? message.baseURL.trim() : ''
+    const apiKeyEnv = typeof message.apiKeyEnv === 'string' ? message.apiKeyEnv.trim() : ''
+    const displayName = typeof message.displayName === 'string' ? message.displayName.trim() : ''
+    const models = Array.isArray(message.models)
+      ? message.models
+          .filter((model): model is string => typeof model === 'string')
+          .map((model) => model.trim())
+          .filter((model) => model.length > 0)
+      : []
+    if (providerId.length === 0 || baseURL.length === 0 || models.length === 0) {
+      sendError(socket, {
+        type: 'error',
+        code: 'BAD_REQUEST',
+        message: 'provider/create needs providerId, baseURL and at least one model id',
+      })
+      return
+    }
+    if (!/^https?:\/\/[^\s]+$/.test(baseURL)) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'baseURL must be an absolute http(s) URL' })
+      return
+    }
+    if (apiKeyEnv.length > 0 && !/^[A-Z][A-Z0-9_]*$/.test(apiKeyEnv)) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'apiKeyEnv must be an upper-case environment variable name' })
+      return
+    }
+    const file = providerFile()
+    if (file === undefined || !providerWritable(file)) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: file === undefined ? 'this Host found no cordis.patch.yml' : `${file} is not writable`,
+        action: 'Create or fix $DSH_HOME/cordis.patch.yml, then restart the Host.',
+      })
+      return
+    }
+    const before = safeRead(file)
+    let after: string
+    try {
+      after = addProvider(before, {
+        id: providerId,
+        baseURL,
+        models,
+        ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
+        ...(displayName.length === 0 ? {} : { displayName }),
+      })
+    } catch (error) {
+      if (error instanceof ProviderEditError) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        return
+      }
+      throw error
+    }
+    const entry: ProviderEntry = {
+      id: providerId,
+      baseURL,
+      models: models.length,
+      ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
+      ...(displayName.length === 0 ? {} : { displayName }),
+    }
+    if (!persistProviders(socket, file, after, [...providerRows(), entry])) return
+    jsonLine(socket, { type: 'provider-created', file, providerId, providers: providerRows() })
+  }
+
+  const deleteProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
+    if (providerId.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/delete needs providerId' })
+      return
+    }
+    const file = providerFile()
+    if (file === undefined || !providerWritable(file)) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: file === undefined ? 'this Host found no cordis.patch.yml' : `${file} is not writable`,
+        action: 'Create or fix $DSH_HOME/cordis.patch.yml, then restart the Host.',
+      })
+      return
+    }
+    const before = safeRead(file)
+    let after: string
+    try {
+      after = removeProvider(before, providerId)
+    } catch (error) {
+      if (error instanceof ProviderEditError) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        return
+      }
+      throw error
+    }
+    const expected = providerRows().filter((row) => row.id !== providerId)
+    if (!persistProviders(socket, file, after, expected)) return
+    jsonLine(socket, { type: 'provider-deleted', file, providerId, providers: providerRows() })
   }
 
   const restartHost = async (socket: Socket): Promise<void> => {
@@ -1197,6 +1322,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'provider/update':
           await updateProvider(socket, message)
+          return
+        case 'provider/create':
+          await createProvider(socket, message)
+          return
+        case 'provider/delete':
+          await deleteProvider(socket, message)
           return
         case 'host/restart':
           await restartHost(socket)
