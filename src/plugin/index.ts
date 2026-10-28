@@ -1035,6 +1035,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       cursor: snapshot.events.at(-1)?.seq ?? -1,
       events: snapshot.events,
     })
+    // Tell a late attacher whether a turn is already running; without this the
+    // client assumes idle and Enter would queue instead of steering.
+    jsonLine(socket, { type: 'status', sessionId, status: openTurn(snapshot.events) ? 'running' : 'idle' })
+  }
+
+  /** True when the newest turn event in a snapshot is a `turn/start`. */
+  const openTurn = (events: readonly SessionEvent[]): boolean => {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const type = events[index]?.type
+      if (type === 'turn/end') return false
+      if (type === 'turn/start') return true
+    }
+    return false
   }
 
   const history = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {

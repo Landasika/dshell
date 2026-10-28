@@ -37,6 +37,16 @@ import {
   type WorkspaceSummary,
 } from './types.js'
 
+/** True when the newest turn event in the log is a `turn/start`. */
+function lastTurnOpen(events: readonly SessionEvent[]): boolean {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const type = events[index]?.type
+    if (type === 'turn/end') return false
+    if (type === 'turn/start') return true
+  }
+  return false
+}
+
 function mapError(error: unknown): BackendError {
   if (error instanceof BackendError) return error
   if (error instanceof DshellError) {
@@ -548,7 +558,10 @@ export class SocketSessionHandle implements SessionHandle {
     this.events.length = 0
     this.events.push(...message.events)
     this.cursor = message.cursor
-    this.status = 'idle'
+    // Attaching in the middle of a turn must not look idle: the tail of the
+    // log says whether the last turn is still open. (A current Host also sends
+    // an explicit status right after `attached`.)
+    this.status = lastTurnOpen(message.events) ? 'running' : 'idle'
     for (const event of message.events) this.noteEvent(event)
   }
 
