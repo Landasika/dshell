@@ -178,7 +178,7 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   `~/.dsh` stays responsive.
 - header: brand (`🐳 dshell`), session title, status (idle / running /
   approval / error) and working directory. The assistant's first block in a
-  turn is signed with the same whale instead of a text label.
+  turn is signed `🐳 dshell`.
 - markdown: headings, lists, quotes, fenced code, diffs and **tables**. Tables
   are drawn as a box grid with per-column alignment (`:---`, `:--:`, `---:`),
   cells wider than the terminal wrap instead of being cut off, and CJK/emoji

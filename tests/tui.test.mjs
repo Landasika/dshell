@@ -890,9 +890,9 @@ test('the dshell header appears once per turn, not before every assistant block'
     { type: 'assistant/message', seq: 7, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'three' }] } } },
   ]
   const lines = renderBlocks(buildBlocks(events), 80, theme).map(stripAnsi).map((line) => line.trimEnd())
-  assert.equal(lines.filter((line) => line === '🐳').length, 2, 'one header per turn')
+  assert.equal(lines.filter((line) => line === '🐳 dshell').length, 2, 'one header per turn')
   // The second turn's header sits right before its first answer, not the tools.
-  const headerIndex = lines.lastIndexOf('🐳')
+  const headerIndex = lines.lastIndexOf('🐳 dshell')
   assert.equal(lines[headerIndex + 1], 'three')
 })
 
