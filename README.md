@@ -230,8 +230,9 @@ the official API.
 
 | Key | Action |
 | --- | --- |
-| `Enter` | send / run command |
-| `Alt+Enter`, `Ctrl-J` | newline |
+| `Enter` | send / run command; while a turn runs it **steers** (joins that turn) |
+| `Alt+Enter` | queue the prompt for the next turn instead of steering |
+| `Ctrl-J`, `Shift+Enter` | newline |
 | `Tab` | complete `/` command or `@` file |
 | `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history (seeded from the session's durable transcript) |
 | `Alt+↑`/`Alt+↓` | scroll the transcript three lines (same as the wheel) |
@@ -250,11 +251,13 @@ the official API.
 | `Ctrl-C` | clear input, cancel a running turn, or quit |
 | `Ctrl-D` | quit when the composer is empty |
 
-Typing while a turn is running does not get lost: the Host queues the prompt
-behind the running turn, and the composer row shows it as `◷ queued · …` until
-that turn ends and yours starts (it then appears in the transcript). Use
-`Ctrl-C` if you want to cancel the running turn instead; a cancel also drops
-the queued prompts.
+Typing while a turn is running does not get lost, and `Enter` keeps the Claude
+Code habit: the message is **steered** into the running turn, so the agent sees
+it at its next step and the transcript shows it as a normal user message
+(`◷ steering · …` marks the gap until then). `Alt+Enter` queues the prompt
+instead — the Host holds it and starts a fresh turn after the current one
+(`◷ queued · …`). `Ctrl-C` cancels the running turn; that also drops prompts
+still queued with `Alt+Enter`.
 
 `Ctrl-C`/`Ctrl-D`/`Esc` quitting only closes this view; it never cancels the
 Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or

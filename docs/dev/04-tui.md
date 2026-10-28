@@ -22,7 +22,7 @@ $ dshell
 │ ✓ bash · ls -la                                                │
 │ ...                                                            │
 │ ❯ 继续                                                          │
-└ enter send · alt+enter newline · / commands · @ files ─────────┘
+└ enter steer/send · alt+enter queue · ctrl+j newline · / commands ───┘
 ```
 
 关键约束没有变化：

@@ -1606,7 +1606,7 @@ test('a dropped Host connection reattaches instead of failing every command', as
   assert.equal(await app, 0)
 })
 
-test('a prompt sent while a turn runs stays visible as queued', async () => {
+test('enter steers into the running turn and alt+enter queues behind it', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
   const { FakeBackend } = await import('../dist/backend/index.js')
@@ -1645,17 +1645,27 @@ test('a prompt sent while a turn runs stays visible as queued', async () => {
   backend.emit('s1', { type: 'turn/start', seq: 1, data: { turn: 1 } })
   await waitFor(() => output.text.includes('running'), 'the running status')
 
+  // Enter joins the running turn instead of waiting for it to finish.
   output.text = ''
-  input.push('keep going')
+  input.push('go faster')
   input.push('\r')
-  await waitFor(() => output.text.includes('◷ queued'), 'the queued marker')
-  assert.equal(output.text.includes('keep going'), true)
+  await waitFor(() => output.text.includes('◷ steering'), 'the steering marker')
+  assert.equal(output.text.includes('go faster'), true)
 
-  // The Host starts the inbox item when the running turn ends: the prompt
-  // moves into the transcript and the queued marker disappears.
+  output.text = ''
+  assert.equal(backend.deliverSteer('s1'), true)
+  await waitFor(() => output.text.includes('go faster'), 'the steered prompt in the transcript')
+  assert.equal(output.text.includes('◷ steering'), false)
+
+  // Alt+Enter asks the Host to hold the prompt for the next turn.
+  output.text = ''
+  input.push('after this')
+  input.push('\u001b\r')
+  await waitFor(() => output.text.includes('◷ queued'), 'the queued marker')
+
   output.text = ''
   assert.equal(backend.startQueued('s1'), true)
-  await waitFor(() => output.text.includes('keep going'), 'the queued prompt in the transcript')
+  await waitFor(() => output.text.includes('after this'), 'the queued prompt in the transcript')
   assert.equal(output.text.includes('◷ queued'), false)
 
   input.push('\u0003')

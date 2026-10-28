@@ -33,6 +33,7 @@ export type Key =
   | { type: 'ctrl-t' }
   | { type: 'ctrl-o' }
   | { type: 'ctrl-g' }
+  | { type: 'alt-enter' }
   | { type: 'alt-up' }
   | { type: 'alt-down' }
   | { type: 'focus'; focused: boolean }
@@ -68,7 +69,10 @@ const SEQUENCES: Record<string, Key> = {
   '\u001b[1;3B': { type: 'alt-down' },
   '\u001b[1;5A': { type: 'up' },
   '\u001b[1;5B': { type: 'down' },
-  '\u001b\r': { type: 'newline' },
+  '\u001b\r': { type: 'alt-enter' },
+  // Shift+Enter as reported by terminals with the kitty/modifyOtherKeys
+  // extensions; plain terminals send the same bytes as Enter.
+  '\u001b[13;2u': { type: 'newline' },
   // Focus reporting (xterm 1004). Terminals send these whenever the window
   // gains or loses focus; without a mapping they leaked into the composer as a
   // literal "[I".

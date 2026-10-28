@@ -150,8 +150,8 @@ interface AppState {
   modelOverride?: ModelSelection
   /** Last reasoning level picked per `provider/model`. */
   modelEfforts: Record<string, string>
-  /** Prompts the Host queued behind the running turn, shown until they start. */
-  queued: { requestId: string; text: string; at: number }[]
+  /** Prompts handed to the running turn, shown until they reach the transcript. */
+  queued: { requestId: string; text: string; at: number; mode: 'queue' | 'steer' }[]
   /** Provider rows read from the Host's patch file. */
   providers?: ProviderList
 }
@@ -611,7 +611,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
-  const send = async (text: string): Promise<void> => {
+  const send = async (text: string, requested?: 'queue' | 'steer'): Promise<void> => {
     const trimmed = text.replace(/\s+$/, '')
     if (trimmed.length === 0) return
     if (state.handle === undefined) {
@@ -629,14 +629,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.status = 'sending'
     state.error = undefined
     const wasRunning = state.view?.status === 'running'
+    // Enter steers by default (the Host folds the text into the running turn,
+    // like Claude Code); Alt+Enter asks for the inbox instead.
+    const mode = requested ?? (wasRunning ? 'steer' : 'queue')
     reportHerdr(state.view, 'working')
     schedule()
     try {
-      const receipt = await state.handle.send(trimmed)
+      const receipt = await state.handle.send(trimmed, { mode })
       if (wasRunning) {
-        // The Host answered `mode: queue`: the prompt will only show up in the
-        // transcript when the running turn ends, so keep it visible meanwhile.
-        state.queued.push({ requestId: receipt.requestId, text: trimmed, at: Date.now() })
+        // The transcript only shows the message once the Host delivers it, so
+        // keep it visible until its user/message arrives.
+        state.queued.push({ requestId: receipt.requestId, text: trimmed, at: Date.now(), mode: receipt.mode ?? mode })
       }
       state.status = 'waiting for turn'
     } catch (error) {
@@ -1350,7 +1353,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const handleOverlayKey = (rawKey: Key): void => {
     // Some terminals (and Shift+Enter) send LF where the rest of the app means
     // "confirm". Inside a picker both should commit, so alias them here.
-    const key: Key = rawKey.type === 'newline' ? { type: 'enter' } : rawKey
+    const key: Key = rawKey.type === 'newline' || rawKey.type === 'alt-enter' ? { type: 'enter' } : rawKey
     const overlay = state.overlay
     if (overlay === null) return
     if (key.type === 'escape') {
@@ -1922,6 +1925,22 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    if (key.type === 'alt-enter') {
+      if (state.completion !== undefined) {
+        const item = state.completion.items[state.completion.index]
+        acceptCompletion(item?.kind === 'command' && item.execute !== undefined)
+        return
+      }
+      const text = state.editor.text
+      if (isCommand(text)) {
+        state.editor = createEditor()
+        state.completion = undefined
+        void runCommand(text)
+      } else {
+        void send(text, 'queue')
+      }
+      return
+    }
     if (key.type === 'enter') {
       if (state.completion !== undefined) {
         const item = state.completion.items[state.completion.index]
@@ -2140,7 +2159,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         body.push(`${paint(theme, 'accent', pad(name, 15))} ${paint(theme, 'text', description)}`)
       }
       body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'keys')), '')
-      body.push(`${paint(theme, 'text', pad('enter', 15))} send · ${paint(theme, 'text', 'alt+enter')} newline · ${paint(theme, 'text', 'tab')} complete`)
+      body.push(`${paint(theme, 'text', pad('enter', 15))} send/steer · ${paint(theme, 'text', 'alt+enter')} queue · ${paint(theme, 'text', 'ctrl+j')} newline`)
+      body.push(`${paint(theme, 'text', pad('tab', 15))} complete · ${paint(theme, 'text', 'shift+enter')} newline (kitty-style terminals)`)
       body.push(`${paint(theme, 'text', pad('up / down', 15))} prompt history · ${paint(theme, 'text', 'alt+up/down')} scroll transcript`)
       body.push(`${paint(theme, 'text', pad('pgup / pgdn', 15))} page scroll · ${paint(theme, 'text', 'wheel')} 3 lines`)
       body.push(`${paint(theme, 'text', pad('drag', 15))} select & copy text (shift+drag: terminal)`)
@@ -2592,7 +2612,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const pill = viewport.scrollOffset === 0 ? undefined : renderJumpToBottom(theme, unseen, columns)
     const queuedRows = state.queued.slice(-2).map((entry) => {
       const oneLine = entry.text.replace(/\s+/g, ' ').trim()
-      return paint(theme, 'dim', truncate(`  ◷ queued · ${oneLine}`, columns))
+      const label = entry.mode === 'steer' ? 'steering' : 'queued'
+      return paint(theme, 'dim', truncate(`  ◷ ${label} · ${oneLine}`, columns))
     })
     const bodyHeight = Math.max(
       3,

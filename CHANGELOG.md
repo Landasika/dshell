@@ -5,13 +5,15 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- A prompt typed while a turn is running is shown as `◷ queued · …` just above
-  the composer until the Host starts it. The Host has always accepted those
-  prompts (`mode: queue`) and run them when the current turn ends, but the
-  transcript only contains them from the moment their turn begins, so they used
-  to look swallowed.
+- `Enter` while a turn is running now **steers**: the prompt joins the running
+  turn instead of waiting behind it (Claude Code's default). `Alt+Enter` is the
+  queue key that waits for the current turn to finish; `Ctrl-J` (and
+  `Shift+Enter` on terminals that report it) inserts a newline. Both modes are
+  labelled above the composer (`◷ steering · …` / `◷ queued · …`) until the
+  Host writes the message into the transcript, so a prompt never looks
+  swallowed.
 
 ### Fixed
 
