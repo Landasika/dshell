@@ -5,6 +5,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
+### Added
+
+- A prompt typed while a turn is running is shown as `◷ queued · …` just above
+  the composer until the Host starts it. The Host has always accepted those
+  prompts (`mode: queue`) and run them when the current turn ends, but the
+  transcript only contains them from the moment their turn begins, so they used
+  to look swallowed.
+
 ### Fixed
 
 - **No more full-screen flicker**: `TerminalScreen.draw` now rewrites only the

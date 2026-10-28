@@ -250,6 +250,12 @@ the official API.
 | `Ctrl-C` | clear input, cancel a running turn, or quit |
 | `Ctrl-D` | quit when the composer is empty |
 
+Typing while a turn is running does not get lost: the Host queues the prompt
+behind the running turn, and the composer row shows it as `◷ queued · …` until
+that turn ends and yours starts (it then appears in the transcript). Use
+`Ctrl-C` if you want to cancel the running turn instead; a cancel also drops
+the queued prompts.
+
 `Ctrl-C`/`Ctrl-D`/`Esc` quitting only closes this view; it never cancels the
 Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
 `/cancel`.

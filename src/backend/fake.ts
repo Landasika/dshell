@@ -61,6 +61,8 @@ export class FakeBackend implements DshellBackend {
   private readonly sessions = new Map<string, FakeSession>()
   private readonly workspaces = new Map<string, WorkspaceSummary>()
   private readonly handles = new Set<FakeSessionHandle>()
+  /** Prompts accepted while a turn was running, keyed by request id. */
+  private readonly queuedPrompts: { sessionId: string; requestId: string; text: string }[] = []
   private isConnected = false
   private readonly disconnectListeners = new Set<() => void>()
   private nextId = 1
@@ -284,6 +286,35 @@ export class FakeBackend implements DshellBackend {
     }
   }
 
+  /** Remember a prompt the Host would hold in its inbox behind the running turn. */
+  queuePrompt(sessionId: string, requestId: string, text: string): void {
+    this.queuedPrompts.push({ sessionId, requestId, text })
+  }
+
+  /** Test helper: start the oldest queued prompt, as the Host does after a turn. */
+  startQueued(sessionId: string): boolean {
+    const index = this.queuedPrompts.findIndex((entry) => entry.sessionId === sessionId)
+    if (index < 0) return false
+    const next = this.queuedPrompts[index]
+    if (next === undefined) return false
+    this.queuedPrompts.splice(index, 1)
+    const session = this.requireSession(sessionId)
+    this.emit(sessionId, { type: 'turn/start', seq: session.cursor + 1, data: { turn: 1 } })
+    this.emit(sessionId, {
+      type: 'user/message',
+      seq: session.cursor + 1,
+      data: {
+        message: {
+          id: next.requestId,
+          role: 'user',
+          content: [{ type: 'text', text: next.text }],
+          source: { kind: 'user' },
+        },
+      },
+    })
+    return true
+  }
+
   /** Test helper: create a pending approval without starting a real turn. */
   askApproval(sessionId: string, question: NonNullable<SessionView['pendingApproval']>): void {
     const session = this.requireSession(sessionId)
@@ -386,6 +417,11 @@ class FakeSessionHandle implements SessionHandle {
       throw new BackendError('BAD_REQUEST', 'prompt must not be empty')
     }
     const requestId = randomUUID()
+    if (this.session.status === 'running') {
+      // The Host keeps the prompt in its inbox until the running turn ends.
+      this.backend.queuePrompt(this.id, requestId, text)
+      return { requestId, mode: 'queue' }
+    }
     const turn = this.session.events.filter((event) => event.type === 'turn/start').length + 1
     this.append({ type: 'turn/start', seq: this.session.cursor + 1, data: { turn } })
     this.append({

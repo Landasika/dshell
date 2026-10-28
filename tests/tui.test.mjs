@@ -1588,3 +1588,60 @@ test('a dropped Host connection reattaches instead of failing every command', as
   input.push('\u0004')
   assert.equal(await app, 0)
 })
+
+test('a prompt sent while a turn runs stays visible as queued', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(output.text.slice(-900))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  backend.emit('s1', { type: 'turn/start', seq: 1, data: { turn: 1 } })
+  await waitFor(() => output.text.includes('running'), 'the running status')
+
+  output.text = ''
+  input.push('keep going')
+  input.push('\r')
+  await waitFor(() => output.text.includes('◷ queued'), 'the queued marker')
+  assert.equal(output.text.includes('keep going'), true)
+
+  // The Host starts the inbox item when the running turn ends: the prompt
+  // moves into the transcript and the queued marker disappears.
+  output.text = ''
+  assert.equal(backend.startQueued('s1'), true)
+  await waitFor(() => output.text.includes('keep going'), 'the queued prompt in the transcript')
+  assert.equal(output.text.includes('◷ queued'), false)
+
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+})

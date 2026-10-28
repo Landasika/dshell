@@ -150,6 +150,8 @@ interface AppState {
   modelOverride?: ModelSelection
   /** Last reasoning level picked per `provider/model`. */
   modelEfforts: Record<string, string>
+  /** Prompts the Host queued behind the running turn, shown until they start. */
+  queued: { requestId: string; text: string; at: number }[]
   /** Provider rows read from the Host's patch file. */
   providers?: ProviderList
 }
@@ -286,6 +288,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     tpsSamples: [],
     escapeAt: 0,
     modelEfforts: {},
+    queued: [],
   }
 
   let renderTimer: NodeJS.Timeout | undefined
@@ -431,6 +434,26 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     herdrReporter.update({ state: view?.status === 'running' ? 'working' : 'idle', ...session })
   }
 
+  /** Drop queued prompts once the transcript shows them (or the Host dropped them). */
+  const pruneQueued = (view: SessionView): void => {
+    if (state.queued.length === 0) return
+    const started = new Set<string>()
+    for (const event of view.events) {
+      if (event.type !== 'user/message') continue
+      const data = (event.data ?? {}) as Record<string, unknown>
+      const message = (data.message ?? data) as Record<string, unknown>
+      const id = message.id
+      if (typeof id === 'string' && id.length > 0) started.add(id)
+    }
+    const now = Date.now()
+    state.queued = state.queued.filter((entry) => {
+      if (started.has(entry.requestId)) return false
+      // Idle for a few seconds without the prompt starting means the Host
+      // discarded it (a cancel with the inbox dropped); stop showing it.
+      return view.status === 'running' || now - entry.at < 5_000
+    })
+  }
+
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
@@ -448,6 +471,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         toast(`turn failed: ${failure.length > 80 ? `${failure.slice(0, 80)}…` : failure}`)
       }
     }
+    pruneQueued(view)
     sampleSpeed(view)
     if (view.pendingApproval !== undefined) {
       if (state.overlay?.kind !== 'approval') state.overlay = { kind: 'approval', details: false }
@@ -604,10 +628,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.editor = createEditor()
     state.status = 'sending'
     state.error = undefined
+    const wasRunning = state.view?.status === 'running'
     reportHerdr(state.view, 'working')
     schedule()
     try {
-      await state.handle.send(trimmed)
+      const receipt = await state.handle.send(trimmed)
+      if (wasRunning) {
+        // The Host answered `mode: queue`: the prompt will only show up in the
+        // transcript when the running turn ends, so keep it visible meanwhile.
+        state.queued.push({ requestId: receipt.requestId, text: trimmed, at: Date.now() })
+      }
       state.status = 'waiting for turn'
     } catch (error) {
       state.error = errorText(error)
@@ -2552,15 +2582,28 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (viewport.scrollOffset === 0) seenTranscriptTotal = total
     const unseen = Math.max(0, total - seenTranscriptTotal)
     const pill = viewport.scrollOffset === 0 ? undefined : renderJumpToBottom(theme, unseen, columns)
+    const queuedRows = state.queued.slice(-2).map((entry) => {
+      const oneLine = entry.text.replace(/\s+/g, ' ').trim()
+      return paint(theme, 'dim', truncate(`  ◷ queued · ${oneLine}`, columns))
+    })
     const bodyHeight = Math.max(
       3,
-      rows - header.length - footer.length - menu.length - composer.height - noticeRows - (pill === undefined ? 0 : 1) - 1,
+      rows -
+        header.length -
+        footer.length -
+        menu.length -
+        composer.height -
+        noticeRows -
+        queuedRows.length -
+        (pill === undefined ? 0 : 1) -
+        1,
     )
     lastBodyHeight = bodyHeight
     const visible = viewport.visible(transcriptData.lines, bodyHeight)
     lines.push(...header)
     lines.push(...visible.lines)
     for (let index = visible.lines.length; index < bodyHeight; index += 1) lines.push('')
+    if (queuedRows.length > 0) lines.push(...queuedRows)
     if (notice !== undefined) {
       const tone: ThemeStyle = !toastActive && state.error !== undefined ? 'error' : 'warning'
       lines.push(paint(theme, tone, truncate(notice, columns)))
