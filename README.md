@@ -27,6 +27,10 @@ truth, and never owns an Agent. Quitting a terminal only closes its view.
 
 **V1 supports Linux only.** See [Supported versions](docs/SUPPORTED-VERSIONS.md).
 
+▶ **[宣传片 / 教学视频](docs/promo/out/dshell-promo.mp4)**（1:27，无声，中文字幕）：
+一次对话、工具折叠、插话与排队、会话切换、审批。分镜和录制方式见
+[docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md)。
+
 ## Status
 
 P0–P6 are complete for the V1 candidate `0.1.0`:

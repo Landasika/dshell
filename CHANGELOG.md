@@ -3,6 +3,20 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [Unreleased]
+
+### Added
+
+- A scripted promo/tutorial video: `docs/promo/` drives the real TUI with a
+  fake backend, records every repaint, and renders a 1080p video
+  (`record.sh` regenerates it in one command).
+
+### Fixed
+
+- Enter on a focused block now opens it even when the transcript is scrolled
+  up. Previously that key press was consumed by "jump to live tail", although
+  the focus hint promised `enter open`.
+
 ## [0.2.0] — 2026-10-28
 
 ### Added

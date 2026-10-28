@@ -1956,9 +1956,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
-    if ((key.type === 'end' || key.type === 'enter') && viewport.scrollOffset > 0) {
-      // less/vim semantics: End (or Enter) returns to the live tail instead of
-      // moving the caret or sending a prompt that the user cannot see.
+    if (key.type === 'end' && viewport.scrollOffset > 0) {
+      // less/vim semantics: End returns to the live tail.
+      viewport.reset()
+      schedule()
+      return
+    }
+    if (key.type === 'enter' && viewport.scrollOffset > 0 && state.focus === undefined) {
+      // Enter also returns to the live tail, unless a block is focused: then it
+      // opens that block, which is what the focus hint promises.
       viewport.reset()
       schedule()
       return

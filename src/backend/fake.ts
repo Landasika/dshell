@@ -356,6 +356,16 @@ export class FakeBackend implements DshellBackend {
     })
   }
 
+  /** Test/presentation helper: replace the live assistant tail. */
+  stream(sessionId: string, text: string, reasoning = ''): void {
+    const session = this.requireSession(sessionId)
+    session.streamText = text
+    session.streamReasoning = reasoning
+    for (const handle of this.handles) {
+      if (handle.id === sessionId) handle.notify()
+    }
+  }
+
   /** Test helper: create a pending approval without starting a real turn. */
   askApproval(sessionId: string, question: NonNullable<SessionView['pendingApproval']>): void {
     const session = this.requireSession(sessionId)

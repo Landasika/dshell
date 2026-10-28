@@ -40,3 +40,13 @@ pnpm-debug.log*
 # CI/local npm cache
 .cache/
 
+# Promo video intermediates (run docs/promo/record.sh to regenerate)
+docs/promo/out/frames/
+docs/promo/out/frames.jsonl
+docs/promo/out/frames.txt
+docs/promo/out/captions.json
+docs/promo/out/meta.json
+
+# Python bytecode
+__pycache__/
+*.pyc
