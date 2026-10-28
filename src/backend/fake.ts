@@ -303,6 +303,13 @@ export class FakeBackend implements DshellBackend {
     return true
   }
 
+  /** Drop the inbox work for one session (a plain cancel without keepInbox). */
+  dropQueued(sessionId: string): void {
+    for (let index = this.queuedPrompts.length - 1; index >= 0; index -= 1) {
+      if (this.queuedPrompts[index]?.sessionId === sessionId) this.queuedPrompts.splice(index, 1)
+    }
+  }
+
   /** Test helper: deliver a steered prompt into the running turn. */
   deliverSteer(sessionId: string): boolean {
     const index = this.queuedPrompts.findIndex((entry) => entry.sessionId === sessionId && entry.mode === 'steer')
@@ -476,7 +483,8 @@ class FakeSessionHandle implements SessionHandle {
   async cancel(): Promise<void> {
     this.assertOpen()
     if (this.session.status !== 'running') return
-    this.session.status = 'idle'
+    // A cancel drops the inbox with the aborted turn, like the Host does.
+    this.backend.dropQueued(this.id)
     this.append({
       type: 'turn/end',
       seq: this.session.cursor + 1,

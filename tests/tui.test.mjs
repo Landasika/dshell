@@ -1663,10 +1663,15 @@ test('enter steers into the running turn and alt+enter queues behind it', async 
   input.push('\u001b\r')
   await waitFor(() => output.text.includes('◷ queued'), 'the queued marker')
 
+  // Ctrl-C aborts the running turn but hands the queued prompt back, so it
+  // starts instead of disappearing with the aborted turn.
   output.text = ''
-  assert.equal(backend.startQueued('s1'), true)
-  await waitFor(() => output.text.includes('after this'), 'the queued prompt in the transcript')
-  assert.equal(output.text.includes('◷ queued'), false)
+  input.push('\u0003')
+  await waitFor(
+    () => output.text.includes('after this') && !output.text.includes('◷ queued'),
+    'the queued prompt restarted after cancel',
+  )
+  assert.equal(output.text.includes('cancelled this turn'), true)
 
   input.push('\u0003')
   input.push('\u0004')

@@ -7,6 +7,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- `Ctrl-C` in a running turn aborts that turn and then continues the `Alt+Enter`
+  queue: an abort drops the Host inbox, so the TUI re-queues the prompts it is
+  still tracking (the Host then starts them as soon as the abort settles —
+  verified: `turn/end aborted` → `turn/start` → `user/message`).
 - `Enter` while a turn is running now **steers**: the prompt joins the running
   turn instead of waiting behind it (Claude Code's default). `Alt+Enter` is the
   queue key that waits for the current turn to finish; `Ctrl-J` (and

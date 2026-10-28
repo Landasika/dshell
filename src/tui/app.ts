@@ -651,12 +651,29 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const cancel = async (): Promise<void> => {
     if (state.handle === undefined) return
+    // The Host drops its inbox together with the aborted turn, so keep our own
+    // copy and hand it back right away: the queued prompts then start as soon
+    // as the abort settles, which is what Ctrl-C should mean.
+    const pending = state.queued.map((entry) => entry.text)
+    state.queued = []
     try {
       await state.handle.cancel()
       state.status = 'cancelling'
-      toast('cancel requested; the Host decides when the turn stops')
+      toast(
+        pending.length === 0
+          ? 'cancel requested; the Host decides when the turn stops'
+          : `cancelled this turn; ${String(pending.length)} queued prompt${pending.length === 1 ? ' continues' : 's continue'}`,
+      )
     } catch (error) {
       state.error = errorText(error)
+    }
+    for (const text of pending) {
+      try {
+        const receipt = await state.handle.send(text, { mode: 'queue' })
+        state.queued.push({ requestId: receipt.requestId, text, at: Date.now(), mode: 'queue' })
+      } catch (error) {
+        state.error = errorText(error)
+      }
     }
     schedule()
   }

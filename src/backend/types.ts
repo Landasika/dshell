@@ -135,7 +135,7 @@ export interface SessionHandle {
   snapshot(): SessionView
 
   send(text: string, options?: SendOptions): Promise<SendReceipt>
-  cancel(reason?: string): Promise<void>
+  cancel(): Promise<void>
   /** Load one older page. Returns false when the beginning is reached. */
   loadOlder(limit?: number): Promise<boolean>
   answerApproval(requestId: string, outcome: 'allowed-once' | 'rejected'): Promise<void>

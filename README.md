@@ -248,7 +248,7 @@ the official API.
 | `Ctrl-O` | expand/fold thinking and lifecycle blocks |
 | `?` | help & shortcuts (when the composer is empty) |
 | `Esc` | close a menu/overlay or clear the composer; double-`Esc` on an empty idle composer opens rewind |
-| `Ctrl-C` | clear input, cancel a running turn, or quit |
+| `Ctrl-C` | clear input, cancel a running turn (the `Alt+Enter` queue continues), or quit |
 | `Ctrl-D` | quit when the composer is empty |
 
 Typing while a turn is running does not get lost, and `Enter` keeps the Claude
@@ -256,8 +256,9 @@ Code habit: the message is **steered** into the running turn, so the agent sees
 it at its next step and the transcript shows it as a normal user message
 (`◷ steering · …` marks the gap until then). `Alt+Enter` queues the prompt
 instead — the Host holds it and starts a fresh turn after the current one
-(`◷ queued · …`). `Ctrl-C` cancels the running turn; that also drops prompts
-still queued with `Alt+Enter`.
+(`◷ queued · …`). `Ctrl-C` aborts the running turn and the prompts you queued
+with `Alt+Enter` continue right after it: the Host drops its inbox with an
+abort, so the TUI hands those prompts back itself.
 
 `Ctrl-C`/`Ctrl-D`/`Esc` quitting only closes this view; it never cancels the
 Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
