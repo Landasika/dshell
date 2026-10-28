@@ -235,7 +235,10 @@ the official API.
 | `Ctrl-J`, `Shift+Enter` | newline |
 | `Tab` | complete `/` command or `@` file |
 | `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history (seeded from the session's durable transcript) |
-| `Alt+↑`/`Alt+↓` | scroll the transcript three lines (same as the wheel) |
+| `Alt+↑`/`Alt+↓` | move a selection from block to block: messages, tool calls, subagent rows, then the queued prompts |
+| `Enter` (with a selection) | open it: tool details, the subagent list (`≈ /agents`), or pull a queued prompt back into the composer to edit it |
+| `Alt+Backspace` | delete the selected queued prompt |
+| `Esc` | clear the selection |
 | `PgUp`/`PgDn`, wheel | page or line scroll of the transcript |
 | drag | select transcript text and copy it (OSC 52); `Shift+drag` uses the terminal's own selection |
 | `Ctrl-R` | search prompts sent in this session |

@@ -303,6 +303,22 @@ export class FakeBackend implements DshellBackend {
     return true
   }
 
+  /** Remove one queued prompt; returns false when it already started. */
+  removeQueued(sessionId: string, requestId: string): boolean {
+    const index = this.queuedPrompts.findIndex((entry) => entry.sessionId === sessionId && entry.requestId === requestId)
+    if (index < 0) return false
+    this.queuedPrompts.splice(index, 1)
+    return true
+  }
+
+  /** Rewrite one queued prompt in place. */
+  editQueued(sessionId: string, requestId: string, text: string): boolean {
+    const entry = this.queuedPrompts.find((item) => item.sessionId === sessionId && item.requestId === requestId)
+    if (entry === undefined) return false
+    entry.text = text
+    return true
+  }
+
   /** Drop the inbox work for one session (a plain cancel without keepInbox). */
   dropQueued(sessionId: string): void {
     for (let index = this.queuedPrompts.length - 1; index >= 0; index -= 1) {
@@ -478,6 +494,21 @@ class FakeSessionHandle implements SessionHandle {
       data: { reason: options.mode === 'steer' ? { kind: 'steered' } : { kind: 'completed' } },
     })
     return { requestId }
+  }
+
+  async removeQueued(requestId: string): Promise<void> {
+    this.assertOpen()
+    if (!this.backend.removeQueued(this.id, requestId)) {
+      throw new BackendError('QUEUE_ITEM_NOT_FOUND', 'that prompt is no longer queued')
+    }
+  }
+
+  async editQueued(requestId: string, text: string): Promise<void> {
+    this.assertOpen()
+    if (text.trim().length === 0) throw new BackendError('BAD_REQUEST', 'a queued prompt cannot be empty')
+    if (!this.backend.editQueued(this.id, requestId, text)) {
+      throw new BackendError('QUEUE_ITEM_NOT_FOUND', 'that prompt is no longer queued')
+    }
   }
 
   async cancel(): Promise<void> {

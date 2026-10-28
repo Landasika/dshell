@@ -34,6 +34,7 @@ export type Key =
   | { type: 'ctrl-o' }
   | { type: 'ctrl-g' }
   | { type: 'alt-enter' }
+  | { type: 'alt-backspace' }
   | { type: 'alt-up' }
   | { type: 'alt-down' }
   | { type: 'focus'; focused: boolean }
@@ -70,6 +71,7 @@ const SEQUENCES: Record<string, Key> = {
   '\u001b[1;5A': { type: 'up' },
   '\u001b[1;5B': { type: 'down' },
   '\u001b\r': { type: 'alt-enter' },
+  '\u001b\u007f': { type: 'alt-backspace' },
   // Shift+Enter as reported by terminals with the kitty/modifyOtherKeys
   // extensions; plain terminals send the same bytes as Enter.
   '\u001b[13;2u': { type: 'newline' },

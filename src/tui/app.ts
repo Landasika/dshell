@@ -23,7 +23,15 @@ import type {
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
 import { createEditor, editKey, insertText, type EditorState } from './editor.js'
-import { buildBlocks, isInjectedContext, renderBlocks, turnFailureMessage, type Block } from './events.js'
+import {
+  buildBlocks,
+  isInjectedContext,
+  renderBlocks,
+  renderBlocksWithRanges,
+  turnFailureMessage,
+  type Block,
+  type BlockRange,
+} from './events.js'
 import { renderMarkdown } from './markdown.js'
 import { TerminalScreen, Viewport } from './screen.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
@@ -119,6 +127,7 @@ type Overlay =
     }
   | { kind: 'confirm'; title: string; lines: string[]; index: number; onYes: () => void }
   | { kind: 'agentView'; childId: string; label: string; lines: string[]; scroll: number; loading: boolean; error?: string }
+  | { kind: 'detail'; title: string; lines: string[]; scroll: number }
 
 interface AppState {
   sessions: SessionSummary[]
@@ -152,6 +161,10 @@ interface AppState {
   modelEfforts: Record<string, string>
   /** Prompts handed to the running turn, shown until they reach the transcript. */
   queued: { requestId: string; text: string; at: number; mode: 'queue' | 'steer' }[]
+  /** Index into the navigable transcript items (blocks, then queued rows). */
+  focus?: number
+  /** A queued prompt pulled back into the composer for editing. */
+  editingQueued?: { requestId: string; text: string; mode: 'queue' | 'steer' }
   /** Provider rows read from the Host's patch file. */
   providers?: ProviderList
 }
@@ -309,6 +322,24 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve
   })
+
+  /** Paint a full-width band behind a line, keeping its own colours intact. */
+  const selectionBand = (line: string): string => {
+    if (!theme.enabled) return line
+    const background = '\u001b[48;5;237m'
+    return `${background}${line.split(theme.reset).join(`${theme.reset}${background}`)}${theme.reset}`
+  }
+
+  const focusLabel = (item: FocusItem): string => {
+    if (item.kind === 'queue') return `queued · ${item.queue?.text.replace(/\s+/g, ' ').slice(0, 40) ?? ''}`
+    const block = item.block
+    if (block === undefined) return 'block'
+    if (block.kind === 'tool') return `tool · ${block.toolName ?? 'call'}`
+    if (block.kind === 'notice') return block.title ?? 'notice'
+    if (block.kind === 'user') return `you · ${block.body.replace(/\s+/g, ' ').slice(0, 40)}`
+    if (block.kind === 'assistant') return `dshell · ${block.body.replace(/\s+/g, ' ').slice(0, 40)}`
+    return block.kind
+  }
 
   const schedule = (): void => {
     if (renderTimer !== undefined) return
@@ -1434,6 +1465,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    if (overlay.kind === 'detail') {
+      const total = overlay.lines.length
+      const height = Math.max(4, lastBodyHeight)
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.scroll = Math.max(0, overlay.scroll - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') overlay.scroll = Math.min(Math.max(0, total - 1), overlay.scroll + 1)
+      else if (key.type === 'page-up') overlay.scroll = Math.max(0, overlay.scroll - height)
+      else if (key.type === 'page-down') overlay.scroll = Math.min(Math.max(0, total - 1), overlay.scroll + height)
+      schedule()
+      return
+    }
     if (overlay.kind === 'dashboard') {
       if (key.type === 'ctrl-b') state.overlay = null
       schedule()
@@ -1836,6 +1877,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       openAgents()
       return
     }
+    if (key.type === 'escape' && state.editingQueued !== undefined) {
+      cancelQueuedEdit()
+      return
+    }
+    if (key.type === 'escape' && state.focus !== undefined) {
+      state.focus = undefined
+      schedule()
+      return
+    }
     if (key.type === 'escape' && viewport.scrollOffset > 0) {
       // Codex semantics: Esc returns to the live tail before it clears input.
       viewport.reset()
@@ -1919,10 +1969,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (key.type === 'alt-up' || key.type === 'alt-down') {
-      // The wheel and Alt+arrows move the transcript; plain arrows stay on
-      // prompt history so readline muscle memory keeps working.
-      viewport.scroll(key.type === 'alt-up' ? 3 : -3, transcriptLineCount(), transcriptHeight())
-      schedule()
+      // Walk a selection from block to block (messages, tools, subagents, then
+      // the queued prompts); plain arrows stay on prompt history.
+      moveFocus(key.type === 'alt-up' ? -1 : 1)
+      return
+    }
+    if (key.type === 'alt-backspace') {
+      const items = focusItems()
+      const item = state.focus === undefined ? undefined : items[state.focus]
+      if (item !== undefined && item.kind === 'queue' && item.queue !== undefined) void dropQueuedPrompt(item.queue)
       return
     }
     if (key.type === 'page-up') {
@@ -1965,6 +2020,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         return
       }
       const text = state.editor.text
+      if (state.editingQueued !== undefined) {
+        void commitQueuedEdit(text)
+        return
+      }
+      if (text.length === 0 && state.focus !== undefined) {
+        activateFocus()
+        return
+      }
       if (isCommand(text)) {
         state.editor = createEditor()
         state.completion = undefined
@@ -2036,16 +2099,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
-  const transcript = (): { lines: string[]; live: boolean } => {
+  const transcript = (): { lines: string[]; live: boolean; ranges: BlockRange[] } => {
     const view = state.view
     const width = Math.max(20, screen.size.columns - 2)
-    if (view === undefined) return { lines: [paint(theme, 'muted', 'connecting to the dsh Host…')], live: false }
+    if (view === undefined) {
+      return { lines: [paint(theme, 'muted', 'connecting to the dsh Host…')], live: false, ranges: [] }
+    }
     const events = view.events.filter((event) => event.seq > state.clearedAtSeq)
     // Todos live in the footer strip and the session panel; keeping their
     // historical snapshots inline would repeat the same list after every
     // update.
     const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
-    const lines = renderBlocks(blocks, width, theme)
+    const rendered = renderBlocksWithRanges(blocks, width, theme)
+    const lines = rendered.lines
+    const ranges = rendered.ranges
     if (view.streamReasoning.length > 0 && view.status === 'running') {
       const recent = view.streamReasoning
         .split('\n')
@@ -2066,7 +2133,143 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       lines.push(...renderMarkdown(view.streamText, width, theme))
       lines.push(paint(theme, 'accent', '▌'))
     }
-    return { lines, live: view.status === 'running' }
+    return { lines, live: view.status === 'running', ranges }
+  }
+
+  interface FocusItem {
+    start: number
+    end: number
+    kind: 'block' | 'queue'
+    block?: Block
+    queue?: { requestId: string; text: string; at: number; mode: 'queue' | 'steer' }
+  }
+
+  /** Blocks in transcript order, then the queued prompt rows below them. */
+  const buildFocusItems = (ranges: readonly BlockRange[], lineCount: number): FocusItem[] => {
+    const items: FocusItem[] = []
+    for (const range of ranges) {
+      if (range.block.kind === 'turn') continue
+      items.push({ start: range.start, end: range.end, kind: 'block', block: range.block })
+    }
+    for (const entry of state.queued) {
+      items.push({ start: lineCount, end: lineCount, kind: 'queue', queue: entry })
+    }
+    return items
+  }
+
+  const focusItems = (): FocusItem[] => {
+    const data = transcript()
+    return buildFocusItems(data.ranges, data.lines.length)
+  }
+
+  const moveFocus = (delta: number): void => {
+    const data = transcript()
+    const items = buildFocusItems(data.ranges, data.lines.length)
+    if (items.length === 0) return
+    const current = state.focus
+    const next = current === undefined
+      ? delta < 0 ? items.length - 1 : 0
+      : Math.max(0, Math.min(items.length - 1, current + delta))
+    state.focus = next
+    const item = items[next]
+    if (item !== undefined) {
+      if (item.kind === 'queue') viewport.reset()
+      else viewport.reveal(item.start, data.lines.length, transcriptHeight())
+    }
+    schedule()
+  }
+
+  /** Pull one queued prompt back into the composer so it can be rewritten. */
+  const beginQueuedEdit = (entry: { requestId: string; text: string; mode: 'queue' | 'steer' }): void => {
+    state.queued = state.queued.filter((item) => item.requestId !== entry.requestId)
+    state.editingQueued = { requestId: entry.requestId, text: entry.text, mode: entry.mode }
+    state.editor = createEditor(entry.text)
+    state.focus = undefined
+    toast('editing a queued prompt · enter saves · esc keeps it queued')
+    schedule()
+  }
+
+  const cancelQueuedEdit = (): void => {
+    const editing = state.editingQueued
+    if (editing === undefined) return
+    state.editingQueued = undefined
+    state.queued.push({ requestId: editing.requestId, text: editing.text, at: Date.now(), mode: editing.mode })
+    state.editor = createEditor()
+    toast('queued prompt kept as it was')
+    schedule()
+  }
+
+  const commitQueuedEdit = async (text: string): Promise<void> => {
+    const editing = state.editingQueued
+    if (editing === undefined) return
+    const trimmed = text.replace(/\s+$/, '')
+    if (trimmed.length === 0) {
+      toast('a queued prompt cannot be empty')
+      return
+    }
+    state.editingQueued = undefined
+    state.editor = createEditor()
+    state.historyIndex = -1
+    schedule()
+    if (trimmed !== editing.text && state.handle !== undefined) {
+      try {
+        await state.handle.editQueued(editing.requestId, trimmed)
+      } catch (error) {
+        state.error = errorText(error)
+        schedule()
+        return
+      }
+    }
+    state.queued.push({ requestId: editing.requestId, text: trimmed, at: Date.now(), mode: editing.mode })
+    toast('queued prompt updated')
+    schedule()
+  }
+
+  const activateFocus = (): void => {
+    const items = focusItems()
+    const item = state.focus === undefined ? undefined : items[state.focus]
+    if (item === undefined) return
+    if (item.kind === 'queue' && item.queue !== undefined) {
+      beginQueuedEdit(item.queue)
+      return
+    }
+    const block = item.block
+    if (block === undefined) return
+    if (block.kind === 'tool') {
+      const width = Math.max(20, screen.size.columns - 10)
+      const body: string[] = [
+        `${paint(theme, 'bold', paint(theme, 'accentSoft', block.toolName ?? 'tool'))}${block.failed === true ? ` ${paint(theme, 'error', '· failed')}` : ''}`,
+      ]
+      if (block.title !== undefined && block.title !== block.toolName) body.push(paint(theme, 'muted', block.title))
+      if (block.body.length > 0) body.push('', ...wrapText(block.body, width).map((line) => paint(theme, 'text', line)))
+      if (block.detail !== undefined && block.detail.length > 0) {
+        body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'result')), ...wrapText(block.detail, width).map((line) => paint(theme, 'muted', line)))
+      }
+      state.overlay = { kind: 'detail', title: `tool · ${block.toolName ?? 'call'}`, lines: body, scroll: 0 }
+      schedule()
+      return
+    }
+    if (block.kind === 'notice' && /agent (started|running|finished|failed)|^subagent /.test(block.title ?? '')) {
+      state.overlay = { kind: 'agents', index: 0 }
+      schedule()
+      return
+    }
+    toast('enter opens tool details, subagents (≈ /agents) and queued prompts')
+  }
+
+  /** Delete one queued prompt both locally and in the Host inbox. */
+  const dropQueuedPrompt = async (entry: { requestId: string; text: string; mode: 'queue' | 'steer' }): Promise<void> => {
+    state.queued = state.queued.filter((item) => item.requestId !== entry.requestId)
+    state.focus = undefined
+    schedule()
+    if (state.handle === undefined) return
+    try {
+      await state.handle.removeQueued(entry.requestId)
+      toast('queued prompt deleted')
+    } catch (error) {
+      state.error = errorText(error)
+    }
+    schedule()
   }
 
   // The renderer measures the footer, menu and composer each frame; PgUp/PgDn
@@ -2178,7 +2381,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'keys')), '')
       body.push(`${paint(theme, 'text', pad('enter', 15))} send/steer · ${paint(theme, 'text', 'alt+enter')} queue · ${paint(theme, 'text', 'ctrl+j')} newline`)
       body.push(`${paint(theme, 'text', pad('tab', 15))} complete · ${paint(theme, 'text', 'shift+enter')} newline (kitty-style terminals)`)
-      body.push(`${paint(theme, 'text', pad('up / down', 15))} prompt history · ${paint(theme, 'text', 'alt+up/down')} scroll transcript`)
+      body.push(`${paint(theme, 'text', pad('up / down', 15))} prompt history · ${paint(theme, 'text', 'pgup/pgdn')} scroll`)
+      body.push(`${paint(theme, 'text', pad('alt+up/down', 15))} select blocks · ${paint(theme, 'text', 'enter')} open · ${paint(theme, 'text', 'esc')} clear`)
+      body.push(`${paint(theme, 'text', pad('alt+backspace', 15))} delete the selected queued prompt`)
       body.push(`${paint(theme, 'text', pad('pgup / pgdn', 15))} page scroll · ${paint(theme, 'text', 'wheel')} 3 lines`)
       body.push(`${paint(theme, 'text', pad('drag', 15))} select & copy text (shift+drag: terminal)`)
       body.push(`${paint(theme, 'text', pad('ctrl+r', 15))} history search · ${paint(theme, 'text', 'ctrl+b')} session panel`)
@@ -2420,6 +2625,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · backspace back · esc close')],
       })
     }
+    if (overlay.kind === 'detail') {
+      const height = Math.max(4, rows - 12)
+      const body = overlay.lines.slice(overlay.scroll, overlay.scroll + height)
+      return panelBox(theme, overlay.title, body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · esc close')],
+      })
+    }
     if (overlay.kind === 'dashboard') {
       const metrics = currentMetrics()
       const view = state.view
@@ -2588,10 +2800,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const header = headerLines()
     const overlay = overlayLines()
     const toastActive = state.toast !== undefined && state.toast.until > now
+    let focusHint: string | undefined
+    if (state.focus !== undefined) {
+      const data = transcript()
+      const items = buildFocusItems(data.ranges, data.lines.length)
+      const index = Math.min(state.focus, Math.max(0, items.length - 1))
+      const item = items[index]
+      if (item !== undefined) {
+        focusHint = `▸ ${String(index + 1)}/${String(items.length)} · ${focusLabel(item)} · enter open · esc clear`
+      }
+    }
     const notice = toastActive
       ? state.toast?.text
       : state.error === undefined
-        ? undefined
+        ? focusHint
         : `! ${state.error}`
     const lines: string[] = []
     let cursor: { row: number; column: number } | undefined
@@ -2627,10 +2849,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (viewport.scrollOffset === 0) seenTranscriptTotal = total
     const unseen = Math.max(0, total - seenTranscriptTotal)
     const pill = viewport.scrollOffset === 0 ? undefined : renderJumpToBottom(theme, unseen, columns)
+    const focusOrder = buildFocusItems(transcriptData.ranges, transcriptData.lines.length)
+    const focused = state.focus === undefined ? undefined : focusOrder[state.focus]
     const queuedRows = state.queued.slice(-2).map((entry) => {
       const oneLine = entry.text.replace(/\s+/g, ' ').trim()
       const label = entry.mode === 'steer' ? 'steering' : 'queued'
-      return paint(theme, 'dim', truncate(`  ◷ ${label} · ${oneLine}`, columns))
+      const row = paint(theme, 'dim', truncate(`  ◷ ${label} · ${oneLine}`, columns))
+      const selected = focused?.kind === 'queue' && focused.queue?.requestId === entry.requestId
+      return selected ? selectionBand(row) : row
     })
     const bodyHeight = Math.max(
       3,
@@ -2647,7 +2873,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     lastBodyHeight = bodyHeight
     const visible = viewport.visible(transcriptData.lines, bodyHeight)
     lines.push(...header)
-    lines.push(...visible.lines)
+    for (let index = 0; index < visible.lines.length; index += 1) {
+      const line = visible.lines[index] ?? ''
+      const absolute = visible.start + index
+      const selected =
+        focused !== undefined && focused.kind === 'block' && absolute >= focused.start && absolute < focused.end
+      lines.push(selected ? selectionBand(line) : line)
+    }
     for (let index = visible.lines.length; index < bodyHeight; index += 1) lines.push('')
     if (queuedRows.length > 0) lines.push(...queuedRows)
     if (notice !== undefined) {

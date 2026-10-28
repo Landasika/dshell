@@ -66,12 +66,20 @@ interface UserMessageLike {
   source: { kind: 'user' }
 }
 
+interface InboxLike {
+  nextTurn: readonly UserMessageLike[]
+  nextStep: readonly UserMessageLike[]
+  remove(id: string): void
+  replace(id: string, message: UserMessageLike): void
+}
+
 interface AgentLike {
   id: string
   session: { id: string }
   followup(message: UserMessageLike): void
   steer(message: UserMessageLike): void
   cancel(cause: { kind: 'user' }): void
+  inbox?: InboxLike
 }
 
 interface AgentHandleLike {
@@ -1166,6 +1174,46 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
   }
 
+  const queuedMessage = (agent: AgentLike, requestId: string): UserMessageLike | undefined => {
+    const inbox = agent.inbox
+    if (inbox === undefined) return undefined
+    return [...inbox.nextTurn, ...inbox.nextStep].find((message) => message.id === requestId)
+  }
+
+  const queueEdit = (socket: Socket, message: Record<string, unknown>): void => {
+    if (typeof message.sessionId !== 'string' || typeof message.requestId !== 'string' || typeof message.text !== 'string') {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'queue/edit needs sessionId, requestId and text' })
+      return
+    }
+    const agent = ctx.agents.get(message.sessionId)
+    const pending = agent === undefined ? undefined : queuedMessage(agent, message.requestId)
+    if (agent === undefined || agent.inbox === undefined || pending === undefined) {
+      sendError(socket, { type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'that prompt is no longer queued' })
+      return
+    }
+    if (message.text.trim().length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'a queued prompt cannot be empty' })
+      return
+    }
+    agent.inbox.replace(message.requestId, { ...pending, content: [{ type: 'text', text: message.text }] })
+    jsonLine(socket, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'edit' })
+  }
+
+  const queueRemove = (socket: Socket, message: Record<string, unknown>): void => {
+    if (typeof message.sessionId !== 'string' || typeof message.requestId !== 'string') {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'queue/remove needs a sessionId and requestId' })
+      return
+    }
+    const agent = ctx.agents.get(message.sessionId)
+    const pending = agent === undefined ? undefined : queuedMessage(agent, message.requestId)
+    if (agent === undefined || agent.inbox === undefined || pending === undefined) {
+      sendError(socket, { type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'that prompt is no longer queued' })
+      return
+    }
+    agent.inbox.remove(message.requestId)
+    jsonLine(socket, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'remove' })
+  }
+
   const settleApproval = (
     requestId: string,
     outcome: string,
@@ -1304,6 +1352,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'session/cancel':
           cancel(socket, message)
+        case 'queue/edit':
+          queueEdit(socket, message)
+        case 'queue/remove':
+          queueRemove(socket, message)
           return
         case 'approval/answer':
           answerApproval(socket, message)

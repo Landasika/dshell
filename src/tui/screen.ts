@@ -177,6 +177,15 @@ export class Viewport {
     this.offset = Math.max(0, total - height)
   }
 
+  /** Scroll the window just enough to show the absolute line `index`. */
+  reveal(index: number, total: number, height: number): void {
+    const max = Math.max(0, total - height)
+    const offset = Math.min(this.offset, max)
+    const start = Math.max(0, total - height - offset)
+    if (index < start) this.offset = Math.max(0, Math.min(max, total - height - index))
+    else if (index >= start + height) this.offset = Math.max(0, Math.min(max, total - index - 1))
+  }
+
   visible(all: readonly string[], height: number): { lines: string[]; start: number } {
     const max = Math.max(0, all.length - height)
     this.offset = Math.min(this.offset, max)

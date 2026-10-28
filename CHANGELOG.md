@@ -5,6 +5,17 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
+### Added
+
+- `Alt+↑`/`Alt+↓` walk a selection across the transcript — user and assistant
+  messages, tool calls, subagent rows, then the queued prompts — with the
+  focused row banded and named above the composer. `Enter` opens the selection:
+  a tool call shows its arguments and result in a scrollable panel, a subagent
+  row opens the `/agents` list, and a queued prompt is pulled back into the
+  composer for editing. `Alt+Backspace` deletes the selected queued prompt
+  (through a new `queue/remove` Host command; `queue/edit` rewrites it in
+  place), and `Esc` clears the selection.
+
 ### Changed
 
 - `Ctrl-C` in a running turn aborts that turn and then continues the `Alt+Enter`

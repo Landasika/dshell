@@ -14,6 +14,7 @@ import type {
   ProviderField,
   ProviderListMessage,
   ProviderUpdatedMessage,
+  QueueUpdatedMessage,
   ServerMessage,
   SessionCreatedMessage,
   SessionEvent,
@@ -39,6 +40,11 @@ import {
 function mapError(error: unknown): BackendError {
   if (error instanceof BackendError) return error
   if (error instanceof DshellError) {
+    // A Host that predates a command answers "unknown message type"; point at
+    // the restart instead of a bare BAD_REQUEST.
+    if (/unknown message type/i.test(error.message)) {
+      return new BackendError('UNSUPPORTED_CAPABILITY', error.message, 'restart the Host to load the current dshell-host plugin')
+    }
     return new BackendError(error.code, error.message, error.action)
   }
   return new BackendError('INTERNAL', error instanceof Error ? error.message : String(error))
@@ -455,6 +461,29 @@ export class SocketSessionHandle implements SessionHandle {
   async cancel(): Promise<void> {
     this.assertOpen()
     this.connection.send({ type: 'session/cancel', sessionId: this.id })
+  }
+
+  async removeQueued(requestId: string): Promise<void> {
+    this.assertOpen()
+    this.connection.send({ type: 'queue/remove', sessionId: this.id, requestId })
+    await this.awaitQueueUpdate(requestId, 'remove')
+  }
+
+  async editQueued(requestId: string, text: string): Promise<void> {
+    this.assertOpen()
+    this.connection.send({ type: 'queue/edit', sessionId: this.id, requestId, text })
+    await this.awaitQueueUpdate(requestId, 'edit')
+  }
+
+  private async awaitQueueUpdate(requestId: string, action: 'edit' | 'remove'): Promise<void> {
+    try {
+      await this.connection.waitFor<QueueUpdatedMessage>(
+        (candidate) => candidate.type === 'queue-updated' && candidate.requestId === requestId && candidate.action === action,
+        10_000,
+      )
+    } catch (error) {
+      throw mapError(error)
+    }
   }
 
   async loadOlder(limit = 50): Promise<boolean> {

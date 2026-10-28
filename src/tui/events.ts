@@ -378,16 +378,45 @@ function renderBody(
 }
 
 /** Render display blocks to lines with labels, gutters and colors. */
+/** One rendered block and the transcript rows it occupies. */
+export interface BlockRange {
+  block: Block
+  /** First row (inclusive). */
+  start: number
+  /** Last row (exclusive). */
+  end: number
+}
+
+export interface RenderedBlocks {
+  lines: string[]
+  ranges: BlockRange[]
+}
+
 export function renderBlocks(
   blocks: readonly Block[],
   width: number,
   theme: Theme,
   options: RenderOptions = {},
 ): string[] {
+  return renderBlocksWithRanges(blocks, width, theme, options).lines
+}
+
+/**
+ * Render blocks and report where each one landed, so the UI can move a
+ * selection from block to block without re-measuring the transcript.
+ */
+export function renderBlocksWithRanges(
+  blocks: readonly Block[],
+  width: number,
+  theme: Theme,
+  options: RenderOptions = {},
+): RenderedBlocks {
   const out: string[] = []
+  const ranges: BlockRange[] = []
   const separatorWidth = Math.max(4, Math.min(width, 24))
   for (const block of blocks) {
     if (out.length > 0) out.push('')
+    const start = out.length
     switch (block.kind) {
       case 'user': {
         // Quote-style prompt: `> hello`, continuation lines aligned under it.
@@ -467,8 +496,9 @@ export function renderBlocks(
         break
       }
     }
+    ranges.push({ block, start, end: out.length })
   }
-  return out
+  return { lines: out, ranges }
 }
 
 /** Build and render in one call; useful for tests and one-shot output. */

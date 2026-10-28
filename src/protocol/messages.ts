@@ -32,6 +32,7 @@ export type DshellErrorCode =
   | 'SESSION_NOT_FOUND'
   | 'SESSION_ALREADY_LIVE'
   | 'APPROVAL_NOT_PENDING'
+  | 'QUEUE_ITEM_NOT_FOUND'
   | 'BAD_REQUEST'
   | 'INTERNAL'
 
@@ -245,6 +246,13 @@ export interface CancelledMessage {
   requestId?: string
 }
 
+export interface QueueUpdatedMessage {
+  type: 'queue-updated'
+  sessionId: string
+  requestId: string
+  action: 'edit' | 'remove'
+}
+
 export interface EventMessage {
   type: 'event'
   sessionId: string
@@ -304,6 +312,8 @@ export type ClientMessage =
   | { type: 'session/create'; cwd?: string; workspaceId?: string; title?: string }
   | { type: 'session/history'; sessionId: string; before?: number; limit?: number }
   | { type: 'session/cancel'; sessionId: string; requestId?: string }
+  | { type: 'queue/edit'; sessionId: string; requestId: string; text: string }
+  | { type: 'queue/remove'; sessionId: string; requestId: string }
   | {
       type: 'prompt'
       sessionId: string
@@ -339,6 +349,7 @@ export type ServerMessage =
   | SessionCreatedMessage
   | AcceptedMessage
   | CancelledMessage
+  | QueueUpdatedMessage
   | EventMessage
   | StreamMessage
   | StatusMessage

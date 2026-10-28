@@ -1018,7 +1018,7 @@ test('TUI opens on the picker with real titles instead of flashing the chat shel
   await backend.disconnect()
 })
 
-test('wheel and Alt+arrows scroll the transcript while plain arrows recall history', async () => {
+test('wheel scrolls and Alt+arrows select blocks while plain arrows recall history', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
   const { FakeBackend } = await import('../dist/backend/index.js')
@@ -1073,11 +1073,13 @@ test('wheel and Alt+arrows scroll the transcript while plain arrows recall histo
   input.push('\u001b[F')
   await waitFor(() => output.text.length > at && !output.text.slice(at).includes('Jump to bottom'))
 
-  // Alt+Up scrolls as well.
+  // Alt+Up walks a selection instead of scrolling: the notice line names the
+  // focused block, Enter opens it, Esc clears it.
   at = output.text.length
   input.push('\u001b[1;3A')
-  await waitFor(() => output.text.slice(at).includes('Jump to bottom'))
-  input.push('\u001b[F')
+  await waitFor(() => stripAnsi(output.text.slice(at)).includes('▸'))
+  assert.match(stripAnsi(output.text.slice(at)), /enter open · esc clear/)
+  input.push('\u001b')
   await new Promise((resolve) => setTimeout(resolve, 40))
 
   // A prompt sent in this run is recalled too.
@@ -1676,4 +1678,168 @@ test('enter steers into the running turn and alt+enter queues behind it', async 
   input.push('\u0003')
   input.push('\u0004')
   assert.equal(await app, 0)
+})
+
+test('alt+arrows walk blocks and enter opens tools and subagents', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'list the files' }] } } },
+    { type: 'tool/call', seq: 2, data: { name: 'bash', callId: 'c1', arguments: '{"command":"ls","description":"List files"}' } },
+    { type: 'tool/result', seq: 3, data: { message: { toolCallId: 'c1', isError: false, content: [{ type: 'text', text: 'a.txt\nb.txt' }] } } },
+    { type: 'subagent/catalog', seq: 4, data: { childId: 'agent-1234567890', label: 'scanner' } },
+    { type: 'assistant/message', seq: 5, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } } },
+    { type: 'turn/end', seq: 6, data: { reason: { kind: 'completed' } } },
+  ]
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+  // Alt+Down starts at the first block; each press moves one block down.
+  output.text = ''
+  input.push('\u001b[1;3B')
+  await waitFor(() => stripAnsi(output.text).includes('enter open'), 'the focus hint')
+  assert.match(stripAnsi(output.text), /▸ 1\//)
+  assert.match(stripAnsi(output.text), /you · list the files/)
+
+  // Enter on the tool block opens its details.
+  output.text = ''
+  input.push('\u001b[1;3B')
+  input.push('\r')
+  await waitFor(() => stripAnsi(output.text).includes('pgup/pgdn'), 'the tool detail panel')
+  assert.match(stripAnsi(output.text), /List files · ls/)
+  assert.match(stripAnsi(output.text), /a\.txt/)
+  output.text = ''
+  input.push('\u001b')
+  await waitFor(() => !stripAnsi(output.text).includes('pgup/pgdn'), 'the detail panel to close')
+
+  // Enter on the subagent row opens the /agents list.
+  output.text = ''
+  input.push('\u001b[1;3B')
+  input.push('\r')
+  await waitFor(() => /subagents? in this session/.test(stripAnsi(output.text)), 'the agents panel')
+
+  input.push('\u001b')
+  input.push('\u001b')
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
+
+test('a queued prompt can be edited or deleted from the block cursor', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-700))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    backend.emit('s1', { type: 'turn/start', seq: 1, data: { turn: 1 } })
+    await waitFor(() => output.text.includes('running'), 'the running status')
+
+    output.text = ''
+    input.push('draft this')
+    input.push('\u001b\r')
+    await waitFor(() => stripAnsi(output.text).includes('◷ queued'), 'the queued marker')
+
+    // Alt+Up lands on the queued row (it is the last item).
+    output.text = ''
+    input.push('\u001b[1;3A')
+    await waitFor(() => stripAnsi(output.text).includes('▸') && stripAnsi(output.text).includes('queued'), 'the queue focus hint')
+
+    // Enter pulls it back into the composer and out of the queue line.
+    output.text = ''
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('editing a queued prompt'), 'the edit toast')
+    assert.equal(stripAnsi(output.text).includes('◷ queued'), false)
+
+    // Esc puts it back untouched.
+    output.text = ''
+    input.push('\u001b')
+    await waitFor(() => stripAnsi(output.text).includes('◷ queued · draft this'), 'the restored queue row')
+
+    // Enter again, append a word, Enter saves in place.
+    output.text = ''
+    input.push('\u001b[1;3A')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('editing a queued prompt'), 'the second edit')
+    input.push(' please')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('queued prompt updated'), 'the edit receipt')
+    await waitFor(() => stripAnsi(output.text).includes('◷ queued · draft this please'), 'the edited queue row')
+
+    // Alt+Backspace deletes it from the queue.
+    output.text = ''
+    input.push('\u001b[1;3A')
+    input.push('\u001b\u007f')
+    await waitFor(() => stripAnsi(output.text).includes('queued prompt deleted'), 'the delete toast')
+    assert.equal(stripAnsi(output.text).includes('◷ queued'), false)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
 })

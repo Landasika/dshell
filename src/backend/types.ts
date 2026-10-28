@@ -17,6 +17,7 @@ export type BackendErrorCode =
   | 'REQUEST_TIMEOUT'
   | 'SESSION_DISPOSED'
   | 'APPROVAL_NOT_PENDING'
+  | 'QUEUE_ITEM_NOT_FOUND'
 
 export class BackendError extends Error {
   readonly code: BackendErrorCode
@@ -136,6 +137,10 @@ export interface SessionHandle {
 
   send(text: string, options?: SendOptions): Promise<SendReceipt>
   cancel(): Promise<void>
+  /** Delete one prompt still waiting in the Host inbox. */
+  removeQueued(requestId: string): Promise<void>
+  /** Rewrite one prompt still waiting in the Host inbox. */
+  editQueued(requestId: string, text: string): Promise<void>
   /** Load one older page. Returns false when the beginning is reached. */
   loadOlder(limit?: number): Promise<boolean>
   answerApproval(requestId: string, outcome: 'allowed-once' | 'rejected'): Promise<void>
