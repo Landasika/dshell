@@ -505,8 +505,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   }
 
   const sessionController = (): SessionControllerLike | undefined => {
-    const direct = ctx.sessionController ?? ctx.get?.('sessionController')
-    return direct as SessionControllerLike | undefined
+    const lookup = ctx.get?.('sessionController')
+    return lookup as SessionControllerLike | undefined
   }
 
   const forwardModelCatalog = async (socket: Socket): Promise<void> => {
