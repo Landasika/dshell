@@ -22,7 +22,7 @@ $ dshell
 │ ✓ bash · ls -la                                                │
 │ ...                                                            │
 │ ❯ 继续                                                          │
-└ enter steer/send · alt+enter queue · ctrl+j newline · / commands ───┘
+└ enter steer/send · alt+q queue · ctrl+j newline · / commands ───┘
 ```
 
 关键约束没有变化：
@@ -101,7 +101,8 @@ dshell --no-color              # 禁用颜色
 
 ## 4. Composer 与命令
 
-- Enter 发送；`Alt+Enter` 或 `Ctrl-J` 插入换行；
+- Enter 发送；`Ctrl-J` 插入换行；`Alt+Q` 排队（部分终端把 `Alt+Enter`
+  抢去切全屏，所以排队用 `Alt`+字母，`Alt+Enter` 能收到时也照常生效）；
 - 左右/Home/End/Delete/Backspace；`Ctrl-A/E/K/U/W` 行编辑；
 - Up/Down 历史输入，保留 100 条内存历史；
 - 括号粘贴一次插入多行；粘贴内容同样经过 sanitize；

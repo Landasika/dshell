@@ -1608,7 +1608,7 @@ test('a dropped Host connection reattaches instead of failing every command', as
   assert.equal(await app, 0)
 })
 
-test('enter steers into the running turn and alt+enter queues behind it', async () => {
+test('enter steers into the running turn and alt+q queues behind it', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
   const { FakeBackend } = await import('../dist/backend/index.js')
@@ -1659,11 +1659,13 @@ test('enter steers into the running turn and alt+enter queues behind it', async 
   await waitFor(() => output.text.includes('go faster'), 'the steered prompt in the transcript')
   assert.equal(output.text.includes('◷ steering'), false)
 
-  // Alt+Enter asks the Host to hold the prompt for the next turn.
+  // Alt+Q asks the Host to hold the prompt for the next turn (Alt+Enter is
+  // reserved by some terminals for fullscreen, so it is only an alias).
   output.text = ''
   input.push('after this')
-  input.push('\u001b\r')
+  input.push('\u001bq')
   await waitFor(() => output.text.includes('◷ queued'), 'the queued marker')
+  assert.equal(backend.queuedPrompts.some((entry) => entry.text === 'after this' && entry.mode === 'queue'), true)
 
   // Ctrl-C aborts the running turn but hands the queued prompt back, so it
   // starts instead of disappearing with the aborted turn.

@@ -177,9 +177,9 @@ export function renderComposer(
 /** Width-aware shortcut hint row. */
 export function renderHintLine(theme: Theme, columns: number): string {
   const text = columns >= 112
-    ? 'enter steer/send · alt+enter queue · ctrl+j newline · / commands · @ files · ctrl+r history · ? help'
+    ? 'enter steer/send · alt+q queue · ctrl+j newline · / commands · @ files · ctrl+r history · ? help'
     : columns >= 84
-      ? 'enter steer/send · alt+enter queue · / commands · @ files · ? help'
+      ? 'enter steer/send · alt+q queue · / commands · @ files · ? help'
       : 'enter send · / commands · ? help'
   return paint(theme, 'muted', truncate(text, columns))
 }

@@ -241,7 +241,7 @@ the official API.
 | Key | Action |
 | --- | --- |
 | `Enter` | send / run command; while a turn runs it **steers** (joins that turn) |
-| `Alt+Enter` | queue the prompt for the next turn instead of steering |
+| `Alt+Q` | queue the prompt for the next turn instead of steering (`Alt+Enter` also works when the terminal forwards it) |
 | `Ctrl-J`, `Shift+Enter` | newline |
 | `Tab` | complete `/` command or `@` file |
 | `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history (seeded from the session's durable transcript) |
@@ -261,17 +261,22 @@ the official API.
 | `Ctrl-O` | expand/fold tool output, thinking and lifecycle blocks |
 | `?` | help & shortcuts (when the composer is empty) |
 | `Esc` | close a menu/overlay or clear the composer; double-`Esc` on an empty idle composer opens rewind |
-| `Ctrl-C` | clear input, cancel a running turn (the `Alt+Enter` queue continues), or quit |
+| `Ctrl-C` | clear input, cancel a running turn (the `Alt+Q` queue continues), or quit |
 | `Ctrl-D` | quit when the composer is empty |
 
 Typing while a turn is running does not get lost, and `Enter` keeps the Claude
 Code habit: the message is **steered** into the running turn, so the agent sees
 it at its next step and the transcript shows it as a normal user message
-(`◷ steering · …` marks the gap until then). `Alt+Enter` queues the prompt
+(`◷ steering · …` marks the gap until then). `Alt+Q` queues the prompt
 instead — the Host holds it and starts a fresh turn after the current one
 (`◷ queued · …`). `Ctrl-C` aborts the running turn and the prompts you queued
-with `Alt+Enter` continue right after it: the Host drops its inbox with an
-abort, so the TUI hands those prompts back itself.
+with `Alt+Q` continue right after it: the Host drops its inbox with an abort,
+so the TUI hands those prompts back itself.
+
+`Alt+Q` rather than `Alt+Enter`: plenty of terminals (Windows Terminal included)
+bind `Alt+Enter` to fullscreen and never forward the key, so dshell's queue
+shortcut is a plain `Alt`+letter. `Alt+Enter` is still accepted where the
+terminal does send it.
 
 `Ctrl-C`/`Ctrl-D`/`Esc` quitting only closes this view; it never cancels the
 Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or

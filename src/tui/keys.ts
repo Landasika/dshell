@@ -34,6 +34,7 @@ export type Key =
   | { type: 'ctrl-o' }
   | { type: 'ctrl-g' }
   | { type: 'alt-enter' }
+  | { type: 'alt-q' }
   | { type: 'alt-backspace' }
   | { type: 'alt-up' }
   | { type: 'alt-down' }
@@ -71,6 +72,10 @@ const SEQUENCES: Record<string, Key> = {
   '\u001b[1;5A': { type: 'up' },
   '\u001b[1;5B': { type: 'down' },
   '\u001b\r': { type: 'alt-enter' },
+  // Some terminals grab Alt+Enter for fullscreen, so queuing has a plain
+  // Alt+letter binding of its own.
+  '\u001bq': { type: 'alt-q' },
+  '\u001bQ': { type: 'alt-q' },
   '\u001b\u007f': { type: 'alt-backspace' },
   // Shift+Enter as reported by terminals with the kitty/modifyOtherKeys
   // extensions; plain terminals send the same bytes as Enter.

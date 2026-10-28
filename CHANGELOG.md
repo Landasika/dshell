@@ -18,6 +18,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- Queueing a prompt for the next turn is `Alt+Q` now. Many terminals claim
+  `Alt+Enter` for fullscreen (WezTerm and Windows Terminal do) and never pass
+  it to the TUI, which made the key look broken; `Alt+Enter` still works where
+  the terminal forwards it.
+
 - Tool calls are folded to one line, Claude-Code style — `✓ Bash(ls -la)`,
   `✓ Read(src/tui/app.ts)`, `✓ Grep(reconnect)` — instead of dumping their
   output into the transcript; long calls end in `…` at the terminal width. `Ctrl-O` expands them inline, and
