@@ -6,13 +6,20 @@ import type { ReadStream, WriteStream } from 'node:tty'
 
 import type {
   DshellBackend,
+  ProviderList,
   SessionHandle,
   SessionSummary,
   SessionView,
   WorkspaceSummary,
 } from '../backend/index.js'
 import { BackendError } from '../backend/index.js'
-import type { ModelCatalog, ModelOption, ModelSelection } from '../protocol/index.js'
+import type {
+  ModelCatalog,
+  ModelOption,
+  ModelSelection,
+  ProviderEntry,
+  ProviderField,
+} from '../protocol/index.js'
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
 import { createEditor, editKey, insertText, type EditorState } from './editor.js'
@@ -94,6 +101,17 @@ type Overlay =
   | { kind: 'dashboard' }
   | { kind: 'agents'; index: number }
   | { kind: 'models'; index: number }
+  | { kind: 'effort'; provider: string; model: string; index: number; back: number }
+  | { kind: 'providers'; index: number }
+  | {
+      kind: 'providerEdit'
+      providerId: string
+      index: number
+      draft: Record<ProviderField, string>
+      dirty: Set<ProviderField>
+      editing?: { field: ProviderField; value: string }
+    }
+  | { kind: 'confirm'; title: string; lines: string[]; index: number; onYes: () => void }
   | { kind: 'agentView'; childId: string; label: string; lines: string[]; scroll: number; loading: boolean; error?: string }
 
 interface AppState {
@@ -124,6 +142,18 @@ interface AppState {
   modelCatalog?: ModelCatalog
   /** Optimistic selection until the next durable request header arrives. */
   modelOverride?: ModelSelection
+  /** Last reasoning level picked per `provider/model`. */
+  modelEfforts: Record<string, string>
+  /** Provider rows read from the Host's patch file. */
+  providers?: ProviderList
+}
+
+const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 'displayName']
+
+const PROVIDER_FIELD_LABEL: Record<ProviderField, string> = {
+  baseURL: 'baseURL',
+  apiKeyEnv: 'apiKeyEnv',
+  displayName: 'displayName',
 }
 
 interface ModelRow {
@@ -238,6 +268,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     todosFolded: false,
     tpsSamples: [],
     escapeAt: 0,
+    modelEfforts: {},
   }
 
   let renderTimer: NodeJS.Timeout | undefined
@@ -667,21 +698,49 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
-  const applyModel = async (row: ModelRow): Promise<void> => {
+  const effortKey = (provider: string, model: string): string => `${provider}/${model}`
+
+  /** The level a switch would send: last explicit pick, else the catalog default. */
+  const effortFor = (row: ModelRow): string | undefined => {
+    const reasoning = row.model?.reasoning
+    if (reasoning === undefined || row.provider === undefined || row.model === undefined) return undefined
+    const candidates = reasoning.efforts
+    if (candidates.length === 0) return undefined
+    const remembered = state.modelEfforts[effortKey(row.provider, row.model.id)]
+    const fallback = reasoning.defaultEffort ?? candidates[0]?.id
+    if (remembered !== undefined && candidates.some((effort) => effort.id === remembered)) return remembered
+    return fallback
+  }
+
+  const hasEfforts = (row: ModelRow): boolean => (row.model?.reasoning?.efforts.length ?? 0) > 0
+
+  const modelRowById = (provider: string, modelId: string): ModelRow | undefined =>
+    modelRows().find((row) => row.kind === 'model' && row.provider === provider && row.model?.id === modelId)
+
+  const applyModel = async (row: ModelRow, effort?: string): Promise<void> => {
     const view = state.view
     const model = row.model
     if (view === undefined || row.provider === undefined || model === undefined) {
       toast('attach a session before switching models')
       return
     }
+    const reasoningEffort = hasEfforts(row) ? effort ?? effortFor(row) : undefined
     state.status = 'switching model'
     schedule()
     try {
-      const selected = await backend.selectModel(view.sessionId, { provider: row.provider, model: model.id })
+      const selected = await backend.selectModel(view.sessionId, {
+        provider: row.provider,
+        model: model.id,
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      })
       state.modelOverride = selected
+      if (selected.reasoningEffort !== undefined) {
+        state.modelEfforts[effortKey(selected.provider, selected.model)] = selected.reasoningEffort
+      }
       if (state.modelCatalog !== undefined) state.modelCatalog.default = selected
       state.overlay = null
-      toast(`model → ${selected.provider}/${selected.model}`)
+      const level = selected.reasoningEffort === undefined ? '' : ` · ${selected.reasoningEffort}`
+      toast(`model → ${selected.provider}/${selected.model}${level}`)
     } catch (error) {
       toast(`model switch failed: ${errorText(error)}`)
     } finally {
@@ -690,17 +749,189 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
-  const saveModelDefault = async (row: ModelRow): Promise<void> => {
+  const saveModelDefault = async (row: ModelRow, effort?: string): Promise<void> => {
     const model = row.model
     if (row.provider === undefined || model === undefined) return
+    const reasoningEffort = hasEfforts(row) ? effort ?? effortFor(row) : undefined
     try {
-      const selected = await backend.saveDefaultModel({ provider: row.provider, model: model.id })
+      const selected = await backend.saveDefaultModel({
+        provider: row.provider,
+        model: model.id,
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      })
+      if (selected.reasoningEffort !== undefined) {
+        state.modelEfforts[effortKey(selected.provider, selected.model)] = selected.reasoningEffort
+      }
       if (state.modelCatalog !== undefined) state.modelCatalog.default = selected
-      toast(`default model → ${selected.provider}/${selected.model}`)
+      const level = selected.reasoningEffort === undefined ? '' : ` · ${selected.reasoningEffort}`
+      toast(`default model → ${selected.provider}/${selected.model}${level}`)
     } catch (error) {
       toast(`default model failed: ${errorText(error)}`)
     }
     schedule()
+  }
+
+  /**
+   * Codex-style two-step pick: a model that declares reasoning levels opens a
+   * level list instead of switching immediately. Enter on a level commits both
+   * the model and the level in one `model/select`.
+   */
+  const openEffortPicker = (row: ModelRow): void => {
+    const provider = row.provider
+    const model = row.model
+    if (provider === undefined || model === undefined) return
+    if (!hasEfforts(row)) {
+      void applyModel(row)
+      return
+    }
+    const efforts = model.reasoning?.efforts ?? []
+    const current = effortFor(row)
+    const index = Math.max(0, efforts.findIndex((effort) => effort.id === current))
+    const back = state.overlay?.kind === 'models' ? state.overlay.index : 0
+    state.overlay = { kind: 'effort', provider, model: model.id, index, back }
+    schedule()
+  }
+
+  const reopenModelPicker = (index: number): void => {
+    if (state.modelCatalog === undefined) {
+      state.overlay = null
+      schedule()
+      return
+    }
+    const rows = modelRows()
+    const bounded = Math.max(0, Math.min(rows.length - 1, index))
+    state.overlay = { kind: 'models', index: bounded }
+    schedule()
+  }
+
+  const restartHost = async (): Promise<void> => {
+    state.status = 'restarting host'
+    schedule()
+    try {
+      await backend.restartHost()
+      state.overlay = null
+      toast('host restarting… reattaching')
+      schedule()
+      await reattachAfterRestart()
+    } catch (error) {
+      state.status = 'idle'
+      toast(`host restart failed: ${errorText(error)}`)
+      schedule()
+    }
+  }
+
+  /** Poll the socket until the re-exec'd Host answers, then reopen the session. */
+  const reattachAfterRestart = async (): Promise<void> => {
+    const sessionId = state.currentId
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+      try {
+        await backend.disconnect().catch(() => {})
+        await backend.connect()
+      } catch {
+        continue
+      }
+      if (sessionId === undefined) {
+        toast('host back')
+        state.status = 'idle'
+        schedule()
+        return
+      }
+      state.handle?.dispose()
+      state.handle = undefined
+      state.view = undefined
+      await openSession(sessionId)
+      if (state.view !== undefined) {
+        state.status = 'idle'
+        toast('host back · reattached')
+        schedule()
+        return
+      }
+    }
+    state.status = 'idle'
+    toast('host did not come back; start it again and use /reconnect')
+    schedule()
+  }
+
+  const openProviderList = async (): Promise<void> => {
+    if (!backend.capabilities().providers) {
+      toast('this Host cannot read providers (restart a fresh dshell-host)')
+      schedule()
+      return
+    }
+    state.status = 'loading providers'
+    schedule()
+    try {
+      state.providers = await backend.providerList()
+    } catch (error) {
+      state.status = 'idle'
+      toast(`provider list failed: ${errorText(error)}`)
+      schedule()
+      return
+    }
+    state.status = 'idle'
+    state.overlay = { kind: 'providers', index: 0 }
+    schedule()
+  }
+
+  const openProviderEditor = (entry: ProviderEntry): void => {
+    state.overlay = {
+      kind: 'providerEdit',
+      providerId: entry.id,
+      index: 0,
+      draft: {
+        baseURL: entry.baseURL ?? '',
+        apiKeyEnv: entry.apiKeyEnv ?? '',
+        displayName: entry.displayName ?? '',
+      },
+      dirty: new Set<ProviderField>(),
+    }
+    schedule()
+  }
+
+  const saveProvider = async (overlay: Extract<Overlay, { kind: 'providerEdit' }>): Promise<void> => {
+    const fields = PROVIDER_FIELD_ORDER.filter((field) => overlay.dirty.has(field))
+    if (fields.length === 0) {
+      state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
+      toast('no provider changes')
+      schedule()
+      return
+    }
+    state.status = 'saving provider'
+    schedule()
+    try {
+      for (const field of fields) {
+        state.providers = await backend.updateProvider(overlay.providerId, field, overlay.draft[field])
+      }
+      const file = state.providers?.file ?? 'cordis.patch.yml'
+      state.overlay = {
+        kind: 'confirm',
+        title: `provider · ${overlay.providerId}`,
+        lines: [
+          `saved ${fields.join(', ')} to`,
+          file,
+          '',
+          'A running Host keeps the providers it booted with.',
+          'Restart it now to load this change?',
+        ],
+        index: 0,
+        onYes: () => {
+          void restartHost()
+        },
+      }
+    } catch (error) {
+      toast(`provider save failed: ${errorText(error)}`)
+      state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
+    } finally {
+      state.status = 'idle'
+      schedule()
+    }
+  }
+
+  const providerIndex = (providerId: string): number => {
+    const rows = state.providers?.providers ?? []
+    const index = rows.findIndex((row) => row.id === providerId)
+    return index < 0 ? 0 : index
   }
 
   const switchModel = async (argument: string): Promise<void> => {
@@ -716,10 +947,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       toast('use /model provider/model, or /model default provider/model')
       return
     }
-    const row: ModelRow = {
+    const provider = spec.slice(0, slash)
+    const modelId = spec.slice(slash + 1)
+    // Prefer the catalog row so a direct `/model p/m` keeps the model's
+    // reasoning levels and its remembered default.
+    const row: ModelRow = modelRowById(provider, modelId) ?? {
       kind: 'model',
-      provider: spec.slice(0, slash),
-      model: { id: spec.slice(slash + 1), name: spec.slice(slash + 1) },
+      provider,
+      model: { id: modelId, name: modelId },
     }
     if (wantsDefault) await saveModelDefault(row)
     else await applyModel(row)
@@ -899,6 +1134,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       case '/model':
         await switchModel(argument)
         return
+      case '/provider':
+      case '/providers':
+        await openProviderList()
+        return
       default:
         toast(`unknown command ${command}; try /help`)
     }
@@ -946,6 +1185,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (key.type === 'escape') {
       if (overlay.kind === 'approval') {
         toast('approval still pending; answer with a/r or wait for the timeout')
+      } else if (overlay.kind === 'effort') {
+        reopenModelPicker(overlay.back)
+      } else if (overlay.kind === 'providerEdit' && overlay.editing !== undefined) {
+        overlay.editing = undefined
+      } else if (overlay.kind === 'providerEdit') {
+        state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
       } else {
         if (overlay.kind === 'agentView') closeAgentView()
         state.overlay = null
@@ -1064,12 +1309,117 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.index = nearestModelRow(overlay.index, delta)
       } else if (key.type === 'down' || key.type === 'ctrl-n') {
         overlay.index = nearestModelRow(overlay.index, 1)
-      } else if (key.type === 'enter' || key.type === 'tab') {
-        if (row?.kind === 'model') void applyModel(row)
+      } else if (key.type === 'enter' || key.type === 'tab' || key.type === 'right') {
+        if (row?.kind === 'model') {
+          if (hasEfforts(row)) openEffortPicker(row)
+          else void applyModel(row)
+        }
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'e') {
+        if (row?.kind === 'model') openEffortPicker(row)
         return
       } else if (key.type === 'text' && key.text.toLowerCase() === 'd') {
         if (row?.kind === 'model') void saveModelDefault(row)
         return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'effort') {
+      const row = modelRowById(overlay.provider, overlay.model)
+      const efforts = row?.model?.reasoning?.efforts ?? []
+      const count = Math.max(1, efforts.length)
+      if (key.type === 'up' || key.type === 'ctrl-p' || key.type === 'wheel') {
+        const delta = key.type === 'wheel' ? key.delta : -1
+        overlay.index = (overlay.index + delta + count) % count
+      } else if (key.type === 'down' || key.type === 'ctrl-n') {
+        overlay.index = (overlay.index + 1) % count
+      } else if (key.type === 'enter' || key.type === 'tab') {
+        const effort = efforts[overlay.index]
+        if (row !== undefined && effort !== undefined) void applyModel(row, effort.id)
+        return
+      } else if (key.type === 'left' || key.type === 'backspace') {
+        reopenModelPicker(overlay.back)
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'd') {
+        const effort = efforts[overlay.index]
+        if (row !== undefined && effort !== undefined) void saveModelDefault(row, effort.id)
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'providers') {
+      const rows = state.providers?.providers ?? []
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.index = Math.max(0, overlay.index - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') {
+        overlay.index = Math.min(Math.max(0, rows.length - 1), overlay.index + 1)
+      } else if (key.type === 'enter') {
+        const entry = rows[overlay.index]
+        if (entry !== undefined) openProviderEditor(entry)
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'r') {
+        state.overlay = {
+          kind: 'confirm',
+          title: 'restart host',
+          lines: ['Re-exec the Host process and reattach this session?'],
+          index: 0,
+          onYes: () => {
+            void restartHost()
+          },
+        }
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'providerEdit') {
+      if (overlay.editing !== undefined) {
+        const editing = overlay.editing
+        if (key.type === 'enter' || key.type === 'tab') {
+          overlay.draft[editing.field] = editing.value
+          overlay.dirty.add(editing.field)
+          overlay.editing = undefined
+        } else if (key.type === 'backspace') {
+          editing.value = Array.from(editing.value).slice(0, -1).join('')
+        } else if (key.type === 'ctrl-u') {
+          editing.value = ''
+        } else if (key.type === 'text') {
+          editing.value += key.text
+        }
+        schedule()
+        return
+      }
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.index = Math.max(0, overlay.index - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') {
+        overlay.index = Math.min(PROVIDER_FIELD_ORDER.length - 1, overlay.index + 1)
+      } else if (key.type === 'enter') {
+        const field = PROVIDER_FIELD_ORDER[overlay.index]
+        if (field !== undefined) overlay.editing = { field, value: overlay.draft[field] }
+      } else if (key.type === 'text' && key.text.toLowerCase() === 's') {
+        void saveProvider(overlay)
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'confirm') {
+      if (key.type === 'up' || key.type === 'down' || key.type === 'tab' || key.type === 'left' || key.type === 'right') {
+        overlay.index = overlay.index === 0 ? 1 : 0
+      } else if (key.type === 'enter') {
+        const yes = overlay.index === 0
+        const action = overlay.onYes
+        state.overlay = null
+        if (yes) action()
+        else schedule()
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'y') {
+        const action = overlay.onYes
+        state.overlay = null
+        action()
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'n') {
+        state.overlay = null
       }
       schedule()
       return
@@ -1459,11 +1809,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const running = metrics.agents.filter((agent) => agent.status === 'running').length
     const model = state.modelOverride?.model ?? metrics.model
     const provider = state.modelOverride?.provider ?? metrics.provider
+    const effort = state.modelOverride?.reasoningEffort
+      ?? (model === undefined || provider === undefined ? undefined : state.modelEfforts[`${provider}/${model}`])
     return renderUsageRail(theme, {
       tokens: metrics.cost.tokens,
       ...(metrics.cost.cost === undefined ? {} : { cost: metrics.cost.cost }),
       ...(model === undefined ? {} : { model }),
       ...(provider === undefined ? {} : { provider }),
+      ...(effort === undefined ? {} : { effort }),
       cwd: state.view?.header.cwd ?? options.cwd,
       ...(gitInfo === undefined ? {} : { git: gitInfo }),
       ...(metrics.agents.length === 0
@@ -1563,10 +1916,89 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const badge = isCurrent ? paint(theme, 'success', '●') : isDefault ? paint(theme, 'accent', '◆') : ' '
         const label = row.model?.name ?? row.model?.id ?? ''
         const idPart = paint(theme, 'muted', `${row.provider ?? ''}/${row.model?.id ?? ''}`)
-        body.push(`${marker}${badge} ${paint(theme, selected ? 'text' : 'muted', truncate(label, 30))}  ${idPart}`)
+        const level = hasEfforts(row)
+          ? paint(theme, 'muted', ` · ${effortFor(row) ?? '—'}`)
+          : ''
+        body.push(`${marker}${badge} ${paint(theme, selected ? 'text' : 'muted', truncate(label, 30))}  ${idPart}${level}`)
       }
       return panelBox(theme, 'model', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ select · enter switch · d default · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ select · enter model/level · e levels · d default · esc close')],
+      })
+    }
+    if (overlay.kind === 'effort') {
+      const row = modelRowById(overlay.provider, overlay.model)
+      const efforts = row?.model?.reasoning?.efforts ?? []
+      const current = row === undefined ? undefined : effortFor(row)
+      const body: string[] = [
+        `${paint(theme, 'muted', `${overlay.provider}/`)}${paint(theme, 'bold', overlay.model)}`,
+        '',
+      ]
+      for (const [index, effort] of efforts.entries()) {
+        const selected = index === overlay.index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        const badge = effort.id === current ? paint(theme, 'success', '●') : ' '
+        const name = paint(theme, selected ? 'text' : 'muted', pad(effort.name, 8))
+        const detail = paint(theme, 'muted', truncate(effort.description ?? effort.id, Math.max(12, inner - 14)))
+        body.push(`${marker}${badge} ${name} ${detail}`)
+      }
+      if (efforts.length === 0) body.push(paint(theme, 'muted', 'this model declares no reasoning levels'))
+      return panelBox(theme, 'reasoning level', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ select · enter switch · d default · ← back · esc close')],
+      })
+    }
+    if (overlay.kind === 'providers') {
+      const list = state.providers
+      const rowsList = list?.providers ?? []
+      const body: string[] = []
+      for (const [index, entry] of rowsList.entries()) {
+        const selected = index === overlay.index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        const title = entry.displayName ?? entry.id
+        const address = entry.baseURL ?? paint(theme, 'muted', 'no baseURL')
+        const key = entry.apiKeyEnv === undefined ? paint(theme, 'muted', 'no key env') : paint(theme, 'text', entry.apiKeyEnv)
+        body.push(`${marker} ${paint(theme, selected ? 'text' : 'muted', pad(truncate(entry.id, 18), 18))} ${paint(theme, 'text', truncate(title, 16))}`)
+        body.push(`  ${address}  ${key}  ${paint(theme, 'muted', `${String(entry.models)} models`)}`)
+      }
+      if (rowsList.length === 0) body.push(paint(theme, 'muted', 'no providers declared'))
+      body.push('')
+      body.push(paint(theme, 'muted', list?.file ?? 'no patch file found'))
+      if (list?.writable === false) body.push(paint(theme, 'error', 'read-only: fix the file permissions to edit'))
+      return panelBox(theme, 'providers', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ select · enter edit · r restart host · esc close')],
+      })
+    }
+    if (overlay.kind === 'providerEdit') {
+      const body: string[] = []
+      for (const [index, field] of PROVIDER_FIELD_ORDER.entries()) {
+        const selected = index === overlay.index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        const dirty = overlay.dirty.has(field) ? paint(theme, 'accent', ' •') : ''
+        const editing = overlay.editing?.field === field
+        const raw = editing ? overlay.editing?.value ?? '' : overlay.draft[field]
+        const shown = raw.length === 0 ? paint(theme, 'muted', '(unset)') : paint(theme, selected ? 'text' : 'muted', raw)
+        body.push(`${marker} ${paint(theme, 'muted', pad(PROVIDER_FIELD_LABEL[field], 12))} ${editing ? `${shown}${paint(theme, 'accent', '▏')}` : shown}${dirty}`)
+      }
+      body.push('')
+      body.push(paint(theme, 'muted', 'secrets live in the environment, never in the patch file'))
+      body.push(paint(theme, 'muted', overlay.editing === undefined
+        ? 'enter edit · s save & reload · esc back'
+        : 'enter commit field · esc cancel field'))
+      return panelBox(theme, `provider · ${overlay.providerId}`, body, width, {
+        footer: [paint(theme, 'muted', overlay.editing === undefined
+          ? 'enter edit · s save · esc back'
+          : 'type to edit · enter commit · esc cancel')],
+      })
+    }
+    if (overlay.kind === 'confirm') {
+      const body: string[] = [...overlay.lines, '']
+      const options = ['restart now', 'later']
+      for (const [index, option] of options.entries()) {
+        const selected = index === overlay.index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        body.push(`${marker} ${paint(theme, selected ? 'text' : 'muted', option)}`)
+      }
+      return panelBox(theme, overlay.title, body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ choose · enter confirm · y restart · n later')],
       })
     }
     if (overlay.kind === 'workspaces') {

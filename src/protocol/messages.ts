@@ -16,6 +16,7 @@ export const CAPABILITIES = [
   'steer',
   'approval',
   'models',
+  'providers',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
@@ -75,6 +76,19 @@ export interface ModelCatalog {
   groups: ModelProviderGroup[]
   failures: ModelCatalogFailure[]
 }
+
+/** One provider row of the Host's active patch file. */
+export interface ProviderEntry {
+  id: string
+  displayName?: string
+  baseURL?: string
+  apiKeyEnv?: string
+  /** Number of model rows declared under the provider. */
+  models: number
+}
+
+/** Fields the TUI may rewrite; credentials never live in the patch file. */
+export type ProviderField = 'baseURL' | 'apiKeyEnv' | 'displayName'
 
 export interface WorkspaceSummary {
   id: string
@@ -180,6 +194,30 @@ export interface ModelSelectedMessage {
   savedAsDefault?: boolean
 }
 
+export interface ProviderListMessage {
+  type: 'provider-list'
+  /** Patch file the rows were read from. */
+  file: string
+  writable: boolean
+  providers: ProviderEntry[]
+}
+
+export interface ProviderUpdatedMessage {
+  type: 'provider-updated'
+  file: string
+  providerId: string
+  field: ProviderField
+  value: string
+  providers: ProviderEntry[]
+}
+
+export interface HostRestartingMessage {
+  type: 'host-restarting'
+  pid: number
+  /** argv the Host will re-exec, for the client's diagnostic line. */
+  argv: string[]
+}
+
 export interface AcceptedMessage {
   type: 'accepted'
   sessionId: string
@@ -261,6 +299,9 @@ export type ClientMessage =
     }
   | { type: 'approval/answer'; requestId: string; outcome: ApprovalOutcome }
   | { type: 'model/catalog' }
+  | { type: 'provider/list' }
+  | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
+  | { type: 'host/restart' }
   | { type: 'model/select'; sessionId: string; provider: string; model: string; reasoningEffort?: string }
   | { type: 'model/default'; provider: string; model: string; reasoningEffort?: string }
 
@@ -282,4 +323,7 @@ export type ServerMessage =
   | ApprovalResolvedMessage
   | ModelCatalogMessage
   | ModelSelectedMessage
+  | ProviderListMessage
+  | ProviderUpdatedMessage
+  | HostRestartingMessage
   | ErrorMessage

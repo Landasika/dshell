@@ -1,5 +1,17 @@
+import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmodSync, lstatSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs'
+import {
+  accessSync,
+  chmodSync,
+  constants as fsConstants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { createServer, Socket, type Server } from 'node:net'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -7,6 +19,7 @@ import { createInterface } from 'node:readline'
 import {
   CAPABILITIES,
   PROTOCOL_VERSION,
+  type ProviderEntry,
   type ApprovalRequestMessage,
   type ApprovalResolvedMessage,
   type Capability,
@@ -21,6 +34,7 @@ import {
   type WorkspaceSummary,
 } from '../protocol/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
+import { ProviderEditError, isProviderField, readProviders, setProviderField } from './profile.js'
 
 export const name = 'dshell-host'
 export const inject = [
@@ -178,6 +192,14 @@ interface PluginContext {
   get?(name: string): unknown
   on(event: string, listener: (...args: any[]) => void, options?: { global?: boolean; prepend?: boolean }): () => void
   effect(setup: () => void | (() => void | Promise<void>)): void
+}
+
+function safeRead(path: string): string {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return ''
+  }
 }
 
 function packageVersion(): string {
@@ -579,6 +601,217 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     jsonLine(socket, { type: 'model-selected', selected: selection, savedAsDefault: true })
   }
 
+  /**
+   * Providers live in a patch file, not in the session store. Prefer the
+   * home-level patch (it outranks every profile), then the active profile's
+   * own patch. The TUI never writes this file directly: the Host owns the
+   * path so a client cannot be pointed at an arbitrary file.
+   */
+  const dshHome = (): string | undefined => {
+    const provided = ctx.get?.('dshHomePath')
+    if (typeof provided === 'string' && provided.length > 0) return provided
+    const env = process.env.DSH_HOME
+    if (env !== undefined && env.length > 0) return env
+    const home = process.env.HOME
+    return home === undefined || home.length === 0 ? undefined : join(home, '.dsh')
+  }
+
+  const providerFileCandidates = (): string[] => {
+    const home = dshHome()
+    if (home === undefined) return []
+    const candidates = [join(home, 'cordis.patch.yml')]
+    const profile = process.env.DSH_PROFILE
+    if (profile !== undefined && profile.length > 0) {
+      candidates.push(join(home, 'profiles', profile, 'cordis.patch.yml'))
+    }
+    return candidates.filter((path) => existsSync(path))
+  }
+
+  const providerFile = (): string | undefined => {
+    const candidates = providerFileCandidates()
+    // A file that declares no providers cannot be the one the Host routes.
+    return candidates.find((path) => readProviders(safeRead(path)).length > 0) ?? candidates[0]
+  }
+
+  const providerRows = (): ProviderEntry[] => {
+    const file = providerFile()
+    if (file === undefined) return []
+    return readProviders(safeRead(file)).map((record) => ({
+      id: record.id,
+      ...(record.displayName === undefined ? {} : { displayName: record.displayName }),
+      ...(record.baseURL === undefined ? {} : { baseURL: record.baseURL }),
+      ...(record.apiKeyEnv === undefined ? {} : { apiKeyEnv: record.apiKeyEnv }),
+      models: record.models,
+    }))
+  }
+
+  const providerWritable = (file: string): boolean => {
+    try {
+      accessSync(file, fsConstants.W_OK)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const listProviders = (socket: Socket): void => {
+    const file = providerFile()
+    if (file === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host found no cordis.patch.yml to read providers from',
+        action: 'Add provider rows to $DSH_HOME/cordis.patch.yml, then restart the Host.',
+      })
+      return
+    }
+    jsonLine(socket, {
+      type: 'provider-list',
+      file,
+      writable: providerWritable(file),
+      providers: providerRows(),
+    })
+  }
+
+  const updateProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
+    const field = typeof message.field === 'string' ? message.field : ''
+    const value = typeof message.value === 'string' ? message.value : ''
+    if (providerId.length === 0 || !isProviderField(field)) {
+      sendError(socket, {
+        type: 'error',
+        code: 'BAD_REQUEST',
+        message: 'provider/update needs providerId and one of baseURL, apiKeyEnv, displayName',
+      })
+      return
+    }
+    const file = providerFile()
+    if (file === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host found no cordis.patch.yml to write providers to',
+        action: 'Create $DSH_HOME/cordis.patch.yml with an llm-pi-ai providers block.',
+      })
+      return
+    }
+    if (!providerWritable(file)) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: `${file} is not writable`,
+        action: 'Fix the file permissions or edit the provider row by hand.',
+      })
+      return
+    }
+    if (field === 'baseURL' && !/^https?:\/\/[^\s]+$/.test(value.trim())) {
+      sendError(socket, {
+        type: 'error',
+        code: 'BAD_REQUEST',
+        message: 'baseURL must be an absolute http(s) URL',
+      })
+      return
+    }
+    if (field === 'apiKeyEnv' && !/^[A-Z][A-Z0-9_]*$/.test(value.trim())) {
+      sendError(socket, {
+        type: 'error',
+        code: 'BAD_REQUEST',
+        message: 'apiKeyEnv must be an upper-case environment variable name',
+      })
+      return
+    }
+    const before = safeRead(file)
+    let after: string
+    try {
+      after = setProviderField(before, providerId, field, value)
+    } catch (error) {
+      if (error instanceof ProviderEditError) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        return
+      }
+      throw error
+    }
+    if (after !== before) {
+      // Never persist a rewrite whose meaning drifted: the parse of the new
+      // text must differ from the old one only in the requested scalar.
+      const normalise = (rows: ReturnType<typeof readProviders>): string[] =>
+        rows.map((row) => [row.id, row.displayName ?? '', row.baseURL ?? '', row.apiKeyEnv ?? '', String(row.models)].join('\u0000'))
+      const expected = providerRows().map((row) => {
+        if (row.id !== providerId) return row
+        const edited: ProviderEntry = { ...row }
+        if (value.trim().length === 0) delete edited[field]
+        else edited[field] = value.trim()
+        return edited
+      })
+      const expectedLines = expected.map((row) =>
+        [row.id, row.displayName ?? '', row.baseURL ?? '', row.apiKeyEnv ?? '', String(row.models)].join('\u0000'))
+      if (JSON.stringify(expectedLines) !== JSON.stringify(normalise(readProviders(after)))) {
+        sendError(socket, {
+          type: 'error',
+          code: 'INTERNAL',
+          message: 'refusing to write: the edited patch file no longer parses to the same providers',
+          action: 'Edit the provider row in cordis.patch.yml by hand.',
+        })
+        return
+      }
+      const temporary = `${file}.dshell-tmp`
+      writeFileSync(temporary, after, { mode: 0o600 })
+      renameSync(temporary, file)
+    }
+    jsonLine(socket, {
+      type: 'provider-updated',
+      file,
+      providerId,
+      field,
+      value: value.trim(),
+      providers: providerRows(),
+    })
+  }
+
+  const restartHost = async (socket: Socket): Promise<void> => {
+    if (process.versions.electron !== undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'the Host runs inside Electron, so it cannot re-exec itself',
+        action: 'Quit and reopen the desktop app.',
+      })
+      return
+    }
+    const argv = process.argv.slice(1)
+    if (argv.length === 0) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'the Host cannot infer how it was launched',
+        action: 'Restart the Host by hand.',
+      })
+      return
+    }
+    let child
+    try {
+      child = spawn(process.execPath, argv, {
+        detached: true,
+        stdio: 'ignore',
+        cwd: process.cwd(),
+        env: process.env,
+      })
+      child.unref()
+    } catch (error) {
+      sendError(socket, {
+        type: 'error',
+        code: 'INTERNAL',
+        message: `could not re-exec the Host: ${errorText(error)}`,
+        action: 'Restart the Host by hand.',
+      })
+      return
+    }
+    jsonLine(socket, { type: 'host-restarting', pid: process.pid, argv })
+    // Close first so the replacement can bind the socket path, then exit.
+    await close().catch(() => {})
+    setTimeout(() => process.exit(0), 250)
+  }
+
   const watch = (socket: Socket, sessionId: string): Set<string> => {
     let sessions = watched.get(socket)
     if (sessions === undefined) {
@@ -888,9 +1121,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             protocol: PROTOCOL_VERSION,
             pluginVersion: packageVersion(),
             dshVersion: inferDshVersion(),
-            capabilities: (CAPABILITIES as readonly Capability[]).filter(
-              (capability) => capability !== 'models' || sessionController() !== undefined,
-            ),
+            capabilities: (CAPABILITIES as readonly Capability[]).filter((capability) => {
+              if (capability === 'models') return sessionController() !== undefined
+              if (capability === 'providers') return providerFile() !== undefined
+              return true
+            }),
             socketPath,
             // Keep the handshake O(1). Session enumeration can block on a
             // shared DSH home (other live Hosts, locked stores); clients issue
@@ -956,6 +1191,15 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'model/default':
           await setDefaultModel(socket, message)
+          return
+        case 'provider/list':
+          listProviders(socket)
+          return
+        case 'provider/update':
+          await updateProvider(socket, message)
+          return
+        case 'host/restart':
+          await restartHost(socket)
           return
         default:
           sendError(socket, {

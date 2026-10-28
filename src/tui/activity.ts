@@ -189,6 +189,8 @@ export interface UsageRailInput {
   cost?: number
   model?: string
   provider?: string
+  /** Reasoning level currently selected for the model, when it has levels. */
+  effort?: string
   cwd?: string
   git?: { branch: string; ahead: number; behind: number; dirty: boolean }
   agents?: { done: number; total: number; running: number; failed?: number }
@@ -238,7 +240,11 @@ export function renderUsageRail(theme: Theme, input: UsageRailInput): string {
       ? input.model
       : `${input.provider}/${input.model}`
   if (model !== undefined && model.length > 0) {
-    segments.push({ text: paint(theme, 'accentSoft', truncate(model, 40)), drop: 0 })
+    const text = paint(theme, 'accentSoft', truncate(model, 40))
+    const level = input.effort === undefined || input.effort.length === 0
+      ? ''
+      : paint(theme, 'muted', ` · ${input.effort}`)
+    segments.push({ text: `${text}${level}`, drop: 0 })
   }
   if (input.cwd !== undefined && input.cwd.length > 0) {
     segments.push({ text: paint(theme, 'muted', shortCwd(input.cwd)), drop: 6 })

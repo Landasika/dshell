@@ -117,8 +117,19 @@ Slash commands：
 /help          /sessions      /workspaces
 /resume        /new [cwd]     /attach <id>
 /cancel        /clear         /reconnect
-/model         /verbose       /quit
+/model         /provider      /verbose
+/quit
 ```
+
+`/model`：目录 →（带 reasoning 档位的模型）档位列表 → `Enter` 一次提交
+`{provider, model, reasoningEffort}`；`e` 重开档位，`←` 退回，`d` 连同档位设为
+默认。档位按 `provider/model` 记忆，底栏显示 `provider/model · high`。
+
+`/provider`：读取 Host 启动用的 patch 文件（`$DSH_HOME/cordis.patch.yml`，否则
+当前 profile 的同名文件）中的 `llm-pi-ai` provider 行；`Enter` 编辑
+`baseURL`/`apiKeyEnv`/`displayName`，`s` 定点改写 YAML 标量行后弹出“是否立即
+重启 Host”，`y` 重新 exec Host 并自动 reattach，`n` 留待手动重启。密钥不落在
+patch 文件里，只有环境变量名。
 
 `/clear` 只隐藏本地 transcript（记录 `clearedAtSeq`），不删除 Host 的 durable
 history；重新 attach 会重新看到。

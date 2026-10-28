@@ -22,7 +22,8 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/agents', description: 'list subagents and open their transcripts' },
   { name: '/status', description: 'alias for /panel' },
   { name: '/verbose', description: 'toggle reasoning and lifecycle events' },
-  { name: '/model', description: 'switch provider/model (d = save as default)' },
+  { name: '/model', description: 'switch provider/model and reasoning level' },
+  { name: '/provider', description: 'edit provider rows in cordis.patch.yml' },
   { name: '/resume', description: 'alias for /sessions' },
   { name: '/quit', description: 'leave the TUI (does not cancel the Host turn)' },
 ]

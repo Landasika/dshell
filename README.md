@@ -257,23 +257,48 @@ Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
 Commands: `/sessions` (aliases `/session`, `/resume`), `/workspaces`, `/new`,
 `/attach`, `/cancel`, `/clear`,
 `/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/agents`, `/model`,
-`/verbose`, `/help`, `/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
+`/provider`, `/verbose`, `/help`, `/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
 
 ### Models
 
 `/model` asks the Host for its live provider/model catalog and opens a picker:
 
 - `↑/↓` move, `Enter` switches the current session
-- `d` saves the highlighted model as the default for new sessions
+- models that declare reasoning levels step into a level list first
+  (`off` / `low` / `high` / `max`, each with its own description); `Enter`
+  there commits model **and** level in one selection
+- `e` reopens the level list for the highlighted model, `←` goes back
+- `d` saves the highlighted model (and shown level) as the default
 - `/model provider/model` switches directly; `/model default provider/model`
   saves a default without touching the current session
 
-Switching is a Host operation, not a TUI guess: the `dshell-host` plugin now
+Switching is a Host operation, not a TUI guess: the `dshell-host` plugin
 bridges DSH's `sessionController.modelCatalog()` and `selectModel()`, so the
 same catalog the Web UI shows is used. DSH applies the selection on the next
 request and appends a durable "model changed" notice; the selection also
-becomes the saved default. Reasoning effort is currently the model default;
-the picker does not expose per-effort choices yet.
+becomes the saved default. The level a model was last switched with is
+remembered per `provider/model` and shown in the bottom rail
+(`deepseek-official/deepseek-flash · high`).
+
+### Providers
+
+`/provider` lists the provider rows of the patch file the Host booted with
+(`$DSH_HOME/cordis.patch.yml`, else the active profile's), read through the
+`dshell-host` plugin:
+
+- `Enter` opens a field editor for `baseURL`, `apiKeyEnv` and `displayName`
+- `Enter` on a field edits it, `Ctrl-U` clears it, `Enter` commits the field
+- `s` writes the changed fields back and raises a confirmation:
+  `Restart the Host now?` — `y` re-execs the Host and reattaches the session,
+  `n` keeps the file change for the next manual start
+- `r` restarts the Host without editing
+
+The editor rewrites only the targeted scalar lines, so comments, model lists
+and `!!js` expressions in the patch file survive. API keys themselves are
+never stored there: the file carries the environment-variable name
+(`apiKeyEnv`) and the secret stays in the environment or DSH's credential
+store. Providers are read at Host boot, so an edit needs the restart the
+confirmation offers — there is no live provider reload.
 
 ### Herdr
 

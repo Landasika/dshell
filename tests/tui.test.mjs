@@ -1179,15 +1179,154 @@ test('TUI model picker switches the session model and saves a default', async ()
   input.push('\u001b[B')
   await new Promise((resolve) => setTimeout(resolve, 20))
   input.push('\r')
-  await waitFor(() => output.text.includes('model → relay/relay-flash'))
+  // Relay Flash declares reasoning levels, so the model pick steps into the
+  // level list first; the second enter commits model + level together.
+  await waitFor(() => output.text.includes('reasoning level') && output.text.includes('Low'))
+  input.push('\r')
+  await waitFor(() => output.text.includes('model → relay/relay-flash · low'))
 
   input.push('/model')
   input.push('\r')
   await new Promise((resolve) => setTimeout(resolve, 100))
   input.push('d')
-  await waitFor(() => output.text.includes('default model → relay/relay-flash'))
+  await waitFor(() => output.text.includes('default model → relay/relay-flash · low'))
   input.push('\u001b')
   await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('TUI effort picker shows levels and remembers the choice in the rail', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 200; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'))
+  input.push('/model')
+  input.push('\r')
+  await waitFor(() => output.text.includes('Relay Flash'))
+  // Walk from the fake default down to Relay Flash, then step into its levels.
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\r')
+  await waitFor(() => output.text.includes('reasoning level'))
+  assert.equal(output.text.includes('Reserve for the hardest quality-first tasks.') || output.text.includes('low'), true)
+  input.push('\r')
+  await waitFor(() => output.text.includes('model → relay/relay-flash · low'))
+  // The rail keeps showing the chosen level after the picker closes.
+  assert.match(output.text.slice(-4000), /relay\/relay-flash · low/)
+
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('TUI provider screen edits a field and asks before restarting the Host', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 200; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'))
+  input.push('/provider')
+  input.push('\r')
+  await waitFor(() => output.text.includes('/fake/cordis.patch.yml'))
+  assert.equal(output.text.includes('FAKE_API_KEY'), true)
+  assert.equal(output.text.includes('api.example/v1'), true)
+
+  // Relay is the second row; open its editor and replace baseURL.
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\r')
+  await waitFor(() => output.text.includes('provider · relay'))
+  input.push('\r')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\u0015')
+  input.push('http://new.example:9000')
+  input.push('\r')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('s')
+  await waitFor(() => output.text.includes('Restart it now to load this change?'))
+  assert.equal(output.text.includes('restart now'), true)
+
+  // Decline: the Host keeps running and the draft survives on disk.
+  input.push('n')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal((await backend.providerList()).providers.find((row) => row.id === 'relay').baseURL, 'http://new.example:9000')
+
+  // Say yes next time and the fake Host re-exec is requested.
+  input.push('/provider')
+  input.push('\r')
+  await waitFor(() => output.text.includes('/fake/cordis.patch.yml'))
+  input.push('r')
+  await waitFor(() => output.text.includes('restart host'))
+  input.push('y')
+  await waitFor(() => output.text.includes('host restarting'))
+
+  input.push('\u0003')
   input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()

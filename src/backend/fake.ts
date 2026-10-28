@@ -1,11 +1,19 @@
 import { randomUUID } from 'node:crypto'
 
-import type { ModelCatalog, ModelSelection, SessionEvent, SessionHeader } from '../protocol/index.js'
+import type {
+  ModelCatalog,
+  ModelSelection,
+  ProviderEntry,
+  ProviderField,
+  SessionEvent,
+  SessionHeader,
+} from '../protocol/index.js'
 import {
   BackendError,
   type CreateSessionOptions,
   type DshellBackend,
   type DshellCapabilities,
+  type ProviderList,
   type SendOptions,
   type SendReceipt,
   type SessionHandle,
@@ -26,6 +34,7 @@ const CAPABILITIES: DshellCapabilities = {
   paging: true,
   approvals: true,
   models: true,
+  providers: true,
 }
 
 interface FakeSession {
@@ -55,6 +64,11 @@ export class FakeBackend implements DshellBackend {
   private nextId = 1
   private defaultModel: ModelSelection = { provider: 'fake', model: 'fake-flash' }
   private readonly sessionModels = new Map<string, ModelSelection>()
+  /** Providers the fake patch file declares; `updateProvider` mutates this. */
+  private readonly providerRows: ProviderEntry[] = [
+    { id: 'fake', displayName: 'Fake Provider', baseURL: 'https://api.example/v1', apiKeyEnv: 'FAKE_API_KEY', models: 2 },
+    { id: 'relay', displayName: 'Relay', baseURL: 'http://relay.example:8180', models: 1 },
+  ]
   private readonly catalog: ModelCatalog = {
     default: { provider: 'fake', model: 'fake-flash' },
     routableProviders: ['fake', 'relay'],
@@ -128,6 +142,28 @@ export class FakeBackend implements DshellBackend {
     this.sessionModels.set(sessionId, selected)
     this.defaultModel = selected
     return selected
+  }
+
+  async providerList(): Promise<ProviderList> {
+    this.assertConnected()
+    return {
+      file: '/fake/cordis.patch.yml',
+      writable: true,
+      providers: this.providerRows.map((row) => ({ ...row })),
+    }
+  }
+
+  async updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList> {
+    this.assertConnected()
+    const row = this.providerRows.find((candidate) => candidate.id === providerId)
+    if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
+    row[field] = value
+    return this.providerList()
+  }
+
+  async restartHost(): Promise<{ pid: number; argv: string[] }> {
+    this.assertConnected()
+    return { pid: 4242, argv: ['fake-dsh', 'dshell'] }
   }
 
   async saveDefaultModel(selection: ModelSelection): Promise<ModelSelection> {

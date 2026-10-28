@@ -7,6 +7,23 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Reasoning levels (档位) in `/model`**: models that declare `reasoning.efforts`
+  now open a Codex-style level list (`off`/`low`/`high`/`max`, each with its
+  description); `Enter` commits model + level in one `model/select`, `e`
+  reopens the list, `←` goes back, `d` saves the default with the level. The
+  last level is remembered per `provider/model` and shown in the bottom rail
+  as `provider/model · high`.
+- **Provider editor (`/provider`)**: lists the providers declared in the patch
+  file the Host booted with (`$DSH_HOME/cordis.patch.yml`, else the active
+  profile's), edits `baseURL` / `apiKeyEnv` / `displayName` in place, writes
+  only the targeted YAML scalar lines (comments and model lists survive), and
+  then asks `Restart the Host now?`. Restart re-execs the Host with its own
+  argv and the TUI reattaches the session automatically; declining keeps the
+  file change for the next start. Secrets stay out of the file — only the
+  env-var name is stored.
+- **`providers` capability + protocol messages**: `provider/list`,
+  `provider/update` and `host/restart` on the Host side, so the TUI never
+  guesses a config path or spawns a process itself.
 - **Model switching from the TUI**: `/model` reads DSH's live catalog through
   `sessionController`, switches the current session (`Enter`) and can save the
   deployment default (`d`, or `/model default provider/model`). The bottom rail

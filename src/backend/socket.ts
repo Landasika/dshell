@@ -4,10 +4,14 @@ import { DshellError, HostConnection } from '../client/socket-client.js'
 import type {
   AttachedMessage,
   ErrorMessage,
+  HostRestartingMessage,
   ModelCatalog,
   ModelCatalogMessage,
   ModelSelectedMessage,
   ModelSelection,
+  ProviderField,
+  ProviderListMessage,
+  ProviderUpdatedMessage,
   ServerMessage,
   SessionCreatedMessage,
   SessionEvent,
@@ -20,6 +24,7 @@ import {
   type CreateSessionOptions,
   type DshellBackend,
   type DshellCapabilities,
+  type ProviderList,
   type SendOptions,
   type SendReceipt,
   type SessionHandle,
@@ -66,6 +71,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     paging: has('history'),
     approvals: has('approval'),
     models: has('models'),
+    providers: has('providers'),
   }
 }
 
@@ -116,6 +122,48 @@ export class SocketBackend implements DshellBackend {
         25_000,
       )
       return message.selected
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async providerList(): Promise<ProviderList> {
+    const connection = this.requireControl()
+    connection.send({ type: 'provider/list' })
+    try {
+      const message = await connection.waitFor<ProviderListMessage>(
+        (candidate) => candidate.type === 'provider-list',
+        15_000,
+      )
+      return { file: message.file, writable: message.writable, providers: message.providers }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList> {
+    const connection = this.requireControl()
+    connection.send({ type: 'provider/update', providerId, field, value })
+    try {
+      const message = await connection.waitFor<ProviderUpdatedMessage>(
+        (candidate) => candidate.type === 'provider-updated',
+        15_000,
+      )
+      return { file: message.file, writable: true, providers: message.providers }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async restartHost(): Promise<{ pid: number; argv: string[] }> {
+    const connection = this.requireControl()
+    connection.send({ type: 'host/restart' })
+    try {
+      const message = await connection.waitFor<HostRestartingMessage>(
+        (candidate) => candidate.type === 'host-restarting',
+        10_000,
+      )
+      return { pid: message.pid, argv: message.argv }
     } catch (error) {
       throw mapError(error)
     }

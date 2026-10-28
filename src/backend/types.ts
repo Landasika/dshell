@@ -2,6 +2,8 @@ import type {
   DshellErrorCode,
   ModelCatalog,
   ModelSelection,
+  ProviderEntry,
+  ProviderField,
   SessionEvent,
   SessionHeader,
 } from '../protocol/index.js'
@@ -51,6 +53,15 @@ export interface DshellCapabilities {
   approvals: boolean
   /** Provider/model catalog and live model switching are available. */
   models: boolean
+  /** The Host can read and rewrite its provider patch file, and restart itself. */
+  providers: boolean
+}
+
+/** The provider rows of the Host's active patch file. */
+export interface ProviderList {
+  file: string
+  writable: boolean
+  providers: ProviderEntry[]
 }
 
 export interface WorkspaceSummary {
@@ -151,4 +162,11 @@ export interface DshellBackend {
   selectModel(sessionId: string, selection: ModelSelection): Promise<ModelSelection>
   /** Persist the default model for agents created without an explicit model. */
   saveDefaultModel(selection: ModelSelection): Promise<ModelSelection>
+
+  /** Read the providers declared in the Host's patch file. */
+  providerList(): Promise<ProviderList>
+  /** Rewrite one provider field; takes effect after the Host restarts. */
+  updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>
+  /** Re-exec the Host process; the socket disappears and comes back. */
+  restartHost(): Promise<{ pid: number; argv: string[] }>
 }
