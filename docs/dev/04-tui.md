@@ -69,7 +69,7 @@ dshell --no-color              # 禁用颜色
   一行摘要，`--verbose` 显示全文；
 - `tool/call` + `tool/result` 按 `callId` 配对，工具卡显示
   `▸`（运行中）/ `✓`（成功）/ `✗`（失败）；默认折叠成一行
-  `✓ bash · <参数摘要>`，输出不铺开——`Ctrl-O` 原地展开，或
+  `✓ Bash(<主参数>)`，输出不铺开——`Ctrl-O` 原地展开，或
   `Alt+↑/↓` 选中后 `Enter` 在详情面板里看；失败的调用仍显示前两行输出；
 - `todo/write` → `☐ todos` 列表；
 - `subagent/*` → 生命周期提示；

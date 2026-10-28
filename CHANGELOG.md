@@ -18,8 +18,9 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
-- Tool calls are folded to one line (`✓ bash · List files · ls`) instead of
-  dumping their output into the transcript. `Ctrl-O` expands them inline, and
+- Tool calls are folded to one line, Claude-Code style — `✓ Bash(ls -la)`,
+  `✓ Read(src/tui/app.ts)`, `✓ Grep(reconnect)` — instead of dumping their
+  output into the transcript; long calls end in `…` at the terminal width. `Ctrl-O` expands them inline, and
   `Alt+↑/↓` + `Enter` opens the detail panel; failures still show their first
   two output lines so errors stay visible.
 

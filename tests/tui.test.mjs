@@ -1946,10 +1946,10 @@ test('tool calls are folded to one line until ctrl+o or the detail panel asks', 
   await waitFor(() => output.text.includes('idle'), 'the first attach')
   try {
     const text = stripAnsi(output.text)
-    assert.match(text, /✓ bash · List files · ls/)
+    assert.match(text, /✓ Bash\(ls\)/)
     assert.equal(text.includes('alpha.txt'), false, 'successful output stays folded')
     // A failure keeps a two-line excerpt so the reason is visible.
-    assert.match(text, /✗ bash · Fail on purpose/)
+    assert.match(text, /✗ Bash\(false\)/)
     assert.match(text, /boom: exit 1/)
 
     // Ctrl-O expands the output inline.

@@ -178,7 +178,8 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   `~/.dsh` stays responsive.
 - header: brand, session title, status (idle / running / approval / error) and
   working directory.
-- tool calls: folded to one line — `✓ bash · List files · ls` — like Claude Code.
+- tool calls: folded to one line, Claude-Code style — `✓ Bash(rg --files -g "*.ts")`,
+  with the identifying argument only and a trailing `…` when it does not fit.
   `Ctrl-O` expands every call's argument summary and output inline; selecting
   one with `Alt+↑/↓` and pressing `Enter` opens the same detail in a scrollable
   panel. A failed call keeps its first two output lines visible.

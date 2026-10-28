@@ -29,6 +29,8 @@ export interface Block {
   meta?: string
   /** How many assistant steps were folded into this block. */
   steps?: number
+  /** One-line call signature for a tool block, e.g. `Bash(ls -la)`. */
+  headline?: string
 }
 
 function shortAgent(id: string): string {
@@ -124,6 +126,74 @@ export function summarizeTool(name: string, rawArguments: unknown): string {
   return truncate(compact, 180)
 }
 
+/** Claude-Code-style labels for the tools dshell knows by name. */
+const TOOL_LABELS: Record<string, string> = {
+  bash: 'Bash',
+  read: 'Read',
+  read_image: 'Image',
+  write: 'Write',
+  edit: 'Edit',
+  apply_patch: 'Patch',
+  grep: 'Grep',
+  glob: 'Glob',
+  task: 'Task',
+  web_fetch: 'Fetch',
+  web_search: 'Search',
+  todo: 'Todo',
+  ask_user_question: 'Ask',
+  skill: 'Skill',
+  subagent: 'Agent',
+}
+
+/** The single argument that identifies a call, the way Claude Code shows it. */
+function primaryArgument(name: string, args: Record<string, unknown>): string {
+  const pick = (keys: readonly string[]): string => {
+    for (const key of keys) {
+      const value = args[key]
+      if (typeof value === 'string' && value.trim().length > 0) return value
+    }
+    return ''
+  }
+  switch (name) {
+    case 'bash':
+      return pick(['command', 'cmd'])
+    case 'read':
+    case 'read_image':
+    case 'write':
+    case 'edit':
+    case 'apply_patch':
+      return pick(['file_path', 'path', 'file'])
+    case 'grep':
+    case 'glob':
+      return pick(['pattern', 'query', 'glob'])
+    case 'web_fetch':
+      return pick(['url'])
+    case 'web_search':
+      return pick(['query', 'q'])
+    case 'task':
+    case 'skill':
+      return pick(['description', 'name', 'prompt'])
+    case 'todo':
+      return ''
+    default: {
+      const first = Object.values(args).find((value) => typeof value === 'string' && value.trim().length > 0)
+      return typeof first === 'string' ? first : ''
+    }
+  }
+}
+
+/**
+ * `Bash(ls -la)` — the one-line call signature shown while a tool is folded.
+ * Long commands keep their head and end in an ellipsis at render time.
+ */
+export function toolSignature(name: string, rawArguments: unknown): string {
+  const args = toolArguments(rawArguments)
+  const label = TOOL_LABELS[name] ?? `${name.slice(0, 1).toUpperCase()}${name.slice(1)}`
+  const primary = primaryArgument(name, args).replace(/\s+/g, ' ').trim()
+  if (primary.length === 0) return label
+  return `${label}(${truncate(primary, 300)})`
+}
+
 function toolResultText(data: Json): string {
   const message = (data.message ?? data) as Json
   const text = contentText(message.content)
@@ -207,6 +277,7 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
           toolName: name,
           callId,
           body: summarizeTool(name, data.arguments ?? data.input),
+          headline: toolSignature(name, data.arguments ?? data.input),
         }
         blocks.push(block)
         callBlocks.set(callId, block)
@@ -461,10 +532,9 @@ export function renderBlocksWithRanges(
         const failed = block.failed === true
         const marker = failed ? '✗' : block.detail === undefined ? '▸' : '✓'
         const color = failed ? 'red' : block.detail === undefined ? 'yellow' : 'green'
-        const label = block.title ?? block.toolName ?? 'tool'
-        const summary = block.body.replace(/\s+/g, ' ').trim()
-        const head = `${paint(theme, color, `${marker} ${label}`)}${summary.length > 0 ? paint(theme, 'dim', ` · ${summary}`) : ''}`
-        out.push(truncate(head, width))
+        const label =
+          block.headline ?? `${block.title ?? block.toolName ?? 'tool'}${block.body.length > 0 ? ` · ${block.body}` : ''}`
+        out.push(truncate(`${paint(theme, color, `${marker} ${label}`)}`, width))
         if (options.expandTools === true) {
           if (block.body.length > 0) {
             for (const line of wrapText(block.body, Math.max(1, width - 2))) {
