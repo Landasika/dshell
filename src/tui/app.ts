@@ -1281,7 +1281,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
-  const handleOverlayKey = (key: Key): void => {
+  const handleOverlayKey = (rawKey: Key): void => {
+    // Some terminals (and Shift+Enter) send LF where the rest of the app means
+    // "confirm". Inside a picker both should commit, so alias them here.
+    const key: Key = rawKey.type === 'newline' ? { type: 'enter' } : rawKey
     const overlay = state.overlay
     if (overlay === null) return
     if (key.type === 'escape') {
@@ -1448,6 +1451,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       } else if (key.type === 'text' && key.text.toLowerCase() === 'd') {
         const effort = efforts[overlay.index]
         if (row !== undefined && effort !== undefined) void saveModelDefault(row, effort.id)
+        return
+      } else if (key.type === 'text' && /^[1-9]$/.test(key.text)) {
+        // Positional shortcut: 1 = first level, 2 = second, … commits directly.
+        const effort = efforts[Number(key.text) - 1]
+        if (row !== undefined && effort !== undefined) void applyModel(row, effort.id)
         return
       }
       schedule()
@@ -2105,7 +2113,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
       if (efforts.length === 0) body.push(paint(theme, 'muted', 'this model declares no reasoning levels'))
       return panelBox(theme, 'reasoning level', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ select · enter switch · d default · ← back · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ or 1-9 pick · enter switch · d default · ← back · esc close')],
       })
     }
     if (overlay.kind === 'providers') {

@@ -85,7 +85,20 @@ export class FakeBackend implements DshellBackend {
       {
         id: 'relay',
         name: 'Relay',
-        models: [{ id: 'relay-flash', name: 'Relay Flash', reasoning: { efforts: [{ id: 'low', name: 'Low' }], defaultEffort: 'low' } }],
+        models: [
+          {
+            id: 'relay-flash',
+            name: 'Relay Flash',
+            reasoning: {
+              efforts: [
+                { id: 'off', name: 'Off', description: 'No reasoning.' },
+                { id: 'low', name: 'Low', description: 'Prefer for routine or latency-sensitive tasks.' },
+                { id: 'high', name: 'High', description: 'The default balance for most tasks.' },
+              ],
+              defaultEffort: 'low',
+            },
+          },
+        ],
       },
     ],
     failures: [],

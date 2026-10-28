@@ -267,7 +267,9 @@ Commands: `/sessions` (aliases `/session`, `/resume`), `/workspaces`, `/new`,
 - models that declare reasoning levels step into a level list first
   (`off` / `low` / `high` / `max`, each with its own description); `Enter`
   there commits model **and** level in one selection
-- `e` reopens the level list for the highlighted model, `←` goes back
+- in the level list `↑/↓` moves and `1`-`9` jumps straight to that level
+  (Enter or `Shift+Enter` commits it); `e` reopens the level list for the
+  highlighted model, `←` goes back
 - `d` saves the highlighted model (and shown level) as the default
 - `/model provider/model` switches directly; `/model default provider/model`
   saves a default without touching the current session

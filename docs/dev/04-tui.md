@@ -121,9 +121,9 @@ Slash commands：
 /quit
 ```
 
-`/model`：目录 →（带 reasoning 档位的模型）档位列表 → `Enter` 一次提交
-`{provider, model, reasoningEffort}`；`e` 重开档位，`←` 退回，`d` 连同档位设为
-默认。档位按 `provider/model` 记忆，底栏显示 `provider/model · high`。
+`/model`：目录 →（带 reasoning 档位的模型）档位列表 → `Enter`（或 `Shift+Enter`）一次提交
+`{provider, model, reasoningEffort}`；档位列表里 `1`-`9` 直选第 n 档，`e` 重开
+档位，`←` 退回，`d` 连同档位设为默认。档位按 `provider/model` 记忆，底栏显示 `provider/model · high`。
 
 `/provider`：读取 Host 启动用的 patch 文件（`$DSH_HOME/cordis.patch.yml`，否则
 当前 profile 的同名文件）中的 `llm-pi-ai` provider 行；`Enter` 编辑

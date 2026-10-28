@@ -12,7 +12,8 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   description); `Enter` commits model + level in one `model/select`, `e`
   reopens the list, `←` goes back, `d` saves the default with the level. The
   last level is remembered per `provider/model` and shown in the bottom rail
-  as `provider/model · high`.
+  as `provider/model · high`. Inside a picker `Shift+Enter` (LF) now commits
+  like `Enter`, and `1`-`9` in the level list jump straight to that level.
 - **Provider editor (`/provider`)**: lists the providers declared in the patch
   file the Host booted with (`$DSH_HOME/cordis.patch.yml`, else the active
   profile's), edits `baseURL` / `apiKeyEnv` / `displayName` in place, writes
