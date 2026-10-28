@@ -262,6 +262,7 @@ function isCommand(text: string): boolean {
 function timeAgo(timestamp: number | undefined): string {
   if (timestamp === undefined) return ''
   const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000))
+  if (seconds < 10) return 'just now'
   if (seconds < 60) return `${seconds}s ago`
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
   if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h ago`
@@ -566,7 +567,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   // picker will actually show.
   const refreshSessions = async (workspaceId?: string): Promise<void> => {
     try {
-      state.sessions = await backend.listSessions(workspaceId)
+      const sessions = await backend.listSessions(workspaceId)
+      // Most recently edited first, whichever time the backend could provide.
+      state.sessions = [...sessions].sort(
+        (left, right) => (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0),
+      )
       schedule()
     } catch (error) {
       // A dropped socket is handled by the reconnect loop; do not paint a
@@ -2555,7 +2560,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const index = start + offset
         const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
         const live = session.live === true ? paint(theme, 'success', 'live') : paint(theme, 'muted', 'cold')
-        const age = timeAgo(session.createdAt)
+        const age = timeAgo(session.updatedAt ?? session.createdAt)
         const label = session.title?.trim() || 'untitled session'
         const row = `${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(label, 26))}`
         const right = `${live} ${paint(theme, 'muted', age)}`
@@ -2738,7 +2743,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         label: title === undefined || title.length === 0 ? 'untitled session' : title,
         live: session.live === true,
         cwd: session.cwd ?? '',
-        age: timeAgo(session.createdAt),
+        age: timeAgo(session.updatedAt ?? session.createdAt),
       }
     })
     return renderSplash(theme, {

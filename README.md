@@ -145,6 +145,11 @@ choose session
   Release checklist                                         cold 3d ago
 ```
 
+`live`/`cold` is the attachment state; the age is the session's **last edit**
+(the newest durable prompt, from the Host's session-list projection, falling
+back to the creation time), and rows are ordered by it — the session you last
+touched is always first.
+
 Inside a session:
 
 ```text

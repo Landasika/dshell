@@ -103,6 +103,8 @@ export interface SessionSummary {
   cwd?: string
   title?: string
   createdAt?: number
+  /** Durable time of the last user prompt (falls back to createdAt). */
+  updatedAt?: number
   live?: boolean
   persisted?: boolean
   formatStatus?: string

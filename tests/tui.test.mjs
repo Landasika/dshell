@@ -1843,3 +1843,60 @@ test('a queued prompt can be edited or deleted from the block cursor', async () 
     await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
   }
 })
+
+test('the session picker shows the last edit time and orders by it', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const now = Date.now()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([
+    { sessionId: 'old', cwd: '/work', title: 'created long ago', createdAt: now - 5 * 86_400_000, updatedAt: now - 30 * 60_000 },
+    { sessionId: 'new', cwd: '/work', title: 'touched now', createdAt: now - 3 * 60_000, updatedAt: now - 5_000 },
+  ])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', input, output, color: false })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('touched now'), 'the session list')
+    const text = stripAnsi(output.text)
+    // The picker shows activity ("just now"), not the creation time ("3m ago").
+    assert.match(text, /just now/)
+    assert.match(text, /30m ago/)
+    assert.equal(text.includes('5d ago'), false)
+    assert.equal(
+      text.indexOf('touched now') < text.indexOf('created long ago'),
+      true,
+      'the most recently edited session is first',
+    )
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})

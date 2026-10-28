@@ -18,6 +18,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- The session list (startup picker and `/sessions`) shows the **last edit**
+  time instead of the creation time and is ordered by it. The Host now carries
+  `updatedAt` from the session-list activity projection; sessions that the
+  projection has not seen yet still fall back to `createdAt`.
+
 - `Ctrl-C` in a running turn aborts that turn and then continues the `Alt+Enter`
   queue: an abort drops the Host inbox, so the TUI re-queues the prompts it is
   still tracking (the Host then starts them as soon as the abort settles —

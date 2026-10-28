@@ -177,6 +177,10 @@ interface AgentDefaultModelLike {
 interface SessionControllerLike {
   modelCatalog(): Promise<ModelCatalog>
   selectModel(request: ModelSelection & { sessionId: string }): Promise<{ selected: ModelSelection }>
+  list?(
+    request: { cursor?: string },
+    signal: AbortSignal,
+  ): Promise<{ items: readonly { sessionId: string; updatedAt: number }[] }>
 }
 
 interface PluginContext {
@@ -440,6 +444,29 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (cached !== undefined && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions
     const records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
     if (records === undefined) return []
+    // The durable activity time comes from the Host's session list projection;
+    // without it the picker falls back to the creation time.
+    const activity = new Map<string, number>()
+    const controller = sessionController()
+    if (controller?.list !== undefined) {
+      const abort = new AbortController()
+      const timer = setTimeout(() => abort.abort(), 4_000)
+      try {
+        const listed = await controller.list({}, abort.signal)
+        for (const item of listed.items ?? []) {
+          if (typeof item?.sessionId === 'string' && typeof item.updatedAt === 'number') {
+            activity.set(item.sessionId, item.updatedAt)
+          }
+        }
+      } catch {
+        // Activity is presentation metadata; a slow or missing projection must
+        // not keep the picker from showing the sessions.
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    const lastActivity = (record: SessionRecordLike): number =>
+      activity.get(record.header.id) ?? record.header.createdAt ?? 0
     const workspaces = workspaceList()
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
     const workspaceOf = (record: SessionRecordLike): WorkspaceSummary | undefined =>
@@ -448,7 +475,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       .filter((record) => record.header.origin !== 'subagent' && record.header.parentSession === undefined)
       .map((record) => ({ record, workspace: workspaceOf(record) }))
       .filter((entry) => workspaceId === undefined || entry.workspace?.id === workspaceId)
-      .sort((left, right) => (right.record.header.createdAt ?? 0) - (left.record.header.createdAt ?? 0))
+      .sort((left, right) => lastActivity(right.record) - lastActivity(left.record))
 
     const titles = new Map<string, string>()
     const TITLE_CACHE_MS = 300_000
@@ -500,6 +527,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         ...(title === undefined || title.length === 0 ? {} : { title }),
         cwd: record.header.cwd,
         createdAt: record.header.createdAt,
+        ...(activity.has(record.header.id) ? { updatedAt: activity.get(record.header.id) } : {}),
         live: record.live,
         persisted: record.persisted,
         formatStatus: record.formatStatus,

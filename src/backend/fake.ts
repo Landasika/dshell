@@ -40,6 +40,8 @@ const CAPABILITIES: DshellCapabilities = {
 
 interface FakeSession {
   header: SessionHeader
+  /** Durable last-activity time; defaults to the newest event or createdAt. */
+  updatedAt?: number
   events: SessionEvent[]
   cursor: number
   status: 'idle' | 'running'
@@ -53,6 +55,7 @@ export interface FakeSessionSeed {
   cwd?: string
   title?: string
   createdAt?: number
+  updatedAt?: number
   events?: SessionEvent[]
 }
 
@@ -112,6 +115,7 @@ export class FakeBackend implements DshellBackend {
       const createdAt = seed.createdAt ?? Date.now()
       this.sessions.set(seed.sessionId, {
         header: { id: seed.sessionId, cwd: seed.cwd, createdAt, ...(seed.title === undefined ? {} : { title: seed.title }) },
+        ...(seed.updatedAt === undefined ? {} : { updatedAt: seed.updatedAt }),
         events: [...(seed.events ?? [])],
         cursor: Math.max(-1, ...(seed.events ?? []).map((event) => event.seq)),
         status: 'idle',
@@ -241,7 +245,7 @@ export class FakeBackend implements DshellBackend {
         return workspace?.id === workspaceId
       })
       .map((session) => this.summary(session))
-      .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))
+      .sort((left, right) => (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0))
   }
 
   async createSession(options: CreateSessionOptions = {}): Promise<SessionHandle> {
@@ -375,6 +379,7 @@ export class FakeBackend implements DshellBackend {
       ...(session.header.title === undefined ? {} : { title: session.header.title }),
       cwd: session.header.cwd,
       createdAt: session.header.createdAt,
+      ...(session.updatedAt === undefined ? {} : { updatedAt: session.updatedAt }),
       live: session.status === 'running',
       persisted: true,
       workspaceId: workspace?.id,
