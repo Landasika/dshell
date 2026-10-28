@@ -2110,6 +2110,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           : ''
         body.push(`${marker}${badge} ${paint(theme, selected ? 'text' : 'muted', truncate(label, 30))}  ${idPart}${level}`)
       }
+      body.push('')
+      body.push(
+        `${paint(theme, 'success', '●')} ${paint(theme, 'muted', 'in use')}   ${paint(theme, 'accent', '◆')} ${paint(theme, 'muted', 'default for new sessions')}   ${paint(theme, 'accent', '▸')} ${paint(theme, 'muted', 'cursor')}`,
+      )
       return panelBox(theme, 'model', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter model/level · e levels · d default · esc close')],
       })
@@ -2131,6 +2135,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         body.push(`${marker}${badge} ${name} ${detail}`)
       }
       if (efforts.length === 0) body.push(paint(theme, 'muted', 'this model declares no reasoning levels'))
+      body.push('')
+      body.push(
+        `${paint(theme, 'success', '●')} ${paint(theme, 'muted', 'in use')}   ${paint(theme, 'accent', '▸')} ${paint(theme, 'muted', 'cursor · enter applies')}`,
+      )
       return panelBox(theme, 'reasoning level', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ or 1-9 pick · enter switch · d default · ← back · esc close')],
       })
