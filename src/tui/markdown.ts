@@ -1,5 +1,137 @@
 import { paint, type Theme } from './theme.js'
-import { sanitizeText, truncate, wrapText } from './width.js'
+import { displayWidth, pad, sanitizeText, truncate, wrapText } from './width.js'
+
+const TABLE_SEPARATOR = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/
+
+/** Remove the inline markers that would otherwise show up inside a cell. */
+function cleanCell(text: string): string {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/(?<![\w])__([^_]+)__(?![\w./])/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
+    .trim()
+}
+
+/** Split one markdown table row into trimmed cells, honouring `\\|`. */
+function tableCells(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '')
+  const cells: string[] = []
+  let current = ''
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index]
+    if (char === '\\' && trimmed[index + 1] === '|') {
+      current += '|'
+      index += 1
+    } else if (char === '|') {
+      cells.push(current.trim())
+      current = ''
+    } else {
+      current += char
+    }
+  }
+  cells.push(current.trim())
+  return cells
+}
+
+function alignCell(text: string, size: number, align: 'left' | 'center' | 'right'): string {
+  if (align !== 'center') return pad(text, size, align)
+  const room = Math.max(0, size - displayWidth(text))
+  const left = Math.floor(room / 2)
+  return `${' '.repeat(left)}${text}${' '.repeat(room - left)}`
+}
+
+function tableAlignments(separator: string, count: number): ('left' | 'center' | 'right')[] {
+  const cells = tableCells(separator)
+  return Array.from({ length: count }, (_, index) => {
+    const cell = cells[index] ?? ''
+    const left = cell.startsWith(':')
+    const right = cell.endsWith(':')
+    if (left && right) return 'center'
+    if (right) return 'right'
+    return 'left'
+  })
+}
+
+/**
+ * Try to render a markdown table that starts at `start`. The caller has
+ * already skipped code fences, so pipes there stay literal. Returns the rows
+ * and the index of the last consumed line, or null when this is not a table.
+ */
+function tryTable(
+  raw: readonly string[],
+  start: number,
+  width: number,
+  theme: Theme,
+): { lines: string[]; end: number } | null {
+  const header = raw[start] ?? ''
+  const separator = raw[start + 1] ?? ''
+  if (!header.includes('|') || !TABLE_SEPARATOR.test(separator) || !separator.includes('-')) return null
+  if (width < 12) return null
+
+  const head = tableCells(header)
+  if (head.length < 2) return null
+  const rows: string[][] = []
+  let end = start + 1
+  for (let index = start + 2; index < raw.length; index += 1) {
+    const line = raw[index] ?? ''
+    if (!line.includes('|') || line.trim().length === 0) break
+    if (TABLE_SEPARATOR.test(line)) break
+    rows.push(tableCells(line))
+    end = index
+  }
+
+  const columnCount = head.length
+  const aligns = tableAlignments(separator, columnCount)
+  const cellsOf = (row: readonly string[]): string[] =>
+    Array.from({ length: columnCount }, (_, index) => cleanCell(row[index] ?? ''))
+  const body = rows.map(cellsOf)
+
+  // Natural width per column, then shrink the widest ones until the table fits.
+  const widths = head.map((cell, index) => {
+    const values = [cleanCell(cell), ...body.map((row) => row[index] ?? '')]
+    return Math.max(3, ...values.map((value) => displayWidth(value)))
+  })
+  // Each column contributes two padding cells and the table has one border
+  // per column plus the outer pair.
+  const chrome = 3 * columnCount + 1
+  const available = Math.max(columnCount * 3, width - chrome)
+  let excess = widths.reduce((sum, value) => sum + value, 0) - available
+  while (excess > 0) {
+    let widest = 0
+    for (let index = 1; index < widths.length; index += 1) {
+      if ((widths[index] ?? 0) > (widths[widest] ?? 0)) widest = index
+    }
+    if ((widths[widest] ?? 0) <= 3) break
+    widths[widest] = (widths[widest] ?? 0) - 1
+    excess -= 1
+  }
+
+  const border = (left: string, middle: string, right: string): string =>
+    paint(theme, 'gray', `${left}${widths.map((size) => '─'.repeat(size + 2)).join(middle)}${right}`)
+  const renderRow = (row: readonly string[], bold: boolean): string[] => {
+    const wrapped = row.map((value, index) =>
+      wrapText(value, Math.max(1, widths[index] ?? 3)),
+    )
+    const height = Math.max(1, ...wrapped.map((parts) => parts.length))
+    const rendered: string[] = []
+    for (let line = 0; line < height; line += 1) {
+      const parts = wrapped.map((parts, index) => {
+        const cell = alignCell(parts[line] ?? '', widths[index] ?? 3, aligns[index] ?? 'left')
+        return bold ? paint(theme, 'bold', cell) : cell
+      })
+      rendered.push(`${paint(theme, 'gray', '│')} ${parts.join(` ${paint(theme, 'gray', '│')} `)} ${paint(theme, 'gray', '│')}`)
+    }
+    return rendered
+  }
+
+  const lines: string[] = [border('┌', '┬', '┐')]
+  lines.push(...renderRow(head.map(cleanCell), true))
+  lines.push(border('├', '┼', '┤'))
+  for (const row of body) lines.push(...renderRow(row, false))
+  lines.push(border('└', '┴', '┘'))
+  return { lines, end }
+}
 
 function isDiff(text: string): boolean {
   return /^(diff --git |--- a\/|\+\+\+ b\/|@@ )/m.test(text)
@@ -14,8 +146,10 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
   const lines: string[] = []
   let inFence = false
   let fenceLanguage = ''
+  const source = safe.split('\n')
 
-  for (const raw of safe.split('\n')) {
+  for (let index = 0; index < source.length; index += 1) {
+    const raw = source[index] ?? ''
     const line = raw.replace(/\s+$/, '')
     const fence = /^\s*```(.*)$/.exec(line)
     if (fence !== null) {
@@ -38,6 +172,13 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
 
     if (line.trim().length === 0) {
       lines.push('')
+      continue
+    }
+
+    const table = tryTable(source, index, width, theme)
+    if (table !== null) {
+      lines.push(...table.lines)
+      index = table.end
       continue
     }
 

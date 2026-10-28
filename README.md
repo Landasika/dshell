@@ -178,6 +178,10 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   `~/.dsh` stays responsive.
 - header: brand, session title, status (idle / running / approval / error) and
   working directory.
+- markdown: headings, lists, quotes, fenced code, diffs and **tables**. Tables
+  are drawn as a box grid with per-column alignment (`:---`, `:--:`, `---:`),
+  cells wider than the terminal wrap instead of being cut off, and CJK/emoji
+  count as two cells so the borders stay aligned.
 - user prompts: drawn on a grey band with white text and a `>` marker, so the
   prompt that started a turn is easy to find when scrolling back. Assistant
   text carries a single `dshell` header per turn — later steps after a tool

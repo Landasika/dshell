@@ -16,6 +16,13 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   (through a new `queue/remove` Host command; `queue/edit` rewrites it in
   place), and `Esc` clears the selection.
 
+### Added
+
+- Markdown tables render as a box-drawn grid: column alignment follows the
+  `:---` / `:--:` / `---:` markers, wide tables shrink and wrap their cells to
+  the terminal width, escaped `\|` stays inside its cell, and pipes inside
+  code fences are left alone.
+
 ### Changed
 
 - User prompts render on a light-grey band with white text, so what you sent
