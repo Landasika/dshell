@@ -83,7 +83,7 @@ const PALETTE = {
   bgPanel: '#1b2230',
   bgFree: '#252e3f',
   selection: '#2c3a58',
-  bgUser: '#5f6975',
+  bgUser: '#7c8697',
   userText: '#ffffff',
 } as const
 
