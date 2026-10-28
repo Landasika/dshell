@@ -25,6 +25,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- The user-prompt band is a translucent slate (`#343c4b`, the old grey mixed
+  over the panel colour) instead of a solid grey block.
+
+
 - The queue below the transcript is now the Host's real inbox: dshell folds
   the durable `agent/inbox/spliced` events (the same projection the Web UI
   uses) instead of only remembering what this client sent. Prompts queued by a

@@ -83,7 +83,10 @@ const PALETTE = {
   bgPanel: '#1b2230',
   bgFree: '#252e3f',
   selection: '#2c3a58',
-  bgUser: '#7c8697',
+  // A translucent slate rather than a solid grey slab: this is the old
+  // `#7c8697` blended ~26% over `bgPanel`, so the band reads as a tint of the
+  // terminal background instead of a block of its own.
+  bgUser: '#343c4b',
   userText: '#ffffff',
 } as const
 
