@@ -19,6 +19,9 @@ test('markdown tables render as a box-drawn grid with aligned columns', () => {
   // Every row has the same display width, so the borders line up.
   const widths = new Set(lines.map((line) => displayWidth(line)))
   assert.equal(widths.size, 1, `ragged table: ${JSON.stringify(lines)}`)
+  // Every row is separated: one rule under the header, one between the two
+  // body rows.
+  assert.equal(lines.filter((line) => line.startsWith('├')).length, 2)
   // The header separator sits between the header and the body.
   const separator = lines.findIndex((line) => line.startsWith('├'))
   assert.equal(lines[separator - 1]?.includes('name'), true)

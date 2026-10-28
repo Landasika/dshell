@@ -128,7 +128,12 @@ function tryTable(
   const lines: string[] = [border('┌', '┬', '┐')]
   lines.push(...renderRow(head.map(cleanCell), true))
   lines.push(border('├', '┼', '┤'))
-  for (const row of body) lines.push(...renderRow(row, false))
+  for (const [index, row] of body.entries()) {
+    // A rule between body rows too: a wrapped cell spans several lines, and
+    // without it two records run together.
+    if (index > 0) lines.push(border('├', '┼', '┤'))
+    lines.push(...renderRow(row, false))
+  }
   lines.push(border('└', '┴', '┘'))
   return { lines, end }
 }
