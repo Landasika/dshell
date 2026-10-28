@@ -211,6 +211,15 @@ export class HostConnection {
 
   private receive(message: ServerMessage): void {
     if (message.type === 'welcome') this.welcomeMessage = message
+    // Errors are replies to the command in flight, never a broadcast: reject
+    // every pending waiter so callers see the failure immediately instead of
+    // blocking until their timeout.
+    if (message.type === 'error') {
+      for (const listener of this.listeners) listener(message)
+      const error = new DshellError(message.code, message.message, message.action)
+      for (const waiter of [...this.waiters]) waiter.reject(error)
+      return
+    }
     this.queue.push(message)
     for (const listener of this.listeners) listener(message)
     for (const waiter of [...this.waiters]) {

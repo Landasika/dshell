@@ -101,6 +101,47 @@ test('handshake error is surfaced as DshellError', async (t) => {
   )
 })
 
+test('a command error rejects the pending waiter immediately', async (t) => {
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') {
+      write(socket, {
+        type: 'welcome',
+        protocol: 2,
+        pluginVersion: 'test',
+        dshVersion: 'test',
+        capabilities: ['list', 'models'],
+        socketPath: 'test.sock',
+        sessions: [],
+      })
+    } else if (message.type === 'model/select') {
+      write(socket, {
+        type: 'error',
+        code: 'INTERNAL',
+        message: 'provider "x" model "y" does not support reasoning effort "off"',
+        action: 'pick another level',
+      })
+    }
+  })
+  const connection = await HostConnection.connect(server.socketPath)
+  t.after(async () => {
+    connection.close()
+    await server.close()
+  })
+
+  const started = Date.now()
+  connection.send({ type: 'model/select', sessionId: 's1', provider: 'x', model: 'y', reasoningEffort: 'off' })
+  await assert.rejects(
+    connection.waitFor((message) => message.type === 'model-selected', 20_000),
+    (error) =>
+      error instanceof DshellError &&
+      error.code === 'INTERNAL' &&
+      /does not support reasoning effort/.test(error.message) &&
+      error.action === 'pick another level',
+  )
+  // The rejection is immediate; the 20s waiter timeout never fires.
+  assert.equal(Date.now() - started < 2_000, true)
+})
+
 test('missing socket maps to HOST_NOT_RUNNING', async () => {
   await assert.rejects(
     HostConnection.connect('/tmp/dshell-does-not-exist.sock', 1_000),

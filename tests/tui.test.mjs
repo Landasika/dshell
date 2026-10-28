@@ -1255,6 +1255,64 @@ test('TUI effort picker shows levels and remembers the choice in the rail', asyn
   await backend.disconnect()
 })
 
+test('a rejected model switch surfaces the Host error instead of hanging', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  backend.selectModel = async () => {
+    throw new Error('provider "x" model "y" does not support reasoning effort "off"')
+  }
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 200; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+  const pause = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  await waitFor(() => output.text.includes('idle'))
+  input.push('/model')
+  input.push('\r')
+  await waitFor(() => output.text.includes('Relay Flash'))
+  input.push('\u001b[B')
+  await pause()
+  input.push('\u001b[B')
+  await pause()
+  input.push('\r')
+  await waitFor(() => output.text.includes('reasoning level'))
+  input.push('\r')
+  await waitFor(() => output.text.includes('model switch failed'))
+  assert.equal(output.text.includes('does not support reasoning effort'), true)
+
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+})
+
 test('TUI level picker also accepts Shift+Enter and 1-9', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')

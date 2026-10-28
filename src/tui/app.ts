@@ -757,7 +757,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (state.modelCatalog !== undefined) state.modelCatalog.default = selected
       state.overlay = null
       const level = selected.reasoningEffort === undefined ? '' : ` · ${selected.reasoningEffort}`
-      toast(`model → ${selected.provider}/${selected.model}${level}`)
+      const note = hasEfforts(row) || selected.reasoningEffort !== undefined ? '' : ' (no reasoning levels)'
+      toast(`model → ${selected.provider}/${selected.model}${level}${note}`)
     } catch (error) {
       toast(`model switch failed: ${errorText(error)}`)
     } finally {
@@ -1420,10 +1421,28 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         if (row?.kind === 'model') {
           if (hasEfforts(row)) openEffortPicker(row)
           else void applyModel(row)
+        } else if (row?.kind === 'group') {
+          // A provider header is not selectable; Enter jumps to its first model
+          // so the key is never a silent no-op.
+          const next = modelRows().findIndex(
+            (candidate) => candidate.kind === 'model' && candidate.provider === row.provider,
+          )
+          if (next >= 0) overlay.index = next
+        } else if (row?.kind === 'failure') {
+          toast(`provider ${row.providerName ?? row.provider ?? ''} unavailable: ${row.message ?? 'no route'}`)
         }
         return
       } else if (key.type === 'text' && key.text.toLowerCase() === 'e') {
         if (row?.kind === 'model') openEffortPicker(row)
+        else if (row?.kind === 'group') {
+          const next = modelRows().findIndex(
+            (candidate) => candidate.kind === 'model' && candidate.provider === row.provider,
+          )
+          if (next >= 0) overlay.index = next
+          schedule()
+        } else if (row?.kind === 'failure') {
+          toast(`provider ${row.providerName ?? row.provider ?? ''} unavailable: ${row.message ?? 'no route'}`)
+        }
         return
       } else if (key.type === 'text' && key.text.toLowerCase() === 'd') {
         if (row?.kind === 'model') void saveModelDefault(row)

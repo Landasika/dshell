@@ -5,6 +5,18 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rejected commands no longer look frozen**: an `error` reply from the Host
+  now rejects the pending request immediately (it used to be dropped, leaving
+  the TUI to wait out its 25 s timeout). A level the provider refuses, a stale
+  session id after a Host restart and an unknown provider/model now surface as
+  a toast with the Host's own message — 8 ms instead of 25 s of silence.
+- `/model` rows that cannot be switched explain themselves: `Enter` on a
+  provider header jumps to its first model, a failed provider row shows the
+  failure reason, and switching to a model without reasoning levels says
+  `(no reasoning levels)` instead of silently skipping the level step.
+
 ### Added
 
 - **Reasoning levels (档位) in `/model`**: models that declare `reasoning.efforts`
