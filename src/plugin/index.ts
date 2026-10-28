@@ -12,6 +12,8 @@ import {
   type Capability,
   type ErrorMessage,
   type HistoryMessage,
+  type ModelCatalog,
+  type ModelSelection,
   type SessionCreatedMessage,
   type SessionEvent,
   type SessionHeader,
@@ -140,6 +142,12 @@ interface AgentPresetRegistryLike {
 
 interface AgentDefaultModelLike {
   currentSelection(): Record<string, unknown>
+  saveSelection?(selection: ModelSelection): Promise<void>
+}
+
+interface SessionControllerLike {
+  modelCatalog(): Promise<ModelCatalog>
+  selectModel(request: ModelSelection & { sessionId: string }): Promise<{ selected: ModelSelection }>
 }
 
 interface PluginContext {
@@ -166,6 +174,8 @@ interface PluginContext {
   workspaceRegistry?: WorkspaceRegistryLike
   agentPresets?: AgentPresetRegistryLike
   agentDefaultModel?: AgentDefaultModelLike
+  sessionController?: SessionControllerLike
+  get?(name: string): unknown
   on(event: string, listener: (...args: any[]) => void, options?: { global?: boolean; prepend?: boolean }): () => void
   effect(setup: () => void | (() => void | Promise<void>)): void
 }
@@ -494,6 +504,81 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     jsonLine(socket, error)
   }
 
+  const sessionController = (): SessionControllerLike | undefined => {
+    const direct = ctx.sessionController ?? ctx.get?.('sessionController')
+    return direct as SessionControllerLike | undefined
+  }
+
+  const forwardModelCatalog = async (socket: Socket): Promise<void> => {
+    const controller = sessionController()
+    if (controller === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host mounts no session controller, so it cannot list models',
+        action: 'Update the DSH Host, or select the model in the Web UI.',
+      })
+      return
+    }
+    const catalog = await controller.modelCatalog()
+    jsonLine(socket, { type: 'model-catalog', catalog })
+  }
+
+  const parseSelection = (message: Record<string, unknown>): ModelSelection | undefined => {
+    const provider = typeof message.provider === 'string' ? message.provider.trim() : ''
+    const model = typeof message.model === 'string' ? message.model.trim() : ''
+    if (provider.length === 0 || model.length === 0) return undefined
+    const effort = typeof message.reasoningEffort === 'string' && message.reasoningEffort.length > 0
+      ? message.reasoningEffort
+      : undefined
+    return { provider, model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
+  }
+
+  const selectModel = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const sessionId = typeof message.sessionId === 'string' ? message.sessionId : ''
+    const selection = parseSelection(message)
+    if (sessionId.length === 0 || selection === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'BAD_REQUEST',
+        message: 'model/select needs sessionId, provider and model',
+      })
+      return
+    }
+    const controller = sessionController()
+    if (controller === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host mounts no session controller, so it cannot switch models',
+        action: 'Update the DSH Host, or select the model in the Web UI.',
+      })
+      return
+    }
+    const { selected } = await controller.selectModel({ sessionId, ...selection })
+    jsonLine(socket, { type: 'model-selected', sessionId, selected, savedAsDefault: true })
+  }
+
+  const setDefaultModel = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const selection = parseSelection(message)
+    if (selection === undefined) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'model/default needs provider and model' })
+      return
+    }
+    const defaults = ctx.agentDefaultModel
+    if (defaults?.saveSelection === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host cannot save a default model',
+        action: 'Update the DSH Host, or select the model in the Web UI.',
+      })
+      return
+    }
+    await defaults.saveSelection(selection)
+    jsonLine(socket, { type: 'model-selected', selected: selection, savedAsDefault: true })
+  }
+
   const watch = (socket: Socket, sessionId: string): Set<string> => {
     let sessions = watched.get(socket)
     if (sessions === undefined) {
@@ -803,7 +888,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             protocol: PROTOCOL_VERSION,
             pluginVersion: packageVersion(),
             dshVersion: inferDshVersion(),
-            capabilities: [...CAPABILITIES] as Capability[],
+            capabilities: (CAPABILITIES as readonly Capability[]).filter(
+              (capability) => capability !== 'models' || sessionController() !== undefined,
+            ),
             socketPath,
             // Keep the handshake O(1). Session enumeration can block on a
             // shared DSH home (other live Hosts, locked stores); clients issue
@@ -860,6 +947,15 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'approval/answer':
           answerApproval(socket, message)
+          return
+        case 'model/catalog':
+          await forwardModelCatalog(socket)
+          return
+        case 'model/select':
+          await selectModel(socket, message)
+          return
+        case 'model/default':
+          await setDefaultModel(socket, message)
           return
         default:
           sendError(socket, {

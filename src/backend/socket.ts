@@ -4,6 +4,10 @@ import { DshellError, HostConnection } from '../client/socket-client.js'
 import type {
   AttachedMessage,
   ErrorMessage,
+  ModelCatalog,
+  ModelCatalogMessage,
+  ModelSelectedMessage,
+  ModelSelection,
   ServerMessage,
   SessionCreatedMessage,
   SessionEvent,
@@ -61,6 +65,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     steer: has('steer'),
     paging: has('history'),
     approvals: has('approval'),
+    models: has('models'),
   }
 }
 
@@ -80,6 +85,59 @@ export class SocketBackend implements DshellBackend {
 
   get connected(): boolean {
     return this.control !== null
+  }
+
+  async modelCatalog(): Promise<ModelCatalog> {
+    const connection = this.requireControl()
+    connection.send({ type: 'model/catalog' })
+    try {
+      const message = await connection.waitFor<ModelCatalogMessage>(
+        (candidate) => candidate.type === 'model-catalog',
+        20_000,
+      )
+      return message.catalog
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async selectModel(sessionId: string, selection: ModelSelection): Promise<ModelSelection> {
+    const connection = this.requireControl()
+    connection.send({
+      type: 'model/select',
+      sessionId,
+      provider: selection.provider,
+      model: selection.model,
+      ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+    })
+    try {
+      const message = await connection.waitFor<ModelSelectedMessage>(
+        (candidate) => candidate.type === 'model-selected',
+        25_000,
+      )
+      return message.selected
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async saveDefaultModel(selection: ModelSelection): Promise<ModelSelection> {
+    const connection = this.requireControl()
+    connection.send({
+      type: 'model/default',
+      provider: selection.provider,
+      model: selection.model,
+      ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+    })
+    try {
+      const message = await connection.waitFor<ModelSelectedMessage>(
+        (candidate) => candidate.type === 'model-selected',
+        10_000,
+      )
+      return message.selected
+    } catch (error) {
+      throw mapError(error)
+    }
   }
 
   async connect(): Promise<void> {

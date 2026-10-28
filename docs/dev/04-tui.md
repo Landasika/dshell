@@ -117,7 +117,7 @@ Slash commands：
 /help          /sessions      /workspaces
 /resume        /new [cwd]     /attach <id>
 /cancel        /clear         /reconnect
-/verbose       /quit
+/model         /verbose       /quit
 ```
 
 `/clear` 只隐藏本地 transcript（记录 `clearedAtSeq`），不删除 Host 的 durable

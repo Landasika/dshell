@@ -15,6 +15,7 @@ export const CAPABILITIES = [
   'cancel',
   'steer',
   'approval',
+  'models',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
@@ -32,6 +33,48 @@ export type DshellErrorCode =
   | 'APPROVAL_NOT_PENDING'
   | 'BAD_REQUEST'
   | 'INTERNAL'
+
+/** One provider/model route the Host can run. */
+export interface ModelSelection {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+export interface ModelReasoningEffort {
+  id: string
+  name: string
+  description?: string
+}
+
+export interface ModelOption {
+  id: string
+  name: string
+  description?: string
+  reasoning?: {
+    efforts: ModelReasoningEffort[]
+    defaultEffort?: string
+  }
+}
+
+export interface ModelProviderGroup {
+  id: string
+  name: string
+  models: ModelOption[]
+}
+
+export interface ModelCatalogFailure {
+  id: string
+  name: string
+  message: string
+}
+
+export interface ModelCatalog {
+  default: ModelSelection
+  routableProviders: string[]
+  groups: ModelProviderGroup[]
+  failures: ModelCatalogFailure[]
+}
 
 export interface WorkspaceSummary {
   id: string
@@ -123,6 +166,20 @@ export interface SessionCreatedMessage {
   workspaceId?: string
 }
 
+export interface ModelCatalogMessage {
+  type: 'model-catalog'
+  catalog: ModelCatalog
+}
+
+export interface ModelSelectedMessage {
+  type: 'model-selected'
+  /** Present when the selection applies to one session. */
+  sessionId?: string
+  selected: ModelSelection
+  /** True when the selection was also saved as the default for new agents. */
+  savedAsDefault?: boolean
+}
+
 export interface AcceptedMessage {
   type: 'accepted'
   sessionId: string
@@ -203,6 +260,9 @@ export type ClientMessage =
       requestId?: string
     }
   | { type: 'approval/answer'; requestId: string; outcome: ApprovalOutcome }
+  | { type: 'model/catalog' }
+  | { type: 'model/select'; sessionId: string; provider: string; model: string; reasoningEffort?: string }
+  | { type: 'model/default'; provider: string; model: string; reasoningEffort?: string }
 
 export type ServerMessage =
   | WelcomeMessage
@@ -220,4 +280,6 @@ export type ServerMessage =
   | StatusMessage
   | ApprovalRequestMessage
   | ApprovalResolvedMessage
+  | ModelCatalogMessage
+  | ModelSelectedMessage
   | ErrorMessage

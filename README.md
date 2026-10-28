@@ -256,8 +256,24 @@ Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
 
 Commands: `/sessions` (aliases `/session`, `/resume`), `/workspaces`, `/new`,
 `/attach`, `/cancel`, `/clear`,
-`/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/agents`, `/verbose`, `/help`,
-`/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
+`/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/agents`, `/model`,
+`/verbose`, `/help`, `/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
+
+### Models
+
+`/model` asks the Host for its live provider/model catalog and opens a picker:
+
+- `↑/↓` move, `Enter` switches the current session
+- `d` saves the highlighted model as the default for new sessions
+- `/model provider/model` switches directly; `/model default provider/model`
+  saves a default without touching the current session
+
+Switching is a Host operation, not a TUI guess: the `dshell-host` plugin now
+bridges DSH's `sessionController.modelCatalog()` and `selectModel()`, so the
+same catalog the Web UI shows is used. DSH applies the selection on the next
+request and appends a durable "model changed" notice; the selection also
+becomes the saved default. Reasoning effort is currently the model default;
+the picker does not expose per-effort choices yet.
 
 ### Herdr
 

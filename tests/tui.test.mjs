@@ -133,6 +133,7 @@ test('completion finds slash commands and @ files', () => {
   assert.equal(sessions.length, 1)
   assert.equal(sessions[0].label, '/sessions')
   assert.deepEqual(completionFor('/res', []).items.map((item) => item.label), ['/resume'])
+  assert.deepEqual(completionFor('/mod', []).items.map((item) => item.label), ['/model'])
   const file = completionContext('look at @src/ma')
   assert.deepEqual(file, { kind: 'file', query: 'src/ma', start: 8, end: 15 })
   assert.equal(completionFor('look at @src/ma', ['src/main.ts']).items[0].label, '@src/main.ts')
@@ -1126,6 +1127,67 @@ test('drag selects text and copies it through OSC 52', async () => {
   assert.ok(match)
   assert.match(Buffer.from(match[1], 'base64').toString('utf8'), /HELLO-TARGET/)
   input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('TUI model picker switches the session model and saves a default', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    encoding = 'utf8'
+    raw = false
+    setRawMode(value) { this.raw = value }
+    setEncoding(value) { this.encoding = value }
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 150; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'))
+  input.push('/model')
+  input.push('\r')
+  await waitFor(() => output.text.includes('Fake Provider') && output.text.includes('Relay Flash'))
+  // Default is fake/fake-flash; move past fake-pro to relay/relay-flash.
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\r')
+  await waitFor(() => output.text.includes('model → relay/relay-flash'))
+
+  input.push('/model')
+  input.push('\r')
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  input.push('d')
+  await waitFor(() => output.text.includes('default model → relay/relay-flash'))
+  input.push('\u001b')
+  await new Promise((resolve) => setTimeout(resolve, 20))
   input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()

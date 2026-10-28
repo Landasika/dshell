@@ -1,4 +1,10 @@
-import type { DshellErrorCode, SessionEvent, SessionHeader } from '../protocol/index.js'
+import type {
+  DshellErrorCode,
+  ModelCatalog,
+  ModelSelection,
+  SessionEvent,
+  SessionHeader,
+} from '../protocol/index.js'
 
 /** Errors surfaced by a backend, independent of the transport used underneath. */
 export type BackendErrorCode =
@@ -43,6 +49,8 @@ export interface DshellCapabilities {
   paging: boolean
   /** Approval requests can be answered from this frontend. */
   approvals: boolean
+  /** Provider/model catalog and live model switching are available. */
+  models: boolean
 }
 
 export interface WorkspaceSummary {
@@ -136,4 +144,11 @@ export interface DshellBackend {
   listSessions(workspaceId?: string): Promise<SessionSummary[]>
   createSession(options?: CreateSessionOptions): Promise<SessionHandle>
   openSession(sessionId: string): Promise<SessionHandle>
+
+  /** Every currently routable provider/model, plus the deployment default. */
+  modelCatalog(): Promise<ModelCatalog>
+  /** Switch one session's model (the Host also persists it as the new default). */
+  selectModel(sessionId: string, selection: ModelSelection): Promise<ModelSelection>
+  /** Persist the default model for agents created without an explicit model. */
+  saveDefaultModel(selection: ModelSelection): Promise<ModelSelection>
 }

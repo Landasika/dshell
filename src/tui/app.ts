@@ -12,6 +12,7 @@ import type {
   WorkspaceSummary,
 } from '../backend/index.js'
 import { BackendError } from '../backend/index.js'
+import type { ModelCatalog, ModelOption, ModelSelection } from '../protocol/index.js'
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
 import { createEditor, editKey, insertText, type EditorState } from './editor.js'
@@ -92,6 +93,7 @@ type Overlay =
   | { kind: 'rewind'; index: number }
   | { kind: 'dashboard' }
   | { kind: 'agents'; index: number }
+  | { kind: 'models'; index: number }
   | { kind: 'agentView'; childId: string; label: string; lines: string[]; scroll: number; loading: boolean; error?: string }
 
 interface AppState {
@@ -118,6 +120,19 @@ interface AppState {
   tpsSamples: TpsSample[]
   speedPrevious?: { at: number; tokens: number }
   escapeAt: number
+  /** Provider/model catalog loaded by `/model`. */
+  modelCatalog?: ModelCatalog
+  /** Optimistic selection until the next durable request header arrives. */
+  modelOverride?: ModelSelection
+}
+
+interface ModelRow {
+  kind: 'group' | 'model' | 'failure'
+  provider?: string
+  providerName?: string
+  model?: ModelOption
+  message?: string
+  count?: number
 }
 
 
@@ -401,6 +416,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.currentId = sessionId
       state.approvalBusy = false
       state.error = undefined
+      state.modelOverride = undefined
       applyView(next.snapshot())
       // Seed arrow history from the durable transcript so prompts sent before
       // this TUI attached can be recalled, not just the ones typed here.
@@ -585,6 +601,130 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return state.sessions.filter((session) => session.workspaceId === workspaceId)
   }
 
+  const modelRows = (): ModelRow[] => {
+    const catalog = state.modelCatalog
+    if (catalog === undefined) return []
+    const rows: ModelRow[] = []
+    for (const group of catalog.groups) {
+      rows.push({ kind: 'group', provider: group.id, providerName: group.name, count: group.models.length })
+      for (const model of group.models) {
+        rows.push({ kind: 'model', provider: group.id, providerName: group.name, model })
+      }
+    }
+    for (const failure of catalog.failures) {
+      rows.push({ kind: 'failure', provider: failure.id, providerName: failure.name, message: failure.message })
+    }
+    return rows
+  }
+
+  const currentModel = (): ModelSelection | undefined => {
+    if (state.modelOverride !== undefined) return state.modelOverride
+    const metrics = currentMetrics()
+    if (metrics.provider !== undefined && metrics.model !== undefined) {
+      return { provider: metrics.provider, model: metrics.model }
+    }
+    return state.modelCatalog?.default
+  }
+
+  const modelRowFor = (selection: ModelSelection | undefined): number => {
+    if (selection === undefined) return -1
+    return modelRows().findIndex((row) => row.kind === 'model'
+      && row.provider === selection.provider
+      && row.model?.id === selection.model)
+  }
+
+  const nearestModelRow = (from: number, delta: number): number => {
+    const rows = modelRows()
+    let index = from
+    for (let step = 0; step < rows.length; step += 1) {
+      index += delta
+      if (index < 0) index = rows.length - 1
+      if (index >= rows.length) index = 0
+      if (rows[index]?.kind === 'model') return index
+    }
+    return from
+  }
+
+  const openModelPicker = async (): Promise<void> => {
+    if (!backend.capabilities().models) {
+      toast('this Host cannot list models (update dshell-host)')
+      return
+    }
+    state.status = 'loading models'
+    schedule()
+    try {
+      state.modelCatalog = await backend.modelCatalog()
+    } catch (error) {
+      state.status = 'idle'
+      toast(`model catalog failed: ${errorText(error)}`)
+      schedule()
+      return
+    }
+    state.status = 'idle'
+    const found = modelRowFor(currentModel())
+    const firstModel = modelRows().findIndex((row) => row.kind === 'model')
+    state.overlay = { kind: 'models', index: found >= 0 ? found : Math.max(0, firstModel) }
+    schedule()
+  }
+
+  const applyModel = async (row: ModelRow): Promise<void> => {
+    const view = state.view
+    const model = row.model
+    if (view === undefined || row.provider === undefined || model === undefined) {
+      toast('attach a session before switching models')
+      return
+    }
+    state.status = 'switching model'
+    schedule()
+    try {
+      const selected = await backend.selectModel(view.sessionId, { provider: row.provider, model: model.id })
+      state.modelOverride = selected
+      if (state.modelCatalog !== undefined) state.modelCatalog.default = selected
+      state.overlay = null
+      toast(`model → ${selected.provider}/${selected.model}`)
+    } catch (error) {
+      toast(`model switch failed: ${errorText(error)}`)
+    } finally {
+      state.status = 'idle'
+      schedule()
+    }
+  }
+
+  const saveModelDefault = async (row: ModelRow): Promise<void> => {
+    const model = row.model
+    if (row.provider === undefined || model === undefined) return
+    try {
+      const selected = await backend.saveDefaultModel({ provider: row.provider, model: model.id })
+      if (state.modelCatalog !== undefined) state.modelCatalog.default = selected
+      toast(`default model → ${selected.provider}/${selected.model}`)
+    } catch (error) {
+      toast(`default model failed: ${errorText(error)}`)
+    }
+    schedule()
+  }
+
+  const switchModel = async (argument: string): Promise<void> => {
+    const trimmed = argument.trim()
+    if (trimmed.length === 0) {
+      await openModelPicker()
+      return
+    }
+    const wantsDefault = /^default\s+/i.test(trimmed)
+    const spec = wantsDefault ? trimmed.replace(/^default\s+/i, '') : trimmed
+    const slash = spec.indexOf('/')
+    if (slash <= 0 || slash === spec.length - 1) {
+      toast('use /model provider/model, or /model default provider/model')
+      return
+    }
+    const row: ModelRow = {
+      kind: 'model',
+      provider: spec.slice(0, slash),
+      model: { id: spec.slice(slash + 1), name: spec.slice(slash + 1) },
+    }
+    if (wantsDefault) await saveModelDefault(row)
+    else await applyModel(row)
+  }
+
   const userPrompts = (): string[] => {
     const view = state.view
     if (view === undefined) return [...state.history].reverse()
@@ -756,6 +896,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       case '/agents':
         openAgents()
         return
+      case '/model':
+        await switchModel(argument)
+        return
       default:
         toast(`unknown command ${command}; try /help`)
     }
@@ -910,6 +1053,23 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       } else if (key.type === 'text' && key.text.toLowerCase() === 'n') {
         const workspace = state.workspaces[overlay.index]
         if (workspace !== undefined) void createSession(undefined, workspace.id)
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'models') {
+      const row = modelRows()[overlay.index]
+      if (key.type === 'up' || key.type === 'ctrl-p' || key.type === 'wheel') {
+        const delta = key.type === 'wheel' ? key.delta : -1
+        overlay.index = nearestModelRow(overlay.index, delta)
+      } else if (key.type === 'down' || key.type === 'ctrl-n') {
+        overlay.index = nearestModelRow(overlay.index, 1)
+      } else if (key.type === 'enter' || key.type === 'tab') {
+        if (row?.kind === 'model') void applyModel(row)
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'd') {
+        if (row?.kind === 'model') void saveModelDefault(row)
+        return
       }
       schedule()
       return
@@ -1297,11 +1457,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const usageRailLine = (metrics: SessionMetrics, now: number): string => {
     const running = metrics.agents.filter((agent) => agent.status === 'running').length
+    const model = state.modelOverride?.model ?? metrics.model
+    const provider = state.modelOverride?.provider ?? metrics.provider
     return renderUsageRail(theme, {
       tokens: metrics.cost.tokens,
       ...(metrics.cost.cost === undefined ? {} : { cost: metrics.cost.cost }),
-      ...(metrics.model === undefined ? {} : { model: metrics.model }),
-      ...(metrics.provider === undefined ? {} : { provider: metrics.provider }),
+      ...(model === undefined ? {} : { model }),
+      ...(provider === undefined ? {} : { provider }),
       cwd: state.view?.header.cwd ?? options.cwd,
       ...(gitInfo === undefined ? {} : { git: gitInfo }),
       ...(metrics.agents.length === 0
@@ -1374,6 +1536,38 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} cancel/quit · ${paint(theme, 'text', 'ctrl-d')} quit`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
       return panelBox(theme, 'help & shortcuts', body, width)
+    }
+    if (overlay.kind === 'models') {
+      const entries = modelRows()
+      const visibleCount = Math.max(1, Math.min(14, rows - 9))
+      const start = Math.max(0, Math.min(overlay.index - Math.floor(visibleCount / 2), entries.length - visibleCount))
+      const selectedModel = currentModel()
+      const defaultModel = state.modelCatalog?.default
+      const body: string[] = []
+      if (entries.length === 0) body.push(paint(theme, 'muted', 'no routable models'))
+      for (const [offset, row] of entries.slice(start, start + visibleCount).entries()) {
+        const index = start + offset
+        if (row.kind === 'group') {
+          if (body.length > 0) body.push('')
+          body.push(`${paint(theme, 'bold', paint(theme, 'accentSoft', row.providerName ?? row.provider ?? ''))} ${paint(theme, 'muted', `· ${String(row.count ?? 0)}`)}`)
+          continue
+        }
+        if (row.kind === 'failure') {
+          body.push(`${paint(theme, 'error', '!')} ${paint(theme, 'text', row.providerName ?? row.provider ?? '')} ${paint(theme, 'muted', truncate(row.message ?? '', Math.max(10, inner - 8)))}`)
+          continue
+        }
+        const selected = index === overlay.index
+        const isCurrent = selectedModel?.provider === row.provider && selectedModel?.model === row.model?.id
+        const isDefault = defaultModel?.provider === row.provider && defaultModel?.model === row.model?.id
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        const badge = isCurrent ? paint(theme, 'success', '●') : isDefault ? paint(theme, 'accent', '◆') : ' '
+        const label = row.model?.name ?? row.model?.id ?? ''
+        const idPart = paint(theme, 'muted', `${row.provider ?? ''}/${row.model?.id ?? ''}`)
+        body.push(`${marker}${badge} ${paint(theme, selected ? 'text' : 'muted', truncate(label, 30))}  ${idPart}`)
+      }
+      return panelBox(theme, 'model', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ select · enter switch · d default · esc close')],
+      })
     }
     if (overlay.kind === 'workspaces') {
       const visibleCount = Math.max(1, Math.min(12, rows - 10))

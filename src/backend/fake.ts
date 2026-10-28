@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 
-import type { SessionEvent, SessionHeader } from '../protocol/index.js'
+import type { ModelCatalog, ModelSelection, SessionEvent, SessionHeader } from '../protocol/index.js'
 import {
   BackendError,
   type CreateSessionOptions,
@@ -25,6 +25,7 @@ const CAPABILITIES: DshellCapabilities = {
   steer: true,
   paging: true,
   approvals: true,
+  models: true,
 }
 
 interface FakeSession {
@@ -52,6 +53,28 @@ export class FakeBackend implements DshellBackend {
   private readonly handles = new Set<FakeSessionHandle>()
   private isConnected = false
   private nextId = 1
+  private defaultModel: ModelSelection = { provider: 'fake', model: 'fake-flash' }
+  private readonly sessionModels = new Map<string, ModelSelection>()
+  private readonly catalog: ModelCatalog = {
+    default: { provider: 'fake', model: 'fake-flash' },
+    routableProviders: ['fake', 'relay'],
+    groups: [
+      {
+        id: 'fake',
+        name: 'Fake Provider',
+        models: [
+          { id: 'fake-flash', name: 'Fake Flash' },
+          { id: 'fake-pro', name: 'Fake Pro', description: 'slower, stronger' },
+        ],
+      },
+      {
+        id: 'relay',
+        name: 'Relay',
+        models: [{ id: 'relay-flash', name: 'Relay Flash', reasoning: { efforts: [{ id: 'low', name: 'Low' }], defaultEffort: 'low' } }],
+      },
+    ],
+    failures: [],
+  }
 
   constructor(seeds: FakeSessionSeed[] = []) {
     for (const seed of seeds) {
@@ -82,6 +105,38 @@ export class FakeBackend implements DshellBackend {
 
   capabilities(): DshellCapabilities {
     return { ...CAPABILITIES }
+  }
+
+  async modelCatalog(): Promise<ModelCatalog> {
+    this.assertConnected()
+    return {
+      ...this.catalog,
+      default: { ...this.defaultModel },
+      groups: this.catalog.groups.map((group) => ({ ...group, models: group.models.map((model) => ({ ...model })) })),
+      routableProviders: [...this.catalog.routableProviders],
+      failures: [...this.catalog.failures],
+    }
+  }
+
+  async selectModel(sessionId: string, selection: ModelSelection): Promise<ModelSelection> {
+    this.assertConnected()
+    if (!this.sessions.has(sessionId)) throw new BackendError('SESSION_NOT_FOUND', `session ${sessionId} not found`)
+    const known = this.catalog.groups.some((group) => group.id === selection.provider
+      && group.models.some((model) => model.id === selection.model))
+    if (!known) throw new BackendError('BAD_REQUEST', `unknown model ${selection.provider}/${selection.model}`)
+    const selected = { ...selection }
+    this.sessionModels.set(sessionId, selected)
+    this.defaultModel = selected
+    return selected
+  }
+
+  async saveDefaultModel(selection: ModelSelection): Promise<ModelSelection> {
+    this.assertConnected()
+    const known = this.catalog.groups.some((group) => group.id === selection.provider
+      && group.models.some((model) => model.id === selection.model))
+    if (!known) throw new BackendError('BAD_REQUEST', `unknown model ${selection.provider}/${selection.model}`)
+    this.defaultModel = { ...selection }
+    return { ...selection }
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {

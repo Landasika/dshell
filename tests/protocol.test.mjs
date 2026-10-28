@@ -21,6 +21,7 @@ test('protocol v2 advertises the P3 capabilities', () => {
       'cancel',
       'steer',
       'approval',
+      'models',
     ],
   )
 })

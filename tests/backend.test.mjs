@@ -284,3 +284,56 @@ test('SocketBackend reports unsupported capabilities clearly', async (t) => {
   )
   await backend.disconnect()
 })
+
+test('SocketBackend reads the model catalog and forwards selections', async (t) => {
+  const catalog = {
+    default: { provider: 'relay', model: 'relay-flash' },
+    routableProviders: ['relay'],
+    groups: [{ id: 'relay', name: 'Relay', models: [{ id: 'relay-flash', name: 'Relay Flash' }] }],
+    failures: [],
+  }
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') {
+      write(socket, {
+        type: 'welcome',
+        protocol: 2,
+        pluginVersion: 'test',
+        dshVersion: 'test',
+        capabilities: ['list', 'models'],
+        socketPath: server.socketPath,
+        sessions: [],
+        workspaces: [],
+      })
+    } else if (message.type === 'model/catalog') {
+      write(socket, { type: 'model-catalog', catalog })
+    } else if (message.type === 'model/select') {
+      write(socket, {
+        type: 'model-selected',
+        sessionId: message.sessionId,
+        selected: { provider: message.provider, model: message.model },
+        savedAsDefault: true,
+      })
+    } else if (message.type === 'model/default') {
+      write(socket, {
+        type: 'model-selected',
+        selected: { provider: message.provider, model: message.model },
+        savedAsDefault: true,
+      })
+    }
+  })
+  t.after(server.close)
+
+  const backend = new SocketBackend(server.socketPath)
+  await backend.connect()
+  assert.equal(backend.capabilities().models, true)
+  assert.equal((await backend.modelCatalog()).default.model, 'relay-flash')
+  assert.deepEqual(
+    await backend.selectModel('s1', { provider: 'relay', model: 'relay-flash' }),
+    { provider: 'relay', model: 'relay-flash' },
+  )
+  assert.deepEqual(
+    await backend.saveDefaultModel({ provider: 'relay', model: 'relay-flash' }),
+    { provider: 'relay', model: 'relay-flash' },
+  )
+  await backend.disconnect()
+})

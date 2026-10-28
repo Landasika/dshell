@@ -7,6 +7,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- **Model switching from the TUI**: `/model` reads DSH's live catalog through
+  `sessionController`, switches the current session (`Enter`) and can save the
+  deployment default (`d`, or `/model default provider/model`). The bottom rail
+  updates optimistically until the next request header lands.
 - **`/resume` alias**: `/resume` (and `/session`) open the same picker as
   `/sessions`, and `/resume` now appears in completion and help.
 - **Retry visibility**: while a provider request is being retried, the activity
