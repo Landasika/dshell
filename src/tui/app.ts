@@ -1958,7 +1958,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'ctrl-o') {
       state.verbose = !state.verbose
-      toast(`details ${state.verbose ? 'on' : 'off'}`)
+      toast(state.verbose ? 'tool output expanded · ctrl+o folds it' : 'tool calls folded · ctrl+o expands output')
       return
     }
     if (
@@ -2115,7 +2115,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     // historical snapshots inline would repeat the same list after every
     // update.
     const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
-    const rendered = renderBlocksWithRanges(blocks, width, theme)
+    const rendered = renderBlocksWithRanges(blocks, width, theme, { expandTools: state.verbose })
     const lines = rendered.lines
     const ranges = rendered.ranges
     if (view.streamReasoning.length > 0 && view.status === 'running') {
@@ -2392,7 +2392,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('pgup / pgdn', 15))} page scroll · ${paint(theme, 'text', 'wheel')} 3 lines`)
       body.push(`${paint(theme, 'text', pad('drag', 15))} select & copy text (shift+drag: terminal)`)
       body.push(`${paint(theme, 'text', pad('ctrl+r', 15))} history search · ${paint(theme, 'text', 'ctrl+b')} session panel`)
-      body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} thinking/details`)
+      body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} tools/thinking`)
       body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'double esc')} rewind prompt`)
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
       body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} cancel/quit · ${paint(theme, 'text', 'ctrl-d')} quit`)

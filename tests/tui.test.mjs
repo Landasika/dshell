@@ -1900,3 +1900,69 @@ test('the session picker shows the last edit time and orders by it', async () =>
     await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
   }
 })
+
+test('tool calls are folded to one line until ctrl+o or the detail panel asks', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'list' }] } } },
+    { type: 'tool/call', seq: 2, data: { name: 'bash', callId: 'c1', arguments: '{"command":"ls","description":"List files"}' } },
+    { type: 'tool/result', seq: 3, data: { message: { toolCallId: 'c1', isError: false, content: [{ type: 'text', text: 'alpha.txt\nbeta.txt' }] } } },
+    { type: 'tool/call', seq: 4, data: { name: 'bash', callId: 'c2', arguments: '{"command":"false","description":"Fail on purpose"}' } },
+    { type: 'tool/result', seq: 5, data: { message: { toolCallId: 'c2', isError: true, content: [{ type: 'text', text: 'boom: exit 1' }] } } },
+    { type: 'turn/end', seq: 6, data: { reason: { kind: 'completed' } } },
+  ]
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-700))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    const text = stripAnsi(output.text)
+    assert.match(text, /✓ bash · List files · ls/)
+    assert.equal(text.includes('alpha.txt'), false, 'successful output stays folded')
+    // A failure keeps a two-line excerpt so the reason is visible.
+    assert.match(text, /✗ bash · Fail on purpose/)
+    assert.match(text, /boom: exit 1/)
+
+    // Ctrl-O expands the output inline.
+    output.text = ''
+    input.push('\u000f')
+    await waitFor(() => stripAnsi(output.text).includes('alpha.txt'), 'the expanded output')
+    assert.match(stripAnsi(output.text), /tool output expanded/)
+
+    input.push('\u000f')
+    await new Promise((resolve) => setTimeout(resolve, 80))
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})

@@ -353,6 +353,8 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
 export interface RenderOptions {
   maxToolLines?: number
   maxToolChars?: number
+  /** Show each tool call's argument summary and output inline (Ctrl-O). */
+  expandTools?: boolean
 }
 
 function renderBody(
@@ -453,18 +455,30 @@ export function renderBlocksWithRanges(
         break
       }
       case 'tool': {
+        // Folded to one line like Claude Code: the call and its arguments, with
+        // the output left for Ctrl-O or the Enter detail panel. A failure keeps
+        // a short excerpt so the reason is visible without expanding.
         const failed = block.failed === true
         const marker = failed ? '✗' : block.detail === undefined ? '▸' : '✓'
         const color = failed ? 'red' : block.detail === undefined ? 'yellow' : 'green'
-        out.push(paint(theme, color, `${marker} ${block.title ?? block.toolName ?? 'tool'}`))
-        if (block.body.length > 0) {
-          for (const line of wrapText(block.body, Math.max(1, width - 2))) {
-            out.push(paint(theme, 'dim', `  ${line}`))
+        const label = block.title ?? block.toolName ?? 'tool'
+        const summary = block.body.replace(/\s+/g, ' ').trim()
+        const head = `${paint(theme, color, `${marker} ${label}`)}${summary.length > 0 ? paint(theme, 'dim', ` · ${summary}`) : ''}`
+        out.push(truncate(head, width))
+        if (options.expandTools === true) {
+          if (block.body.length > 0) {
+            for (const line of wrapText(block.body, Math.max(1, width - 2))) {
+              out.push(paint(theme, 'dim', `  ${line}`))
+            }
           }
-        }
-        if (block.detail !== undefined && block.detail.length > 0) {
-          for (const line of renderBody({ ...block, body: block.detail }, width, theme, options)) {
-            out.push(line)
+          if (block.detail !== undefined && block.detail.length > 0) {
+            for (const line of renderBody({ ...block, body: block.detail }, width, theme, options)) {
+              out.push(line)
+            }
+          }
+        } else if (failed && block.detail !== undefined && block.detail.length > 0) {
+          for (const line of block.detail.split('\n').slice(0, 2)) {
+            out.push(paint(theme, 'red', truncate(`  ${line}`, width)))
           }
         }
         break

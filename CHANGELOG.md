@@ -18,6 +18,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- Tool calls are folded to one line (`✓ bash · List files · ls`) instead of
+  dumping their output into the transcript. `Ctrl-O` expands them inline, and
+  `Alt+↑/↓` + `Enter` opens the detail panel; failures still show their first
+  two output lines so errors stay visible.
+
 - The session list (startup picker and `/sessions`) shows the **last edit**
   time instead of the creation time and is ordered by it. The Host now carries
   `updatedAt` from the session-list activity projection; sessions that the

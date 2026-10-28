@@ -178,6 +178,10 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   `~/.dsh` stays responsive.
 - header: brand, session title, status (idle / running / approval / error) and
   working directory.
+- tool calls: folded to one line — `✓ bash · List files · ls` — like Claude Code.
+  `Ctrl-O` expands every call's argument summary and output inline; selecting
+  one with `Alt+↑/↓` and pressing `Enter` opens the same detail in a scrollable
+  panel. A failed call keeps its first two output lines visible.
 - thinking: folded to a `⚓ thinking · N tok · ctrl+o` header plus the last
   three reasoning lines on a dim rail. `Ctrl-O` expands the full text; live
   reasoning streams on the same rail while the model is thinking.
@@ -253,7 +257,7 @@ the official API.
 | `End` / `Enter` / `Esc` | jump back to the live tail while scrolled up |
 | wheel, `PgUp`/`PgDn` | scroll the transcript |
 | `Ctrl-T` | fold/show the todo strip |
-| `Ctrl-O` | expand/fold thinking and lifecycle blocks |
+| `Ctrl-O` | expand/fold tool output, thinking and lifecycle blocks |
 | `?` | help & shortcuts (when the composer is empty) |
 | `Esc` | close a menu/overlay or clear the composer; double-`Esc` on an empty idle composer opens rewind |
 | `Ctrl-C` | clear input, cancel a running turn (the `Alt+Enter` queue continues), or quit |
