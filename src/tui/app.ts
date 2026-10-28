@@ -32,6 +32,7 @@ import {
   type Block,
   type BlockRange,
 } from './events.js'
+import { foldInbox, type InboxState } from './inbox.js'
 import { renderMarkdown } from './markdown.js'
 import { TerminalScreen, Viewport } from './screen.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
@@ -161,12 +162,28 @@ interface AppState {
   modelEfforts: Record<string, string>
   /** Prompts handed to the running turn, shown until they reach the transcript. */
   queued: { requestId: string; text: string; at: number; mode: 'queue' | 'steer' }[]
+  /** Pending inbox folded from `agent/inbox/spliced` — every client's queue. */
+  inbox: InboxState
+  /** Rows this client removed, hidden until the Host confirms (or 5s pass). */
+  hiddenQueued: Map<string, number>
+  /** Text this client edited, shown until the splice carries it back. */
+  queueText: Map<string, string>
   /** Index into the navigable transcript items (blocks, then queued rows). */
   focus?: number
   /** A queued prompt pulled back into the composer for editing. */
-  editingQueued?: { requestId: string; text: string; mode: 'queue' | 'steer' }
+  editingQueued?: { requestId: string; text: string; mode: 'queue' | 'steer'; local: boolean }
   /** Provider rows read from the Host's patch file. */
   providers?: ProviderList
+}
+
+/** One row under the transcript: a prompt waiting in the Host's inbox. */
+interface QueueEntry {
+  requestId: string
+  text: string
+  at: number
+  mode: 'queue' | 'steer'
+  /** True when only this client knows it yet (its splice has not landed). */
+  local: boolean
 }
 
 const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 'displayName']
@@ -303,6 +320,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     escapeAt: 0,
     modelEfforts: {},
     queued: [],
+    inbox: { nextTurn: [], nextStep: [] },
+    hiddenQueued: new Map(),
+    queueText: new Map(),
   }
 
   let renderTimer: NodeJS.Timeout | undefined
@@ -486,6 +506,40 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     })
   }
 
+  /**
+   * Rows shown below the transcript: the durable inbox first (so prompts queued
+   * by another terminal or the Web UI show up too), then any local prompt whose
+   * splice has not arrived yet. Steering rows come before queued ones because
+   * they land sooner.
+   */
+  const queuedEntries = (): QueueEntry[] => {
+    const entries: QueueEntry[] = []
+    const seen = new Set<string>()
+    const editing = state.editingQueued?.requestId
+    const push = (entry: QueueEntry): void => {
+      if (entry.requestId === editing) return
+      seen.add(entry.requestId)
+      entries.push(entry)
+    }
+    const hidden = (id: string): boolean => {
+      const at = state.hiddenQueued.get(id)
+      return at !== undefined && Date.now() - at < 5_000
+    }
+    for (const item of state.inbox.nextStep) {
+      if (hidden(item.id)) continue
+      push({ requestId: item.id, text: state.queueText.get(item.id) ?? item.text, at: 0, mode: 'steer', local: false })
+    }
+    for (const item of state.inbox.nextTurn) {
+      if (hidden(item.id)) continue
+      push({ requestId: item.id, text: state.queueText.get(item.id) ?? item.text, at: 0, mode: 'queue', local: false })
+    }
+    for (const entry of state.queued) {
+      if (seen.has(entry.requestId) || hidden(entry.requestId)) continue
+      push({ ...entry, local: true })
+    }
+    return entries
+  }
+
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
@@ -502,6 +556,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         lastFailureToast = { text: failure, at: now }
         toast(`turn failed: ${failure.length > 80 ? `${failure.slice(0, 80)}…` : failure}`)
       }
+    }
+    state.inbox = foldInbox(view.events)
+    const live = new Set([...state.inbox.nextTurn, ...state.inbox.nextStep].map((item) => item.id))
+    for (const [id, at] of state.hiddenQueued) {
+      if (!live.has(id) || Date.now() - at > 5_000) state.hiddenQueued.delete(id)
+    }
+    for (const [id, text] of state.queueText) {
+      const item = [...state.inbox.nextTurn, ...state.inbox.nextStep].find((entry) => entry.id === id)
+      if (item === undefined || item.text === text) state.queueText.delete(id)
     }
     pruneQueued(view)
     sampleSpeed(view)
@@ -690,8 +753,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     // The Host drops its inbox together with the aborted turn, so keep our own
     // copy and hand it back right away: the queued prompts then start as soon
     // as the abort settles, which is what Ctrl-C should mean.
-    const pending = state.queued.map((entry) => entry.text)
+    const pendingById = new Map<string, string>()
+    for (const entry of state.queued) pendingById.set(entry.requestId, entry.text)
+    for (const item of [...state.inbox.nextStep, ...state.inbox.nextTurn]) {
+      if (!pendingById.has(item.id)) pendingById.set(item.id, item.text)
+    }
+    const pending = [...pendingById.values()]
     state.queued = []
+    state.inbox = { nextTurn: [], nextStep: [] }
     try {
       await state.handle.cancel()
       state.status = 'cancelling'
@@ -2149,7 +2218,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     end: number
     kind: 'block' | 'queue'
     block?: Block
-    queue?: { requestId: string; text: string; at: number; mode: 'queue' | 'steer' }
+    queue?: QueueEntry
   }
 
   /** Blocks in transcript order, then the queued prompt rows below them. */
@@ -2159,7 +2228,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (range.block.kind === 'turn') continue
       items.push({ start: range.start, end: range.end, kind: 'block', block: range.block })
     }
-    for (const entry of state.queued) {
+    for (const entry of queuedEntries()) {
       items.push({ start: lineCount, end: lineCount, kind: 'queue', queue: entry })
     }
     return items
@@ -2188,9 +2257,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   /** Pull one queued prompt back into the composer so it can be rewritten. */
-  const beginQueuedEdit = (entry: { requestId: string; text: string; mode: 'queue' | 'steer' }): void => {
+  const beginQueuedEdit = (entry: QueueEntry): void => {
     state.queued = state.queued.filter((item) => item.requestId !== entry.requestId)
-    state.editingQueued = { requestId: entry.requestId, text: entry.text, mode: entry.mode }
+    state.editingQueued = { requestId: entry.requestId, text: entry.text, mode: entry.mode, local: entry.local }
     state.editor = createEditor(entry.text)
     state.focus = undefined
     toast('editing a queued prompt · enter saves · esc keeps it queued')
@@ -2201,7 +2270,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const editing = state.editingQueued
     if (editing === undefined) return
     state.editingQueued = undefined
-    state.queued.push({ requestId: editing.requestId, text: editing.text, at: Date.now(), mode: editing.mode })
+    if (editing.local) {
+      state.queued.push({ requestId: editing.requestId, text: editing.text, at: Date.now(), mode: editing.mode })
+    }
     state.editor = createEditor()
     toast('queued prompt kept as it was')
     schedule()
@@ -2228,7 +2299,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         return
       }
     }
-    state.queued.push({ requestId: editing.requestId, text: trimmed, at: Date.now(), mode: editing.mode })
+    if (editing.local) {
+      state.queued.push({ requestId: editing.requestId, text: trimmed, at: Date.now(), mode: editing.mode })
+    } else {
+      state.queueText.set(editing.requestId, trimmed)
+    }
     toast('queued prompt updated')
     schedule()
   }
@@ -2266,8 +2341,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   /** Delete one queued prompt both locally and in the Host inbox. */
-  const dropQueuedPrompt = async (entry: { requestId: string; text: string; mode: 'queue' | 'steer' }): Promise<void> => {
+  const dropQueuedPrompt = async (entry: QueueEntry): Promise<void> => {
     state.queued = state.queued.filter((item) => item.requestId !== entry.requestId)
+    if (!entry.local) state.hiddenQueued.set(entry.requestId, Date.now())
     state.focus = undefined
     schedule()
     if (state.handle === undefined) return
@@ -2859,7 +2935,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const pill = viewport.scrollOffset === 0 ? undefined : renderJumpToBottom(theme, unseen, columns)
     const focusOrder = buildFocusItems(transcriptData.ranges, transcriptData.lines.length)
     const focused = state.focus === undefined ? undefined : focusOrder[state.focus]
-    const queuedRows = state.queued.slice(-2).map((entry) => {
+    const queuedRows = queuedEntries().slice(-2).map((entry) => {
       const oneLine = entry.text.replace(/\s+/g, ' ').trim()
       const label = entry.mode === 'steer' ? 'steering' : 'queued'
       const row = paint(theme, 'dim', truncate(`  ◷ ${label} · ${oneLine}`, columns))

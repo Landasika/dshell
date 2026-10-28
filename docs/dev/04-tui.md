@@ -30,6 +30,9 @@ $ dshell
 - TUI 只是 **Host 的第二个前端**；不持有 Agent 的所有权；
 - 退出 TUI 只 dispose 本地 view/connection，**不 cancel** Host 正在跑的 turn；
 - 所有 durable 内容来自 `session/event`，`assistant-stream` 只做实时预览；
+- 排队行不是本地记账：`inbox.ts` 折叠 durable 的 `agent/inbox/spliced`
+  （`next-turn` / `next-step` 两个 splice 列表），所以别的终端或 Web UI
+  排的 prompt 也会显示在同一处，编辑/删除直接作用于共享 inbox；
 - 审批只能通过 Host 的 bridge 回答，不能自己伪造 allow；
 - V1 仍然只支持 Linux。
 

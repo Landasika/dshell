@@ -278,9 +278,12 @@ Code habit: the message is **steered** into the running turn, so the agent sees
 it at its next step and the transcript shows it as a normal user message
 (`◷ steering · …` marks the gap until then). `Alt+Q` queues the prompt
 instead — the Host holds it and starts a fresh turn after the current one
-(`◷ queued · …`). `Ctrl-C` aborts the running turn and the prompts you queued
-with `Alt+Q` continue right after it: the Host drops its inbox with an abort,
-so the TUI hands those prompts back itself.
+(`◷ queued · …`). The queue rows come from the durable inbox: dsh logs every
+queue change as `agent/inbox/spliced`, so dshell folds those events and shows
+prompts queued by **any** client — a second terminal or the Web UI included —
+and edit/delete acts on the shared inbox. `Ctrl-C` aborts the running turn and
+every prompt still waiting in that inbox continues right after it: the Host
+drops its inbox with an abort, so the TUI hands the prompts back itself.
 
 `Alt+Q` rather than `Alt+Enter`: plenty of terminals (Windows Terminal included)
 bind `Alt+Enter` to fullscreen and never forward the key, so dshell's queue

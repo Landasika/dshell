@@ -25,6 +25,13 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- The queue below the transcript is now the Host's real inbox: dshell folds
+  the durable `agent/inbox/spliced` events (the same projection the Web UI
+  uses) instead of only remembering what this client sent. Prompts queued by a
+  second terminal or the Web UI appear there too, edit/delete works on the
+  shared inbox, and `Ctrl-C` re-queues everything that was still waiting.
+
+
 - dshell signs itself with a whale: the header, the startup splash and the
   first assistant block of each turn use `🐳` instead of the `◆` diamond; the
   transcript header keeps the name (`🐳 dshell`) so it stays legible.

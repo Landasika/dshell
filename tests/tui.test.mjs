@@ -2060,3 +2060,70 @@ test('attaching mid-turn reports running, so Enter steers instead of queueing', 
     await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
   }
 })
+
+test('prompts queued by another client are visible and editable', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  // The transcript knows a turn is running and the inbox holds a prompt that
+  // this client never sent: another terminal (or the Web UI) queued it.
+  const events = [
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    { type: 'user/message', seq: 2, data: { message: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'earlier prompt' }] } } },
+    { type: 'agent/inbox/spliced', seq: 3, data: { target: 'next-turn', start: 0, inserted: [{ id: 'other-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'queued elsewhere' }] }] } },
+  ]
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  backend.queuePrompt('s1', 'other-1', 'queued elsewhere', 'queue')
+  await backend.connect()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-700))}`)
+  }
+
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('◷ queued · queued elsewhere'), 'the foreign queue row')
+
+    // Enter on the row edits it through the shared inbox.
+    output.text = ''
+    input.push('\u001b[1;3A')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('editing a queued prompt'), 'the edit toast')
+    input.push(' edited')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('◷ queued · queued elsewhere edited'), 'the edited row')
+
+    // Alt+Backspace removes it for everyone.
+    output.text = ''
+    input.push('\u001b[1;3A')
+    input.push('\u001b\u007f')
+    await waitFor(() => stripAnsi(output.text).includes('queued prompt deleted'), 'the delete toast')
+    assert.equal(stripAnsi(output.text).includes('◷ queued'), false)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
