@@ -107,8 +107,8 @@ Or install it globally:
 
 ```bash
 npm install -g @landasika/dshell
-# or, before npm publication, from a verified tarball:
-npm install -g ./landasika-dshell-0.1.0.tgz
+# or from a verified release tarball:
+npm install -g ./landasika-dshell-0.2.0.tgz
 ```
 
 ### 4. Open the TUI
@@ -483,13 +483,15 @@ There is no token or Cookie. Run dshell as the same user that started the Host.
 pnpm install
 pnpm typecheck
 pnpm lint
-pnpm test          # 30 tests
+pnpm test          # 100+ tests
 ./scripts/ci.sh    # full local gate, including clean pack/install
 ```
 
 Release artifacts are verified with `scripts/verify-pack.sh`. The tag workflow
-`.github/workflows/release.yml` runs the same gate and uploads the tarball plus
-`SHA256SUMS`; npm publication is a manual, credentialed step.
+`.github/workflows/release.yml` runs the same gate, uploads the tarball plus
+`SHA256SUMS`, and — when the `NPM_TOKEN` repository secret is configured —
+publishes the verified tarball to npm with provenance. Until the secret is
+set, publication stays a manual `npm publish --access public`.
 
 ## Documentation
 

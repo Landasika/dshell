@@ -23,6 +23,7 @@ import type {
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
 import { createEditor, editKey, insertText, type EditorState } from './editor.js'
+import { normalizePaste, pastePlaceholder, shouldFoldPaste } from './paste.js'
 import {
   buildBlocks,
   isInjectedContext,
@@ -174,6 +175,10 @@ interface AppState {
   editingQueued?: { requestId: string; text: string; mode: 'queue' | 'steer'; local: boolean }
   /** Provider rows read from the Host's patch file. */
   providers?: ProviderList
+  /** Full content behind each folded paste placeholder in the composer. */
+  attachments: Map<string, string>
+  /** Monotonic counter for `[Pasted text #N …]` placeholders. */
+  pasteSeq: number
 }
 
 /** One row under the transcript: a prompt waiting in the Host's inbox. */
@@ -323,6 +328,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     inbox: { nextTurn: [], nextStep: [] },
     hiddenQueued: new Map(),
     queueText: new Map(),
+    attachments: new Map(),
+    pasteSeq: 0,
   }
 
   let renderTimer: NodeJS.Timeout | undefined
@@ -710,6 +717,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  /** Substitute folded paste placeholders with their stored full content. */
+  const expandAttachments = (text: string): string => {
+    let out = text
+    for (const [placeholder, content] of state.attachments) {
+      if (out.includes(placeholder)) out = out.split(placeholder).join(content)
+    }
+    return out
+  }
+
   const send = async (text: string, requested?: 'queue' | 'steer'): Promise<void> => {
     const trimmed = text.replace(/\s+$/, '')
     if (trimmed.length === 0) return
@@ -734,7 +750,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     reportHerdr(state.view, 'working')
     schedule()
     try {
-      const receipt = await state.handle.send(trimmed, { mode })
+      const receipt = await state.handle.send(expandAttachments(trimmed), { mode })
       if (wasRunning) {
         // The transcript only shows the message once the Host delivers it, so
         // keep it visible until its user/message arrives.
@@ -774,7 +790,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     for (const text of pending) {
       try {
-        const receipt = await state.handle.send(text, { mode: 'queue' })
+        const receipt = await state.handle.send(expandAttachments(text), { mode: 'queue' })
         state.queued.push({ requestId: receipt.requestId, text, at: Date.now(), mode: 'queue' })
       } catch (error) {
         state.error = errorText(error)
@@ -2117,7 +2133,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (key.type === 'paste') {
-      state.editor = insertText(state.editor, key.text)
+      const pasted = normalizePaste(key.text)
+      if (shouldFoldPaste(pasted)) {
+        state.pasteSeq += 1
+        const placeholder = pastePlaceholder(pasted, state.pasteSeq)
+        state.attachments.set(placeholder, pasted)
+        state.editor = insertText(state.editor, placeholder)
+      } else {
+        state.editor = insertText(state.editor, pasted)
+      }
       refreshCompletion()
       schedule()
       return

@@ -60,6 +60,11 @@ test('inline markers and escaped pipes stay inside their cells', () => {
   assert.equal(lines.find((line) => line.includes('a | b')) !== undefined, true)
 })
 
+test('code fences print verbatim with no label row or gutter', () => {
+  const lines = renderMarkdown(['```bash', '# comment', 'echo hi', '```'].join('\n'), 40, theme)
+  assert.deepEqual(lines, ['# comment', 'echo hi'])
+})
+
 test('pipes inside code fences are not treated as tables', () => {
   const lines = renderMarkdown(['```', '| not | a | table |', '| --- | --- | --- |', '```'].join('\n'), 40, theme)
   assert.equal(lines.some((line) => line.startsWith('┌')), false)

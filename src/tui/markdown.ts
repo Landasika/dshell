@@ -150,28 +150,21 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
 
   const lines: string[] = []
   let inFence = false
-  let fenceLanguage = ''
   const source = safe.split('\n')
 
   for (let index = 0; index < source.length; index += 1) {
     const raw = source[index] ?? ''
     const line = raw.replace(/\s+$/, '')
-    const fence = /^\s*```(.*)$/.exec(line)
-    if (fence !== null) {
+    const fence = /^\s*```/.test(line)
+    if (fence) {
       inFence = !inFence
-      fenceLanguage = fence[1]?.trim() ?? ''
-      if (inFence && fenceLanguage.length > 0) {
-        lines.push(paint(theme, 'gray', `  ${truncate(fenceLanguage, Math.max(1, width - 2))}`))
-      }
       continue
     }
 
     if (inFence) {
-      if (line.length === 0) {
-        lines.push(paint(theme, 'gray', `  │`))
-      } else {
-        lines.push(paint(theme, 'gray', `  │ ${truncate(line, Math.max(1, width - 4))}`))
-      }
+      // Code blocks print verbatim: no language label row, no gutter, no
+      // styling — the raw source is the most faithful rendering.
+      lines.push(truncate(line, width))
       continue
     }
 

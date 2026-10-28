@@ -41,3 +41,30 @@ jobs:
             dist/release/*.tgz
             dist/release/SHA256SUMS
           if-no-files-found: error
+
+  publish-npm:
+    name: Publish to npm
+    needs: verify-and-pack
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # npm provenance signs the published package with the workflow's OIDC
+      # identity, tying the tarball to this exact tag.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dshell-release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Publish the verified tarball
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo '::notice::NPM_TOKEN secret is not configured; skipping npm publish'
+            exit 0
+          fi
+          npm publish --access public --provenance ./landasika-dshell-*.tgz

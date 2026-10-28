@@ -3,9 +3,32 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
-## [Unreleased]
+## [0.2.0] — 2026-10-28
 
 ### Added
+
+- Large pastes fold into a `[Pasted text #N +20 lines]` placeholder in the
+  composer (more than 4 lines or 200 cells); the full content is substituted
+  back when the prompt is sent. Pasted text is normalized on insert: CRLF
+  becomes LF and trailing whitespace is stripped from every line.
+
+### Fixed
+
+- The composer cursor now moves after a typed space. The composer no longer
+  reuses the transcript wrapper (which trims and collapses whitespace); its
+  own WYSIWYG wrap keeps every typed space in a cell, so the cursor column
+  tracks typing, and spaces beyond the line width are clamped instead of
+  silently dropped.
+
+### Changed
+
+- The `v*` release workflow can now publish the verified tarball to npm
+  automatically: it signs with npm provenance and runs only when the
+  `NPM_TOKEN` repository secret is configured; without the secret it is a
+  no-op and publication stays manual.
+
+- Fenced code blocks in messages print verbatim: the language label row and
+  the `│ ` gutter are gone, and the raw source line is emitted directly.
 
 - `Alt+↑`/`Alt+↓` walk a selection across the transcript — user and assistant
   messages, tool calls, subagent rows, then the queued prompts — with the
@@ -274,4 +297,5 @@ First V1 candidate for Linux.
 - No npm publication in this repository's automated release workflow; the
   `v*` workflow produces a verified tarball and SHA256SUMS.
 
+[0.2.0]: https://github.com/Landasika/dshell/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Landasika/dshell/releases/tag/v0.1.0

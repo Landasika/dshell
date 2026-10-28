@@ -1,4 +1,4 @@
-import { sanitizeText, wrapText } from './width.js'
+import { displayWidth, sanitizeText } from './width.js'
 
 /** Editable composer state. `cursor` is a UTF-16 offset, always on a boundary. */
 export interface EditorState {
@@ -150,15 +150,47 @@ export function editKey(
   }
 }
 
+/**
+ * Wrap one logical line to `width` display cells without collapsing spaces.
+ * Unlike `wrapText` (which serves transcript rendering and trims/collapses
+ * whitespace), the composer must be WYSIWYG: every typed space stays in a
+ * cell, so the cursor drawn after a trailing space sits where it was typed.
+ */
+function wrapComposerLine(paragraph: string, width: number): string[] {
+  const out: string[] = []
+  let current = ''
+  let currentWidth = 0
+  let pending = 0
+  for (const char of paragraph) {
+    if (char === ' ') {
+      pending += 1
+      continue
+    }
+    const cells = displayWidth(char)
+    if (currentWidth + pending + cells > width) {
+      // Break here. Spaces that still fit on this line stay typed content;
+      // the rest are consumed by the break itself, like any editor.
+      const keep = Math.max(0, Math.min(pending, width - currentWidth))
+      out.push(current + ' '.repeat(keep))
+      current = char
+      currentWidth = cells
+      pending = 0
+      continue
+    }
+    current += ' '.repeat(pending) + char
+    currentWidth += pending + cells
+    pending = 0
+  }
+  const tail = current + ' '.repeat(Math.min(pending, Math.max(0, width - currentWidth)))
+  out.push(tail)
+  return out
+}
+
 /** Split composer text into visual lines, honoring explicit newlines and display width. */
 export function composerLines(text: string, width: number): string[] {
   const lines: string[] = []
   for (const line of sanitizeText(text).split('\n')) {
-    if (line.length === 0) {
-      lines.push('')
-      continue
-    }
-    lines.push(...wrapText(line, Math.max(1, width)))
+    lines.push(...wrapComposerLine(line, Math.max(1, width)))
   }
   return lines.length === 0 ? [''] : lines
 }

@@ -106,6 +106,17 @@ test('editor supports unicode boundaries, history, and multiline composers', () 
   assert.deepEqual(lineCol('ab\ncd', 5), { line: 1, column: 2 })
 })
 
+test('composer wrap keeps typed spaces so the cursor moves after a space', () => {
+  // The cursor column is the display width of the last wrapped line before
+  // the cursor; a trailing space must survive the wrap (bug: cursor froze).
+  assert.deepEqual(composerLines('abc ', 20), ['abc '])
+  assert.deepEqual(composerLines('ab   cd', 20), ['ab   cd'])
+  // Spaces beyond the width budget are clamped, never dropped silently.
+  assert.deepEqual(composerLines('ab      ', 4), ['ab  '])
+  const wrapped = composerLines('ab      cd', 4)
+  assert.equal(wrapped.every((line) => displayWidth(line) <= 4), true)
+})
+
 test('key parser handles arrows, control keys, and bracketed paste across chunks', () => {
   const parser = new KeyParser()
   assert.deepEqual(parser.feed('\u001b[A'), [{ type: 'up' }])
