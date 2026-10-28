@@ -132,7 +132,7 @@ The terminal is a daily tool, so the first screen is the session list you
 actually need — no splash art:
 
 ```text
-◆ dshell · DeepSeek Harness
+🐳 dshell · DeepSeek Harness
 ────────────────────────────────────────────────────────────────────────────
 
 choose session
@@ -153,7 +153,7 @@ touched is always first.
 Inside a session:
 
 ```text
-◆ dshell · session title                              ● running · /project
+🐳 dshell · session title                              ● running · /project
 ────────────────────────────────────────────────────────────────────────────
   transcript: streaming markdown, reasoning, tool cards, diffs, approvals
 ⚓ thinking · 412 tok · ctrl+o expand
@@ -176,8 +176,9 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cach
   parent's `Ctrl-G` roster. Listing is scoped to the current workspace, cached
   for a few seconds, and titles are resolved progressively so a large shared
   `~/.dsh` stays responsive.
-- header: brand, session title, status (idle / running / approval / error) and
-  working directory.
+- header: brand (`🐳 dshell`), session title, status (idle / running /
+  approval / error) and working directory. The assistant's first block in a
+  turn is signed with the same whale instead of a text label.
 - markdown: headings, lists, quotes, fenced code, diffs and **tables**. Tables
   are drawn as a box grid with per-column alignment (`:---`, `:--:`, `---:`),
   cells wider than the terminal wrap instead of being cut off, and CJK/emoji

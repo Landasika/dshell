@@ -1,5 +1,6 @@
 import type { SessionEvent } from '../protocol/index.js'
 import { renderDiff, renderMarkdown } from './markdown.js'
+import { BRAND_ICON } from './brand.js'
 import { paint, paintBand, type Theme } from './theme.js'
 import { displayWidth, pad, sanitizeText, truncate, wrapText } from './width.js'
 
@@ -510,7 +511,7 @@ export function renderBlocksWithRanges(
         // One attribution per turn: only the first assistant block after a user
         // prompt carries the `dshell` header, later steps stay label-free.
         if (!assistantLabelShown) {
-          out.push(paint(theme, 'bold', paint(theme, 'green', 'dshell')))
+          out.push(paint(theme, 'bold', paint(theme, 'accent', BRAND_ICON)))
           assistantLabelShown = true
         }
         out.push(...renderBody(block, width, theme, options))

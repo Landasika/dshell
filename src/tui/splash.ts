@@ -2,6 +2,7 @@
  * Launch screen: a quiet, keyboard-first session picker. No splash art: the
  * TUI is a daily tool, so the first screen is the list you actually need.
  */
+import { BRAND_ICON, BRAND_NAME } from './brand.js'
 import { paint, type Theme } from './theme.js'
 import { displayWidth, pad, truncate } from './width.js'
 
@@ -48,7 +49,7 @@ function sessionRow(theme: Theme, session: SplashSession, selected: boolean, wid
 function content(theme: Theme, input: SplashInput, width: number): string[] {
   const lines: string[] = []
   const title = input.kind === 'missing' ? 'workspace not created' : 'choose session'
-  const brand = `${paint(theme, 'accent', '◆')} ${paint(theme, 'bold', paint(theme, 'accentSoft', 'dshell'))} ${paint(theme, 'muted', '· DeepSeek Harness')}`
+  const brand = `${paint(theme, 'accent', BRAND_ICON)} ${paint(theme, 'bold', paint(theme, 'accentSoft', BRAND_NAME))} ${paint(theme, 'muted', '· DeepSeek Harness')}`
   lines.push(brand)
   lines.push(paint(theme, 'border', '─'.repeat(width)))
   lines.push('')

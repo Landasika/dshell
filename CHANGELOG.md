@@ -25,6 +25,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- dshell signs itself with a whale: the header, the startup splash and the
+  first assistant block of each turn use `🐳` (the assistant block drops the
+  `dshell` word for the icon) instead of the `◆` diamond.
+
 - User prompts render on a light-grey band with white text, so what you sent
   is easy to find when scrolling back.
 - Only the first assistant block of a turn carries the `dshell` header; later

@@ -1,5 +1,6 @@
 /** Shared terminal chrome: panels, header, composer frame and hint rows. */
 import { blockBar } from './activity.js'
+import { BRAND_ICON, BRAND_NAME } from './brand.js'
 import type { EditorState } from './editor.js'
 import { composerLines } from './editor.js'
 import { formatPercent, pressureStyle } from './metrics.js'
@@ -49,7 +50,7 @@ export function renderHeader(
     model?: string
   },
 ): string {
-  const left = `${paint(theme, 'bold', paint(theme, 'accent', '◆ dshell'))} ${paint(theme, 'muted', '·')} ${paint(theme, 'bold', truncate(options.title, 42))}`
+  const left = `${paint(theme, 'bold', paint(theme, 'accent', `${BRAND_ICON} ${BRAND_NAME}`))} ${paint(theme, 'muted', '·')} ${paint(theme, 'bold', truncate(options.title, 42))}`
   const model = options.model === undefined ? '' : ` ${paint(theme, 'muted', `[${truncate(options.model, 18)}]`)}`
   const right = `${paint(theme, options.statusStyle, `● ${options.status}`)} ${paint(theme, 'muted', '·')} ${paint(theme, 'muted', truncate(options.cwd, Math.max(8, options.columns - 52)))}`
   const gap = Math.max(1, options.columns - displayWidth(left) - displayWidth(model) - displayWidth(right))
