@@ -12,6 +12,13 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   the TUI to wait out its 25 s timeout). A level the provider refuses, a stale
   session id after a Host restart and an unknown provider/model now surface as
   a toast with the Host's own message — 8 ms instead of 25 s of silence.
+- **The TUI now survives a Host plugin reload**: the plugin is installed as a
+  link into the profile, so touching the package (a rebuild, an update, a
+  config edit) makes DSH re-create it, which drops every open socket. The
+  client detects that drop and reattaches on its own — `host connection lost ·
+  reconnecting` → `host back · reattached` — instead of turning every later
+  command into `dshell-host connection is closed`. A failed background session
+  poll no longer paints a permanent error either.
 - `/model` rows that cannot be switched explain themselves: `Enter` on a
   provider header jumps to its first model, a failed provider row shows the
   failure reason, and switching to a model without reasoning levels says

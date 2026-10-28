@@ -82,6 +82,7 @@ export class HostConnection {
     reject: (error: Error) => void
   }>()
   private closed = false
+  private readonly closeListeners = new Set<() => void>()
   private welcomeMessage: WelcomeMessage | null = null
 
   private constructor(socket: Socket) {
@@ -151,6 +152,27 @@ export class HostConnection {
     return this.welcome.socketPath
   }
 
+  get closedByPeer(): boolean {
+    return this.closed
+  }
+
+  /** Called once when the connection is gone, however it went away. */
+  onClose(listener: () => void): () => void {
+    this.closeListeners.add(listener)
+    return () => this.closeListeners.delete(listener)
+  }
+
+  private notifyClosed(): void {
+    for (const listener of [...this.closeListeners]) {
+      try {
+        listener()
+      } catch {
+        // A listener must not break the transport teardown.
+      }
+    }
+    this.closeListeners.clear()
+  }
+
   onMessage(listener: MessageListener): () => void {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
@@ -200,6 +222,7 @@ export class HostConnection {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.notifyClosed()
     // Destroy rather than only half-closing: a viewer may quit while the Host
     // is still writing, and an `end()` can leave the client process alive.
     this.socket.destroy()
@@ -233,6 +256,7 @@ export class HostConnection {
   private fail(error: Error): void {
     if (this.closed) return
     this.closed = true
+    this.notifyClosed()
     for (const waiter of this.waiters) waiter.reject(error)
     this.waiters.clear()
   }

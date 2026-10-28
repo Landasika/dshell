@@ -62,6 +62,7 @@ export class FakeBackend implements DshellBackend {
   private readonly workspaces = new Map<string, WorkspaceSummary>()
   private readonly handles = new Set<FakeSessionHandle>()
   private isConnected = false
+  private readonly disconnectListeners = new Set<() => void>()
   private nextId = 1
   private defaultModel: ModelSelection = { provider: 'fake', model: 'fake-flash' }
   private readonly sessionModels = new Map<string, ModelSelection>()
@@ -129,6 +130,18 @@ export class FakeBackend implements DshellBackend {
 
   async disconnect(): Promise<void> {
     this.isConnected = false
+  }
+
+  onDisconnect(listener: () => void): () => void {
+    this.disconnectListeners.add(listener)
+    return () => this.disconnectListeners.delete(listener)
+  }
+
+  /** Test hook: behave like a Host that exited or reloaded its plugin. */
+  simulateDisconnect(): void {
+    if (!this.isConnected) return
+    this.isConnected = false
+    for (const listener of [...this.disconnectListeners]) listener()
   }
 
   capabilities(): DshellCapabilities {

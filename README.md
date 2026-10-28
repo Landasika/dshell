@@ -284,6 +284,11 @@ remembered per `provider/model` and shown in the bottom rail
 
 ### Providers
 
+If the Host drops the socket (it exits, or DSH re-creates the plugin after the
+profile's linked package changes), the TUI notices and reattaches by itself:
+`host connection lost · reconnecting`, then `host back · reattached`. Nothing
+to run by hand, and `/reconnect` remains for a manual nudge.
+
 `/provider` lists the provider rows of the patch file the Host booted with
 (`$DSH_HOME/cordis.patch.yml`, else the active profile's), read through the
 `dshell-host` plugin:

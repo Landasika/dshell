@@ -87,6 +87,8 @@ export class SocketBackend implements DshellBackend {
   private readonly socketPath: string
   private control: HostConnection | null = null
   private readonly handles = new Set<SocketSessionHandle>()
+  private readonly disconnectListeners = new Set<() => void>()
+  private closingByUs = false
 
   constructor(socketPath: string) {
     this.socketPath = socketPath
@@ -233,13 +235,34 @@ export class SocketBackend implements DshellBackend {
     } catch (error) {
       throw mapError(error)
     }
+    const connection = this.control
+    connection.onClose(() => {
+      if (this.closingByUs || this.control !== connection) return
+      this.control = null
+      for (const handle of [...this.handles]) handle.dispose()
+      this.handles.clear()
+      for (const listener of [...this.disconnectListeners]) {
+        try {
+          listener()
+        } catch {
+          // Reconnect policy lives in the caller.
+        }
+      }
+    })
   }
 
   async disconnect(): Promise<void> {
+    this.closingByUs = true
     for (const handle of [...this.handles]) handle.dispose()
     this.handles.clear()
     this.control?.close()
     this.control = null
+    this.closingByUs = false
+  }
+
+  onDisconnect(listener: () => void): () => void {
+    this.disconnectListeners.add(listener)
+    return () => this.disconnectListeners.delete(listener)
   }
 
   capabilities(): DshellCapabilities {

@@ -300,6 +300,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let herdrResume: { id: string; argv: string[] | undefined } | undefined
   let metricsCache: { key: string; value: SessionMetrics } | undefined
   let lastBodyHeight = 3
+  let reattaching = false
   let resolveDone: ((code: number) => void) | undefined
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve
@@ -506,6 +507,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.sessions = await backend.listSessions(workspaceId)
       schedule()
     } catch (error) {
+      // A dropped socket is handled by the reconnect loop; do not paint a
+      // permanent "connection is closed" error over the transcript.
+      if (!backend.connected) return
       state.error = errorText(error)
       schedule()
     }
@@ -823,6 +827,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const restartHost = async (): Promise<void> => {
+    if (reattaching) return
+    reattaching = true
     state.status = 'restarting host'
     schedule()
     try {
@@ -835,7 +841,24 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.status = 'idle'
       toast(`host restart failed: ${errorText(error)}`)
       schedule()
+    } finally {
+      reattaching = false
     }
+  }
+
+  /**
+   * A Host that reloads its plugin (config edit) or exits drops the socket
+   * under us. Reattach instead of making every later command fail with
+   * "connection is closed".
+   */
+  const beginReconnect = (): void => {
+    if (reattaching || state.quitting) return
+    reattaching = true
+    toast('host connection lost · reconnecting')
+    schedule()
+    void reattachAfterRestart().finally(() => {
+      reattaching = false
+    })
   }
 
   /** Poll the socket until the re-exec'd Host answers, then reopen the session. */
@@ -855,12 +878,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         schedule()
         return
       }
-      state.handle?.dispose()
+      try {
+        state.handle?.dispose()
+      } catch {
+        // Already disposed by the backend when the socket went away.
+      }
       state.handle = undefined
       state.view = undefined
       await openSession(sessionId)
       if (state.view !== undefined) {
         state.status = 'idle'
+        state.error = undefined
         toast('host back · reattached')
         schedule()
         return
@@ -2552,6 +2580,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   if (pickerMode) {
     state.startup = { kind: 'sessions', cwd: canonicalPath(options.cwd), sessions: [], index: 0, loading: true }
   }
+
+  backend.onDisconnect?.(() => {
+    beginReconnect()
+  })
 
   screen.onResizeRequest(() => schedule())
   screen.start()

@@ -158,6 +158,12 @@ export interface DshellBackend {
   connect(): Promise<void>
   disconnect(): Promise<void>
   readonly connected: boolean
+  /**
+   * Notified when the Host connection drops on its own (Host exit, plugin
+   * reload after a config edit). Not called for a `disconnect()` the client
+   * asked for. Returns an unsubscribe function.
+   */
+  onDisconnect?(listener: () => void): () => void
   capabilities(): DshellCapabilities
 
   listWorkspaces(): Promise<WorkspaceSummary[]>
