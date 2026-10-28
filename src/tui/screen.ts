@@ -12,6 +12,8 @@ export class TerminalScreen {
   private started = false
   private mouseEnabled = false
   private lastLines: readonly string[] = []
+  private lastFrame: string[] = []
+  private lastSize = ''
   private selection: SelectionRange | null = null
   private readonly onResize = (): void => this.resizeHandler?.()
   private resizeHandler: (() => void) | undefined
@@ -31,6 +33,8 @@ export class TerminalScreen {
   start(): void {
     if (this.started) return
     this.started = true
+    this.lastFrame = []
+    this.lastSize = ''
     this.input.setRawMode(true)
     this.input.resume()
     this.output.write('\u001b[?1049h\u001b[?25l\u001b[2J\u001b[H')
@@ -90,13 +94,22 @@ export class TerminalScreen {
     return text
   }
 
-  /** Draw a complete frame. Lines longer than the terminal are truncated. */
+  /**
+   * Draw a complete frame. Only rows whose text changed are rewritten: a full
+   * repaint on every tick reads as flicker (and tears over slow links), while
+   * a diff keeps the header and transcript rock steady.
+   */
   draw(lines: readonly string[], cursor?: { row: number; column: number }): void {
     if (!this.started) return
     const { columns, rows } = this.size
     this.lastLines = lines
     const body = lines.slice(0, rows)
-    let frame = '\u001b[H'
+    const size = `${String(rows)}x${String(columns)}`
+    if (size !== this.lastSize) {
+      this.lastSize = size
+      this.lastFrame = []
+    }
+    let frame = ''
     for (let index = 0; index < rows; index += 1) {
       const raw = body[index] ?? ''
       const selection = this.selection
@@ -109,12 +122,14 @@ export class TerminalScreen {
           line = highlightColumns(raw, from, to)
         }
       }
-      frame += `\u001b[2K${pad(line, columns)}`
-      if (index < rows - 1) frame += '\r\n'
+      const painted = pad(line, columns)
+      if (this.lastFrame[index] === painted) continue
+      this.lastFrame[index] = painted
+      frame += `\u001b[${String(index + 1)};1H\u001b[2K${painted}`
     }
     if (cursor !== undefined && cursor.row >= 1 && cursor.row <= rows) {
       const column = Math.max(1, Math.min(columns, cursor.column))
-      frame += `\u001b[${cursor.row};${column}H\u001b[?25h`
+      frame += `\u001b[${String(cursor.row)};${String(column)}H\u001b[?25h`
     } else {
       frame += '\u001b[?25l'
     }
@@ -128,6 +143,7 @@ export class TerminalScreen {
   /** Clear and leave the cursor at the bottom, used before a non-TUI error. */
   clear(): void {
     if (!this.started) return
+    this.lastFrame = []
     this.output.write('\u001b[2J\u001b[H')
   }
 }

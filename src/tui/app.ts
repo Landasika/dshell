@@ -301,6 +301,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let metricsCache: { key: string; value: SessionMetrics } | undefined
   let lastBodyHeight = 3
   let reattaching = false
+  let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
   let resolveDone: ((code: number) => void) | undefined
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve
@@ -436,10 +437,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     reportHerdr(view)
     refreshGit()
     // Surface a failed turn in the header and as a toast, not only inline.
+    // A retrying provider can fail with the same message every few seconds;
+    // toasting each one turns the header into a flicker, so throttle repeats.
     const failure = turnFailureMessage(view.events)
     if (failure !== undefined && failure !== state.error) {
       state.error = failure
-      toast(`turn failed: ${failure.length > 80 ? `${failure.slice(0, 80)}…` : failure}`)
+      const now = Date.now()
+      if (failure !== lastFailureToast.text || now - lastFailureToast.at > 30_000) {
+        lastFailureToast = { text: failure, at: now }
+        toast(`turn failed: ${failure.length > 80 ? `${failure.slice(0, 80)}…` : failure}`)
+      }
     }
     sampleSpeed(view)
     if (view.pendingApproval !== undefined) {

@@ -279,6 +279,9 @@ export class FakeBackend implements DshellBackend {
     session.cursor = Math.max(session.cursor, event.seq)
     if (event.type === 'turn/start') session.status = 'running'
     if (event.type === 'turn/end' || event.type === 'turn/failed') session.status = 'idle'
+    for (const handle of this.handles) {
+      if (handle.id === sessionId) handle.notify()
+    }
   }
 
   /** Test helper: create a pending approval without starting a real turn. */

@@ -7,6 +7,15 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Fixed
 
+- **No more full-screen flicker**: `TerminalScreen.draw` now rewrites only the
+  rows whose text changed instead of clearing and repainting every row on
+  every tick; a stable screen costs a handful of cursor bytes per frame, so the
+  header, transcript and banner stop visibly flashing (measured: ~300 bytes per
+  3 idle seconds, previously one full frame per redraw).
+- A repeated failed turn no longer re-toasts on every retry: the same failure
+  message is toasted once per 30 seconds while the header banner keeps it
+  visible.
+
 - **Rejected commands no longer look frozen**: an `error` reply from the Host
   now rejects the pending request immediately (it used to be dropped, leaving
   the TUI to wait out its 25 s timeout). A level the provider refuses, a stale
