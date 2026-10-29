@@ -551,7 +551,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         persisted: record.persisted,
         formatStatus: record.formatStatus,
         ...(workspace === undefined ? {} : { workspaceId: workspace.id }),
-        status: record.live ? 'running' : 'idle',
+        // A resident agent is not the same thing as a running turn; the turn
+        // state lives in the event log, which this list does not read.
+        status: record.live ? 'live' : 'idle',
       }
     })
     sessionCache.set(cacheKey, { at: Date.now(), sessions })

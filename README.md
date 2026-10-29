@@ -176,8 +176,10 @@ dshell --resume <sessionId> # jump straight into a session
 dshell --no-color           # plain styling
 ```
 
-The first screen is the session list — no splash art. `live` / `cold` is the
-attachment state; the age is the session's last edit, and the newest is on top.
+The first screen is the session list — no splash art. A green `● live` marks a
+session whose agent is still resident in this Host; a plain row is simply not
+loaded yet (opening it does not need a restart, and nothing is lost). The age
+is the session's last edit, and the newest row is on top.
 Inside a session you get the transcript, the composer and the footer rail:
 
 ```text

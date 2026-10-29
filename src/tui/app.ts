@@ -2913,11 +2913,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const body = sessions.slice(start, start + visibleCount).map((session, offset) => {
         const index = start + offset
         const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
-        const live = session.live === true ? paint(theme, 'success', 'live') : paint(theme, 'muted', 'cold')
+        // `live` means the Host still holds this session's agent in memory — it
+        // is true only while a frontend keeps it open or after a prompt in this
+        // Host. Everything else is a durable session that simply is not loaded
+        // yet, so it gets no label at all: "cold" read like decay, not storage.
         const age = timeAgo(session.updatedAt ?? session.createdAt)
         const label = session.title?.trim() || 'untitled session'
         const row = `${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(label, 26))}`
-        const right = `${live} ${paint(theme, 'muted', age)}`
+        const right = session.live === true
+          ? `${paint(theme, 'success', '● live')} ${paint(theme, 'muted', age)}`
+          : paint(theme, 'muted', age)
         return `${row}${' '.repeat(Math.max(1, inner - displayWidth(row) - displayWidth(right)))}${right}`
       })
       if (body.length === 0) body.push(paint(theme, 'muted', 'no sessions; press n to create one'))

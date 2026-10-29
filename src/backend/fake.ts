@@ -396,6 +396,11 @@ export class FakeBackend implements DshellBackend {
   }
 
   /** Test/presentation helper: replace the live assistant tail. */
+  /** Test helper: whether the Host would report a resident agent for this session. */
+  markLive(sessionId: string, live = true): void {
+    this.requireSession(sessionId).status = live ? 'running' : 'idle'
+  }
+
   stream(sessionId: string, text: string, reasoning = ''): void {
     const session = this.requireSession(sessionId)
     session.streamText = text

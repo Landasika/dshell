@@ -2525,3 +2525,54 @@ test('TUI smoke: /skills lists the catalog and opens a skill', async () => {
     await backend.disconnect()
   }
 })
+
+test('session picker only labels a resident agent, never "cold"', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 110
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([
+    { sessionId: 's1', cwd: '/work', title: 'Busy session' },
+    { sessionId: 's2', cwd: '/work', title: 'Dormant session' },
+  ])
+  await backend.connect()
+  backend.markLive('s1')
+  const app = runTui(backend, { cwd: '/work', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 200; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-500))}`)
+  }
+
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('Dormant session'), 'the picker rows')
+    const picker = stripAnsi(output.text)
+    assert.ok(picker.includes('● live'), 'a resident agent is labelled live')
+    assert.ok(!picker.includes('cold'), 'an unloaded session is not called cold')
+  } finally {
+    input.push('\u0004')
+    await app
+    await backend.disconnect()
+  }
+})

@@ -58,8 +58,8 @@ choose session
 
 ↑/↓ move · enter attach · n new session · q quit
 
-▸ Socket client hardening                                    live 2m ago
-  TUI redesign notes                                        cold 1h ago
+▸ Socket client hardening                                  ● live 2m ago
+  TUI redesign notes                                              1h ago
 ```
 
 `choose session` and `workspace not created` are the two launch states; the

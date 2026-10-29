@@ -36,8 +36,11 @@ function sessionWindow(count: number, index: number, visible: number): { start: 
 
 function sessionRow(theme: Theme, session: SplashSession, selected: boolean, width: number): string {
   const marker = selected ? paint(theme, 'accent', '▸') : ' '
-  const live = session.live ? paint(theme, 'success', 'live') : paint(theme, 'muted', 'cold')
-  const right = `${live} ${paint(theme, 'muted', session.age)}`
+  // No "cold" label: a row without a resident agent is simply a durable
+  // session that is not loaded yet, and the word implied decay.
+  const right = session.live
+    ? `${paint(theme, 'success', '● live')} ${paint(theme, 'muted', session.age)}`
+    : paint(theme, 'muted', session.age)
   const leftWidth = Math.max(10, width - displayWidth(right) - 3)
   const label = truncate(session.label, Math.max(8, leftWidth - 2))
   const name = selected ? paint(theme, 'text', label) : paint(theme, 'muted', label)
