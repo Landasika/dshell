@@ -13,6 +13,7 @@
   <a href="docs/promo/out/dshell-promo.mp4"><img alt="demo" src="https://img.shields.io/badge/%E2%96%B6_demo-1m27s-1f6feb?style=flat-square"></a>
   <img alt="node" src="https://img.shields.io/badge/node-%5E22.19_%7C_%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.2-4d6bfe?style=flat-square">
+  <a href="https://github.com/Landasika/dshell/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/Landasika/dshell/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <img alt="tests" src="https://img.shields.io/badge/tests-151_passing-2ea043?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-linux-FCC624?style=flat-square&logo=linux&logoColor=black">
 </p>
