@@ -1,8 +1,42 @@
-# dshell
+<p align="center">
+  <img src="docs/assets/logo.png" width="200" alt="dshell" />
+</p>
 
-`dshell` is a Claude Code-style terminal frontend for an already-running
-DeepSeek Harness (DSH) Host. The Web UI and the terminal are two frontends over
-the same live Agents and durable Sessions:
+<h1 align="center">dshell</h1>
+
+<p align="center">
+  <b>A Claude Code-style terminal frontend for DeepSeek Harness.</b><br/>
+  The same Host, the same sessions, the same Agents — with a keyboard-first TUI.
+</p>
+
+<p align="center">
+  <a href="docs/promo/out/dshell-promo.mp4"><img alt="demo" src="https://img.shields.io/badge/%E2%96%B6_demo-1m27s-1f6feb?style=flat-square"></a>
+  <img alt="node" src="https://img.shields.io/badge/node-%5E22.19_%7C_%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
+  <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.2-4d6bfe?style=flat-square">
+  <img alt="tests" src="https://img.shields.io/badge/tests-151_passing-2ea043?style=flat-square">
+  <img alt="platform" src="https://img.shields.io/badge/platform-linux-FCC624?style=flat-square&logo=linux&logoColor=black">
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#keyboard">Keyboard</a> ·
+  <a href="#cli">CLI</a> ·
+  <a href="docs/TUI-DESIGN.md">Design</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+---
+
+## Why
+
+DeepSeek Harness already ships a Web UI. `dshell` adds a second frontend
+without adding a second brain:
+
+- it never starts another Host, never copies durable events into a second
+  truth, and never owns an Agent;
+- quitting the terminal only closes a view — the turn keeps running;
+- the Web UI, a TUI and a scripted CLI can watch and drive the **same live
+  session at the same time**, and approvals resolve first-answer-wins.
 
 ```text
                     one dsh Host
@@ -22,37 +56,62 @@ the same live Agents and durable Sessions:
              └─────────────────────┘
 ```
 
-The CLI never starts a second Host, never copies durable events into a second
-truth, and never owns an Agent. Quitting a terminal only closes its view.
+**V1 targets Linux.** Tested against Node 22/24 and DSH `0.2.1-rc.2`; see
+[Supported versions](docs/SUPPORTED-VERSIONS.md).
 
-**V1 supports Linux only.** See [Supported versions](docs/SUPPORTED-VERSIONS.md).
+## Demo
 
-▶ **[宣传片 / 教学视频](docs/promo/out/dshell-promo.mp4)**（1:27，无声，中文字幕）：
-一次对话、工具折叠、插话与排队、会话切换、审批。分镜和录制方式见
-[docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md)。
+<p align="center">
+  <a href="docs/promo/out/dshell-promo.mp4">
+    <img src="docs/promo/out/poster.png" width="720" alt="watch the dshell demo" />
+  </a>
+  <br/>
+  <sub>1:27 · one conversation, folded tools, steering, approvals, session switching</sub>
+</p>
 
-## Status
+The video is silent; the narration is in the captions. Storyboard and
+re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
 
-P0–P6 are complete for the V1 candidate `0.1.0`:
+## Highlights
 
-- full-screen TUI, plus scriptable `dshell -p`;
-- text / JSON / NDJSON output;
-- workspace and session creation, history, cancel, steer;
-- first-answer-wins approval bridge shared with the Web UI;
-- fail-closed approvals for non-interactive and disconnected frontends;
-- Node 22/24 CI and a verified npm tarball.
+- **Streaming markdown** — headings, lists, quotes, fenced code, diffs and
+  boxed **tables** with per-column alignment; CJK and emoji count as two cells
+  so borders stay square.
+- **Folded tool calls** — one line each, Claude Code style
+  (`✓ Bash(rg --files -g "*.ts")`). `Ctrl-O` expands arguments and output;
+  `Alt-↑/↓` + `Enter` opens a scrollable detail panel.
+- **Thinking, folded and streamed** — `⚓ thinking · 412 tok · ctrl+o` with the
+  last three reasoning lines on a dim rail; live reasoning streams in place.
+- **Steer or queue** — `Enter` sends into the running turn, `Alt-Q` queues the
+  prompt for the next one, `Alt-Backspace` drops a queued prompt.
+- **Approvals you can trust** — answered by a Host bridge that races the Web UI
+  fairly: first valid answer wins, everything else fails closed.
+- **Questions in the terminal** — `ask_user_question` renders as a selectable
+  card (`↑/↓`, `Space`, `c` for a custom answer, `Enter`); timed-out questions
+  stay answerable instead of dying with the turn.
+- **Subagents** — `⇢ agent started` cards that settle to `✓ finished` / `✗
+  failed`; `Ctrl-G` lists children and opens their transcripts read-only.
+- **Model & provider control** — `/model` picks provider, model and reasoning
+  level from the Host's own catalog; `/provider` edits `cordis.patch.yml`
+  surgical lines and offers to restart the Host.
+- **Herdr aware** — inside a [Herdr](https://herdr.dev) pane it reports
+  `working` / `blocked` / `idle`, the session id and a resume command, with no
+  hook to install.
+- **Reconnects itself** — a Host restart or plugin reload shows
+  `host connection lost · reconnecting`, then `host back · reattached`.
 
-## Requirements
+## Install
+
+### Prerequisites
 
 - Linux (x64 tested)
 - Node `^22.19.0 || >=24.0.0`
-- pnpm 11.x for development
-- DSH `0.2.1-rc.2` (tested; other versions are best-effort)
-- an already-running `dsh --profile web`
+- A running DSH Host, `0.2.1-rc.2` tested
+- pnpm 11.x if you build from source
 
-## Quick start
+### 1. Load the Host plugin
 
-### 1. Build and install the Host plugin
+`dshell` is a DSH bundle, so installing it updates `dsh.profile.bundles`:
 
 ```bash
 git clone https://github.com/Landasika/dshell.git
@@ -60,12 +119,13 @@ cd dshell
 pnpm install
 pnpm build
 
-# Load the plugin into the DSH web profile. The package is a DSH bundle, so
-# this updates dsh.profile.bundles automatically.
 dsh plugin --profile web add "$PWD"
 ```
 
-Start the Host:
+The plugin must be present **when the Host boots** — it cannot be injected into
+an already-running Host.
+
+### 2. Start the Host
 
 ```bash
 dsh --profile web
@@ -77,14 +137,18 @@ Look for:
 [dshell-host] listening on /home/<user>/.dsh/run/dshell.sock
 ```
 
-The plugin must be present when the Host boots; it cannot be injected into an
-already-running Host.
+### 3. Install the CLI
 
-### 2. Local development Host (no global `dsh`)
+```bash
+npm install -g @landasika/dshell
+# or run the built binary directly while developing:
+node dist/bin/dshell.js doctor
+```
 
-If `dsh` is not on `PATH`, use the development wrappers. They boot a Host with
-the plugin in an isolated `.dsh-dev/` home (never touching `~/.dsh`) and
-auto-detect a bundled DSH runtime:
+### No global `dsh`? Use the dev wrappers
+
+They boot a Host with the plugin inside an isolated `.dsh-dev/` home (never
+touching `~/.dsh`) and auto-detect a bundled DSH runtime:
 
 ```bash
 # terminal 1 — Host and Web UI
@@ -94,67 +158,19 @@ auto-detect a bundled DSH runtime:
 ./scripts/dev-tui.sh
 ```
 
-`./scripts/dev-host.sh` installs this checkout into a dedicated `dshell`
-profile and rebuilds the profile when the plugin changes. Override `DSH_BIN`,
-`DSH_HOME`, or `DSH_PROFILE` to use another CLI/home/profile.
+Override `DSH_BIN`, `DSH_HOME` or `DSH_PROFILE` to point elsewhere.
 
-### 3. Install the CLI
-
-While developing, run the built binary directly:
+## Quick start
 
 ```bash
-node dist/bin/dshell.js doctor
-node dist/bin/dshell.js
+dshell                      # session picker for the current workspace
+dshell --resume <sessionId> # jump straight into a session
+dshell --no-color           # plain styling
 ```
 
-Or install it globally:
-
-```bash
-npm install -g @landasika/dshell
-# or from a verified release tarball:
-npm install -g ./landasika-dshell-0.2.0.tgz
-```
-
-### 4. Open the TUI
-
-```bash
-dshell
-```
-
-In a non-TTY (pipe, CI), `dshell` prints help instead of writing control
-sequences.
-
-## TUI
-
-```text
-dshell
-dshell --resume <sessionId>
-dshell --no-color
-```
-
-The terminal is a daily tool, so the first screen is the session list you
-actually need — no splash art:
-
-```text
-🐳 dshell · DeepSeek Harness
-────────────────────────────────────────────────────────────────────────────
-
-choose session
-/home/landasika/dshell
-
-↑/↓ move · enter attach · n new session · q quit
-
-▸ Socket client hardening                                    live 2m ago
-  TUI redesign notes                                        cold 1h ago
-  Release checklist                                         cold 3d ago
-```
-
-`live`/`cold` is the attachment state; the age is the session's **last edit**
-(the newest durable prompt, from the Host's session-list projection, falling
-back to the creation time), and rows are ordered by it — the session you last
-touched is always first.
-
-Inside a session:
+The first screen is the session list — no splash art. `live` / `cold` is the
+attachment state; the age is the session's last edit, and the newest is on top.
+Inside a session you get the transcript, the composer and the footer rail:
 
 ```text
 🐳 dshell · session title                              ● running · /project
@@ -162,222 +178,67 @@ Inside a session:
   transcript: streaming markdown, reasoning, tool cards, diffs, approvals
 ⚓ thinking · 412 tok · ctrl+o expand
 │ 先确认每个应用的启动方式，再分派给子代理。
-│ venv 已就绪，可以直接跑冒烟门。
 ⇢ agent started  接入 OctoPrint harness · 18b9d1cc
 ⢿ Running command · rg reconnect src · 12s · ctx 84%
 ▸ 1/3 · Adding bounded backoff                                    ctrl+t hide
+✻ Worked for 1m 16s · done 11:19
 ────────────────────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps
 ❯ ask anything
 ──────────────────────────────────────────────────────────────────────
   enter send · / commands · @ files · ctrl+r history · ? help
-deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  cache ▰▰▰▰▰ 91%  ↑12.4k ↓840
+deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑12.4k ↓840
 ```
 
-- startup picker: drawn before the first Host round-trip, so the chat shell
-  never flashes while connecting. Rows use the DSH title snapshot (the same
-  one the Web UI shows) and fall back to `untitled session`, never to a bare
-  UUID; subagent child sessions are hidden and remain reachable through the
-  parent's `Ctrl-G` roster. Listing is scoped to the current workspace, cached
-  for a few seconds, and titles are resolved progressively so a large shared
-  `~/.dsh` stays responsive.
-- header: brand (`🐳 dshell`), session title, status (idle / running /
-  approval / error) and working directory. The assistant's first block in a
-  turn is signed `🐳 dshell`.
-- markdown: headings, lists, quotes, fenced code, diffs and **tables**. Tables
-  are drawn as a box grid with per-column alignment (`:---`, `:--:`, `---:`),
-  cells wider than the terminal wrap instead of being cut off, and CJK/emoji
-  count as two cells so the borders stay aligned.
-- user prompts: drawn on a grey band with white text and a `>` marker, so the
-  prompt that started a turn is easy to find when scrolling back. Assistant
-  text carries a single `dshell` header per turn — later steps after a tool
-  call are not labelled again.
-- tool calls: folded to one line, Claude-Code style — `✓ Bash(rg --files -g "*.ts")`,
-  with the identifying argument only and a trailing `…` when it does not fit.
-  `Ctrl-O` expands every call's argument summary and output inline; selecting
-  one with `Alt+↑/↓` and pressing `Enter` opens the same detail in a scrollable
-  panel. A failed call keeps its first two output lines visible.
-- thinking: folded to a `⚓ thinking · N tok · ctrl+o` header plus the last
-  three reasoning lines on a dim rail. `Ctrl-O` expands the full text; live
-  reasoning streams on the same rail while the model is thinking.
-- subagents: a `⇢ agent started` card when a child is spawned, updated to
-  `✓ finished` / `✗ failed` from the durable settlement notice. `Ctrl-G` (or
-  `/agents`) lists every child with its status; `Enter` opens that child's
-  transcript in a read-only panel.
-- live activity: spinner, current tool/verb, elapsed turn time and context
-  pressure. Only shown while a turn runs; the header carries the idle state.
-- scrolling: the mouse wheel (and `PgUp`/`PgDn`) scrolls the transcript, never
-  the composer. While scrolled up a right-aligned `↓ N new · End` pill appears
-  above the composer; click it, press `End`/`Enter`, or `Esc` to return to the
-  live tail. `DSHELL_NO_MOUSE=1` disables mouse capture so the terminal keeps
-  its own scrollback and text selection.
-- composer (frameless, Claude-Code style): a horizontal rule, the `❯` input,
-  another rule, then a dim shortcut hint. The top rule carries the context
-  gauge (`ctx ▰▰▰▱▱▱▱▱▱▱ 25%`) and token speed (`42 tps`) right-aligned. Wide
-  terminals get the 10-cell bar with TPS; narrower ones drop TPS, then collapse
-  the bar to a plain percentage, then drop the gauge. Rules never wrap.
-- usage rail (bottom, under the composer): provider/model route (`provider/model`),
-  the cwd (`~/…`), the Git branch with ahead/behind counts (`main [↑10]`, `*`
-  when dirty), subagent progress (`✓ agents 1/1`, `✗` plus a failed count),
-  the cache hit rate (`cache ▰▰▰▰▰ 91%`) and, when space allows, session
-  input/output totals and estimated spend (`~¥`). On narrow terminals it drops
-  totals → spend → cwd → git → agents → cache, keeping the model route.
-  Model and provider details, the peak/idle split and per-model rows live in
-  `Ctrl-B`.
-- context bar: measured occupancy from the latest usage, split into
-  system / prompt / assistant / thinking / tools; amber at 80%, red at 95%.
-  The bar is the readout's boundary, local estimates only divide the used span.
-- todo strip: current task and completion count, foldable with `Ctrl-T`; the
-  session panel keeps the full list.
-- status strip (above the composer, only when non-empty):
-  `✓ agents 1/1  ● jobs 1  ● todo 0/6`. `✓` means every subagent settled,
-  `●` a child/job is still running; `✗` flags failed jobs. Jobs are folded from
-  durable `job/registered` / `job/settled` events, so the count survives
-  reconnects and history replay.
-- composer: rounded frame that grows with the draft (up to seven rows); the
-  shortcut hint sits in its bottom border.
-
-### Spend estimate
-
-DSH reports tokens, not money. The usage rail converts durable
-`assistant/message.usage` events with DeepSeek's published per-million-token
-rates (CNY, idle price; peak hours are doubled). Cache reads use the hit rate;
-cache writes and uncached input use the miss rate; output uses the output rate.
-Peak hours are Beijing time, Monday–Friday 09:00–12:00 and 14:00–18:00.
-
-`~¥0.42` is an **estimate, not a bill**: prices can change, and the balance is
-deducted on DeepSeek's side. Models missing from the rate table show tokens but
-no amount (`unpriced`); the same applies to routes whose billing differs from
-the official API.
-
-### Keys
+## Keyboard
 
 | Key | Action |
 | --- | --- |
-| `Enter` | send / run command; while a turn runs it **steers** (joins that turn) |
-| `Alt+Q` | queue the prompt for the next turn instead of steering (`Alt+Enter` also works when the terminal forwards it) |
-| `Ctrl+Enter`, `Shift+Enter` | newline (`Ctrl-J` also works everywhere; dshell enables the kitty keyboard protocol so `Ctrl+Enter` is distinguishable) |
-| `Tab` | complete `/` command or `@` file |
-| `↑`/`↓`, `Ctrl-P/N` | completion, picker, or prompt history (seeded from the session's durable transcript) |
-| `Alt+↑`/`Alt+↓` | move a selection from block to block: messages, tool calls, subagent rows, then the queued prompts |
-| `Enter` (with a selection) | open it: tool details, the subagent list (`≈ /agents`), or pull a queued prompt back into the composer to edit it |
-| `Alt+Backspace` | delete the selected queued prompt |
-| `Esc` | clear the selection |
-| `PgUp`/`PgDn`, wheel | page or line scroll of the transcript |
-| drag | select transcript text and copy it (OSC 52); `Shift+drag` uses the terminal's own selection |
+| `Enter` | send — steers the running turn, otherwise starts one |
+| `Alt-Q` | queue the prompt for the next turn |
+| `Ctrl-Enter` / `Shift-Enter` | newline in the composer |
+| `Tab` | complete `/` commands and `@` files |
+| `↑` / `↓` | prompt history |
+| `PgUp` / `PgDn`, wheel | scroll the transcript |
+| `Alt-↑` / `Alt-↓` | select blocks, then `Enter` to open or `Esc` to clear |
+| `Alt-Backspace` | delete the selected queued prompt |
+| `Ctrl-O` | expand tools and thinking |
+| `Ctrl-T` | fold the todo list |
 | `Ctrl-R` | search prompts sent in this session |
-| `Ctrl-B` | session panel: context breakdown, session spend, tokens, speed, todos, agents |
-| `Ctrl-G` | subagent list; `Enter` opens that child's transcript |
-| `q` | quit from the startup picker |
-| `End` / `Enter` / `Esc` | jump back to the live tail while scrolled up |
-| wheel, `PgUp`/`PgDn` | scroll the transcript |
-| `Ctrl-T` | fold/show the todo strip |
-| `Ctrl-O` | expand/fold tool output, thinking and lifecycle blocks |
-| `?` | help & shortcuts (when the composer is empty) |
-| `Esc` | close a menu/overlay or clear the composer; double-`Esc` on an empty idle composer opens rewind |
-| `Ctrl-C` | clear input, cancel a running turn (the `Alt+Q` queue continues), or quit |
-| `Ctrl-D` | quit when the composer is empty |
+| `Ctrl-B` | session panel |
+| `Ctrl-G` | subagents (roster + read-only transcript) |
+| `Esc` `Esc` | rewind to a previous prompt |
+| `End` / `Esc` | jump to the bottom while scrolled up |
+| `Ctrl-C` | cancel the turn (or quit when idle) |
+| `Ctrl-D` | quit |
 
-Typing while a turn is running does not get lost, and `Enter` keeps the Claude
-Code habit: the message is **steered** into the running turn, so the agent sees
-it at its next step and the transcript shows it as a normal user message
-(`◷ steering · …` marks the gap until then). `Alt+Q` queues the prompt
-instead — the Host holds it and starts a fresh turn after the current one
-(`◷ queued · …`). The queue rows come from the durable inbox: dsh logs every
-queue change as `agent/inbox/spliced`, so dshell folds those events and shows
-prompts queued by **any** client — a second terminal or the Web UI included —
-and edit/delete acts on the shared inbox. `Ctrl-C` aborts the running turn and
-every prompt still waiting in that inbox continues right after it: the Host
-drops its inbox with an abort, so the TUI hands the prompts back itself.
+In an `ask_user_question` card: `↑/↓` move, `Space` toggles a choice (multi-
+select), `c` types a custom answer, `Enter` submits, `Esc` leaves it pending
+for the Web UI.
 
-`Alt+Q` rather than `Alt+Enter`: plenty of terminals (Windows Terminal included)
-bind `Alt+Enter` to fullscreen and never forward the key, so dshell's queue
-shortcut is a plain `Alt`+letter. `Alt+Enter` is still accepted where the
-terminal does send it.
+## Slash commands
 
-`Ctrl-C`/`Ctrl-D`/`Esc` quitting only closes this view; it never cancels the
-Host turn. Cancel explicitly with `Ctrl-C` while a turn is running or
-`/cancel`.
+| Command | Purpose |
+| --- | --- |
+| `/help` | show keys and commands |
+| `/sessions` (`/resume`) | switch session |
+| `/workspaces` | switch workspace |
+| `/new` | create a session |
+| `/attach <id>` | attach by id |
+| `/cancel` | cancel the running turn |
+| `/clear` | clear the local transcript view |
+| `/reconnect` | reattach the current session |
+| `/rewind` | restore a previous prompt into the composer |
+| `/history` | search prompts sent in this session |
+| `/panel` (`/status`) | context, spend, speed, todos |
+| `/agents` | list subagents, open their transcripts |
+| `/verbose` | toggle reasoning and lifecycle events |
+| `/model` | switch provider/model and reasoning level |
+| `/provider` | edit provider rows in `cordis.patch.yml` |
+| `/quit` | leave the TUI (does not cancel the Host turn) |
 
-Commands: `/sessions` (aliases `/session`, `/resume`), `/workspaces`, `/new`,
-`/attach`, `/cancel`, `/clear`,
-`/reconnect`, `/rewind`, `/history`, `/panel`, `/status`, `/agents`, `/model`,
-`/provider`, `/verbose`, `/help`, `/quit`. Approvals are modal: `a` allow once, `r` reject, `d` details.
+## CLI
 
-### Models
-
-`/model` asks the Host for its live provider/model catalog and opens a picker:
-
-- `↑/↓` move, `Enter` switches the current session
-- models that declare reasoning levels step into a level list first
-  (`off` / `low` / `high` / `max`, each with its own description); `Enter`
-  there commits model **and** level in one selection
-- in the level list `↑/↓` moves and `1`-`9` jumps straight to that level
-  (Enter or `Shift+Enter` commits it); `e` reopens the level list for the
-  highlighted model, `←` goes back
-- `d` saves the highlighted model (and shown level) as the default
-- `/model provider/model` switches directly; `/model default provider/model`
-  saves a default without touching the current session
-
-Switching is a Host operation, not a TUI guess: the `dshell-host` plugin
-bridges DSH's `sessionController.modelCatalog()` and `selectModel()`, so the
-same catalog the Web UI shows is used. DSH applies the selection on the next
-request and appends a durable "model changed" notice; the selection also
-becomes the saved default. The level a model was last switched with is
-remembered per `provider/model` and shown in the bottom rail
-(`deepseek-official/deepseek-flash · high`).
-
-### Providers
-
-If the Host drops the socket (it exits, or DSH re-creates the plugin after the
-profile's linked package changes), the TUI notices and reattaches by itself:
-`host connection lost · reconnecting`, then `host back · reattached`. Nothing
-to run by hand, and `/reconnect` remains for a manual nudge.
-
-`/provider` lists the provider rows of the patch file the Host booted with
-(`$DSH_HOME/cordis.patch.yml`, else the active profile's), read through the
-`dshell-host` plugin:
-
-- `Enter` opens a field editor for `baseURL`, `apiKeyEnv` and `displayName`
-- `Enter` on a field edits it, `Ctrl-U` clears it, `Enter` commits the field
-- `s` writes the changed fields back and raises a confirmation:
-  `Restart the Host now?` — `y` re-execs the Host and reattaches the session,
-  `n` keeps the file change for the next manual start
-- `a` adds a provider: `id`, optional `displayName` / `apiKeyEnv`, `baseURL`
-  and a comma- or space-separated model list; the block is appended to the
-  `providers` map and the same restart confirmation follows
-- `x` deletes the selected provider (after a `y` confirmation, then the same
-  restart prompt). The last remaining provider cannot be deleted
-- `r` restarts the Host without editing
-
-The editor only touches the lines it needs — a field edit rewrites that
-scalar, `a` inserts one block, `x` splices one block out — so comments, model
-lists and `!!js` expressions elsewhere in the patch file survive, and an
-add/delete round trip leaves the file byte-identical. API keys themselves are
-never stored there: the file carries the environment-variable name
-(`apiKeyEnv`) and the secret stays in the environment or DSH's credential
-store. Providers are read at Host boot, so an edit needs the restart the
-confirmation offers — there is no live provider reload.
-
-### Herdr
-
-Run the TUI inside a [Herdr](https://herdr.dev) pane and it integrates itself:
-
-- the pane shows `dshell` with `working`, `blocked` (approval waiting) or
-  `idle` state in Herdr's sidebar and in `herdr agent list`
-- the DSH session id and a resume command are reported, so a Herdr server
-  restart reopens the same conversation in that pane
-- quitting releases the agent from the pane
-- outside Herdr it is a no-op; `DSHELL_NO_HERDR=1` disables it explicitly
-
-Unlike Claude Code, which needs `herdr integration install claude` to write a
-`SessionStart` hook into its settings, dshell speaks Herdr's
-`pane.report_agent` socket protocol directly (the "Add Herdr support to your
-agent" path), so there is no hook or settings file to install.
-
-See [TUI design](docs/TUI-DESIGN.md) for the palette, metric sources and
-responsive rules.
-
-## Scriptable CLI
+For scripts and pipes — it never prompts, and any approval is rejected:
 
 ```bash
 dshell -p "summarize this repository"
@@ -389,22 +250,20 @@ dshell -p --json "..."                       # one JSON result object
 dshell -p --output-format stream-json "..."  # NDJSON start/event/result
 ```
 
-`-p` writes only the result to stdout; diagnostics go to stderr. It never
-prompts: any approval is rejected and the exit code is `5` (fail closed).
-
-Exit codes:
+`-p` writes only the result to stdout; diagnostics go to stderr. Exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | 0 | turn completed |
-| 1 | Host/connection/protocol/internal error |
+| 1 | Host / connection / protocol / internal error |
 | 2 | invalid usage |
-| 3 | turn failed, cancelled, or abnormal end |
+| 3 | turn failed, cancelled, or ended abnormally |
 | 4 | `--timeout` reached |
 | 5 | approval denied in non-interactive mode |
 | 130 | SIGINT |
 
-### Low-level commands
+<details>
+<summary>Low-level commands and options</summary>
 
 ```bash
 dshell doctor
@@ -416,8 +275,6 @@ dshell prompt <sessionId> '…'
 dshell steer <sessionId> '…'
 dshell cancel <sessionId>
 ```
-
-Options:
 
 ```text
 --socket <path>       control socket override
@@ -434,87 +291,84 @@ Options:
 --new                 always create a session
 ```
 
-Environment:
+</details>
 
-```text
-DSH_HOME              DSH home (default: ~/.dsh)
-DSHELL_SOCKET         control socket override
-```
+## How it works
+
+- The **Host owns** every live Agent and Session.
+- The **plugin** holds the Agent handles it resumes; a CLI disconnect only
+  drops subscriptions.
+- Durable truth is `session/event`; `agent/assistant-stream` is a live
+  presentation channel only.
+- **One Host per `DSH_HOME`** — a second Host refuses to bind the same socket.
+- The plugin is a DSH bundle (`package.json:dsh.bundle.patch`); **no DSH source
+  changes** are required.
+
+The socket is `$DSH_HOME/run/dshell.sock`, directory `0700`, socket `0600`,
+and there is no token or cookie: run dshell as the user that started the Host.
 
 ## Approvals and safety
 
-- DSH approval is answered by a Host bridge. The Web UI and a CLI/TUI can race;
-  the **first valid answer wins**.
-- The bridge registers with `{ global: true, prepend: true }` so the agent-scoped
-  Web answerer cannot block it.
-- Timeout, Host shutdown, request abort, and last-watcher disconnect return
-  `unavailable`; they never auto-allow.
+- Approvals are bridged by the Host plugin; the Web UI and any dshell client
+  race, and the **first valid answer wins**.
+- The bridge registers with `{ global: true, prepend: true }` so an
+  agent-scoped Web answerer cannot starve it.
+- Timeout, Host shutdown, request abort and last-watcher disconnect return
+  `unavailable` — they never auto-allow.
 - `dshell prompt` on a TTY asks `[a]llow once / [r]eject`; non-TTY rejects.
 - `dshell -p` always rejects and exits `5`.
 - Approval request ids come from the Host bridge, never from a replayed
   `approval/asked` durable event.
 
-The socket is `$DSH_HOME/run/dshell.sock`, directory `0700`, socket `0600`.
-There is no token or Cookie. Run dshell as the same user that started the Host.
+## Configuration
 
-## Design notes
+```text
+DSH_HOME              DSH home (default: ~/.dsh)
+DSHELL_SOCKET         control socket override
+DSHELL_NO_HERDR=1     disable the Herdr reporter
+```
 
-- The Host owns all live Agents and Sessions.
-- The plugin holds the Agent handles it resumes; a CLI disconnect only drops
-  subscriptions.
-- Durable truth is `session/event`; `agent/assistant-stream` is a live
-  presentation channel only.
-- One Host per `DSH_HOME`. A second Host refuses to bind the same socket.
-- The plugin is a DSH bundle (`package.json:dsh.bundle.patch`); no DSH source
-  changes are required.
-
-## Troubleshooting
-
-| Symptom | Fix |
-| --- | --- |
-| `HOST_NOT_RUNNING` / no socket | Start `dsh --profile web` with the plugin installed, or run `./scripts/dev-host.sh`. |
-| `PLUGIN_MISSING` | The Host booted without `dshell-host`; add the plugin to the web profile and restart. |
-| `PROTOCOL_MISMATCH` | Install the CLI and plugin from the same dshell version. |
-| `SOCKET_PERMISSION_DENIED` | Run dshell as the Host user; check `DSH_HOME` ownership and socket mode `0600`. |
-| `[warn] dsh version` in doctor | Your DSH is outside the tested matrix; see [Supported versions](docs/SUPPORTED-VERSIONS.md). |
-| Approval seems to wait | Check the Web UI and any other dshell client; only one answer wins. Disconnect/unanswered requests fail closed. |
-| TUI won't start in a pipeline | It needs a TTY. Use `dshell -p` for scripts. |
-| Second Host fails to start | Stop the first Host; only one dshell Host per `DSH_HOME`. |
+Providers live in `$DSH_HOME/cordis.patch.yml` (else the active profile's).
+`/provider` edits them in place — `baseURL`, `apiKeyEnv`, `displayName`, model
+lists — and only touches the lines it needs, so comments, model lists and
+`!!js` expressions survive. Secrets are never written there: the file carries
+the environment-variable name and the key stays in the environment or DSH's
+credential store. Providers are read at Host boot, so an edit needs the restart
+that the confirmation offers.
 
 ## Development
 
 ```bash
 pnpm install
-pnpm typecheck
-pnpm lint
-pnpm test          # 100+ tests
-./scripts/ci.sh    # full local gate, including clean pack/install
+pnpm typecheck   # tsc --noEmit
+pnpm lint        # alias of typecheck
+pnpm test        # build + node --test (151 tests)
+./scripts/ci.sh  # full local gate, including a clean pack/install
 ```
 
 Release artifacts are verified with `scripts/verify-pack.sh`. The tag workflow
 `.github/workflows/release.yml` runs the same gate, uploads the tarball plus
-`SHA256SUMS`, and — when the `NPM_TOKEN` repository secret is configured —
-publishes the verified tarball to npm with provenance. Until the secret is
-set, publication stays a manual `npm publish --access public`.
+`SHA256SUMS`, and — when the `NPM_TOKEN` secret is configured — publishes it to
+npm with provenance.
 
 ## Documentation
 
-Stage docs:
-
-- [P0 — feasibility](docs/dev/00-feasibility.md)
-- [P1 — packaging](docs/dev/01-packaging.md)
-- [P2 — adapter](docs/dev/02-adapter.md)
-- [P3 — session core](docs/dev/03-session-core.md)
-- [P4 — TUI](docs/dev/04-tui.md)
-- [P5 — product CLI](docs/dev/05-product-cli.md)
-- [P6 — compatibility and release](docs/dev/06-compatibility-release.md)
-
-Reference:
-
+- [TUI design](docs/TUI-DESIGN.md) — palette, metric sources, responsive rules
 - [Supported versions](docs/SUPPORTED-VERSIONS.md)
 - [Changelog](CHANGELOG.md)
-- [Architecture](find/architecture.md)
-- [P3 evidence](find/p3-evidence.md)
-- [P4 evidence](find/p4-evidence.md)
-- [P5 evidence](find/p5-evidence.md)
-- [P6 evidence](find/p6-evidence.md)
+- Stage notes: [P0 feasibility](docs/dev/00-feasibility.md) ·
+  [P1 packaging](docs/dev/01-packaging.md) ·
+  [P2 adapter](docs/dev/02-adapter.md) ·
+  [P3 session core](docs/dev/03-session-core.md) ·
+  [P4 TUI](docs/dev/04-tui.md) ·
+  [P5 product CLI](docs/dev/05-product-cli.md) ·
+  [P6 compatibility](docs/dev/06-compatibility-release.md)
+- Reference: [architecture](find/architecture.md) ·
+  [DSH API inventory](find/dsh-api-inventory.md) ·
+  [compatibility risks](find/compatibility-risks.md) ·
+  [P3](find/p3-evidence.md) · [P4](find/p4-evidence.md) ·
+  [P5](find/p5-evidence.md) · [P6](find/p6-evidence.md)
+
+## License
+
+Published as `UNLICENSED` (all rights reserved) while V1 stabilizes.
