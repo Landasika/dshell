@@ -74,6 +74,6 @@ The release workflow and `scripts/verify-pack.sh` verify:
 - no `.p0`, `.cache`, `docs/development`, or credentials are packed;
 - a clean `npm install` of the tarball exposes the `dshell` bin and the
   `dshell-host` plugin export;
-- `pnpm test` (25 tests), typecheck, and lint pass.
+- `pnpm test` (149 tests), typecheck, and lint pass.
 
 See [`docs/dev/06-compatibility-release.md`](./dev/06-compatibility-release.md).
