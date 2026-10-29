@@ -9,6 +9,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -398,7 +399,15 @@ function listen(server: Server, socketPath: string): Promise<void> {
 
 function closeServer(server: Server): Promise<void> {
   if (!server.listening) return Promise.resolve()
-  return new Promise((resolve) => server.close(() => resolve()))
+  // A half-open client can keep server.close pending forever; bound the
+  // shutdown so a restart handover never stalls on one.
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 3_000)
+    server.close(() => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
 }
 
 export async function apply(ctx: PluginContext, config: Config = {}): Promise<void> {
@@ -944,9 +953,27 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    let child
     try {
-      child = spawn(process.execPath, argv, {
+      accessSync(process.execPath, fsConstants.X_OK)
+    } catch {
+      sendError(socket, {
+        type: 'error',
+        code: 'INTERNAL',
+        message: `could not re-exec the Host: ${process.execPath} is not executable`,
+        action: 'Restart the Host by hand.',
+      })
+      return
+    }
+    jsonLine(socket, { type: 'host-restarting', pid: process.pid, argv })
+    // Close BEFORE spawning the replacement: Node's server.close() removes
+    // the socket file at this path, so closing after the spawn races the
+    // replacement's own bind and can delete its freshly-created socket
+    // (verified on Node 24). Closing first leaves the child a free path;
+    // a spawn failure past this point is logged and surfaced by the CLI's
+    // reconnect timeout instead of a half-dead Host.
+    await close().catch(() => {})
+    try {
+      const child = spawn(process.execPath, argv, {
         detached: true,
         stdio: 'ignore',
         cwd: process.cwd(),
@@ -954,18 +981,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       child.unref()
     } catch (error) {
-      sendError(socket, {
-        type: 'error',
-        code: 'INTERNAL',
-        message: `could not re-exec the Host: ${errorText(error)}`,
-        action: 'Restart the Host by hand.',
-      })
-      return
+      console.error(`[dshell-host] could not re-exec the Host: ${errorText(error)}`)
     }
-    jsonLine(socket, { type: 'host-restarting', pid: process.pid, argv })
-    // Close first so the replacement can bind the socket path, then exit.
-    await close().catch(() => {})
-    setTimeout(() => process.exit(0), 250)
+    process.exit(0)
   }
 
   const watch = (socket: Socket, sessionId: string): Set<string> => {
@@ -1578,6 +1596,18 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
   console.error(`[dshell-host] listening on ${socketPath}`)
 
+  // Identity of the socket file this instance bound. close() only unlinks
+  // the path while it still points at this file, so a replacement Host
+  // (host/restart) that already re-bound the path can never have its socket
+  // removed by the old process shutting down (DS-009).
+  const boundIno: number | undefined = (() => {
+    try {
+      return statSync(socketPath).ino
+    } catch {
+      return undefined
+    }
+  })()
+
   const close = async (): Promise<void> => {
     if (closing) return
     closing = true
@@ -1586,16 +1616,24 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     disposeAgentStatus()
     disposeApproval()
     approvals.dispose()
-    for (const socket of clients) socket.destroy()
+    // End (don't destroy) the clients so final frames — approval-resolved on
+    // shutdown, host-restarting — flush before the connection drops; a
+    // stalled peer gets destroyed once closeServer's bound gives up.
+    const live = [...clients]
+    for (const socket of live) socket.end()
     clients.clear()
     watched.clear()
     await closeServer(server)
+    for (const socket of live) {
+      if (!socket.destroyed) socket.destroy()
+    }
     for (const handle of handles.values()) {
       await handle.dispose().catch(() => {})
     }
     handles.clear()
     try {
-      unlinkSync(socketPath)
+      const currentIno = statSync(socketPath).ino
+      if (boundIno === undefined || currentIno === boundIno) unlinkSync(socketPath)
     } catch {
       // Already gone.
     }

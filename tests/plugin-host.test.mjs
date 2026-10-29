@@ -693,3 +693,46 @@ test('losing the last watcher settles the approval unavailable (DS-002)', async 
   first.destroy()
   assert.equal((await outcomes)[0], 'unavailable')
 })
+
+test('close() releases the socket path for the replacement Host (DS-009)', async (t) => {
+  const harness = await startHarness(t)
+  // Node's server.close() removes the file at the listen path, which is the
+  // property the restart handover relies on: after this plugin closes, the
+  // path is free for the re-exec'd Host to bind.
+  for (const disposer of harness.disposers) await disposer?.()
+  const { accessSync, constants } = await import('node:fs')
+  assert.throws(() => accessSync(harness.socketPath, constants.F_OK), /ENOENT/)
+  // And a fresh plugin can bind the same path immediately afterwards.
+  const second = await startHarness(t)
+  const probe = new NdjClient(second.socketPath)
+  probe.send({ type: 'hello', protocol: 2 })
+  const welcome = await probe.next()
+  assert.equal(welcome.type, 'welcome')
+  probe.destroy()
+})
+
+test('shutdown flushes the final approval resolution before closing (DS-009)', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  const never = new Promise(() => {})
+  const outcomes = harness.emit('approval/request', {
+    agent: { session: { id: 's1' } },
+    toolName: 'bash',
+  }, () => never)
+  await client.next() // approval-request
+
+  for (const disposer of harness.disposers) await disposer?.()
+  // The resolution frame must arrive before the connection ends.
+  const resolved = await client.next(2000)
+  assert.equal(resolved.type, 'approval-resolved')
+  assert.equal(resolved.outcome, 'unavailable')
+  assert.equal((await outcomes)[0], 'unavailable')
+  await client.closed
+})
