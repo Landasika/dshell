@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION,
   type ClientMessage,
   type DshellErrorCode,
+  type ErrorMessage,
   type ServerMessage,
   type WelcomeMessage,
 } from '../protocol/index.js'
@@ -92,6 +93,7 @@ export class HostConnection {
   private closed = false
   private readonly closeListeners = new Set<() => void>()
   private welcomeMessage: WelcomeMessage | null = null
+  private commandChain: Promise<void> = Promise.resolve()
 
   private constructor(socket: Socket) {
     this.socket = socket
@@ -244,6 +246,37 @@ export class HostConnection {
     })
   }
 
+  /**
+   * Send one command and await its reply. Commands are serialized per
+   * connection, so at most one command is ever in flight: a failing command
+   * can never bleed its error into an unrelated concurrent caller (DS-006).
+   * An error reply to this command rejects immediately; waiters that did
+   * not ask for errors (event streams) are untouched.
+   */
+  async request<T extends ServerMessage>(
+    message: ClientMessage,
+    predicate: (candidate: ServerMessage) => boolean,
+    timeoutMs = 30_000,
+  ): Promise<T> {
+    const run = async (): Promise<T> => {
+      this.send(message)
+      const reply = await this.waitFor<T | ErrorMessage>(
+        (candidate) => predicate(candidate) || candidate.type === 'error',
+        timeoutMs,
+      )
+      if (reply.type === 'error') {
+        throw new DshellError(reply.code, reply.message, reply.action)
+      }
+      return reply
+    }
+    const next = this.commandChain.then(run, run)
+    this.commandChain = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return await next
+  }
+
   close(): void {
     if (this.closed) return
     this.closed = true
@@ -265,7 +298,12 @@ export class HostConnection {
     if (message.type === 'error') {
       for (const listener of this.listeners) listener(message)
       const error = new DshellError(message.code, message.message, message.action)
-      for (const waiter of [...this.waiters]) waiter.reject(error)
+      // An error is a reply to the command in flight, never a broadcast:
+      // only waiters that accept an error as their answer are rejected, so
+      // an event stream waiting next to a failing command keeps running.
+      for (const waiter of [...this.waiters]) {
+        if (waiter.predicate(message)) waiter.reject(error)
+      }
       return
     }
     if (!this.broadcastOnly) {

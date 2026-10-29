@@ -118,9 +118,9 @@ export class SocketBackend implements DshellBackend {
 
   async modelCatalog(): Promise<ModelCatalog> {
     const connection = this.requireControl()
-    connection.send({ type: 'model/catalog' })
     try {
-      const message = await connection.waitFor<ModelCatalogMessage>(
+      const message = await connection.request<ModelCatalogMessage>(
+        { type: 'model/catalog' },
         (candidate) => candidate.type === 'model-catalog',
         20_000,
       )
@@ -132,15 +132,15 @@ export class SocketBackend implements DshellBackend {
 
   async selectModel(sessionId: string, selection: ModelSelection): Promise<ModelSelection> {
     const connection = this.requireControl()
-    connection.send({
+    try {
+      const message = await connection.request<ModelSelectedMessage>(
+        {
       type: 'model/select',
       sessionId,
       provider: selection.provider,
       model: selection.model,
       ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
-    })
-    try {
-      const message = await connection.waitFor<ModelSelectedMessage>(
+    },
         (candidate) => candidate.type === 'model-selected',
         25_000,
       )
@@ -152,9 +152,9 @@ export class SocketBackend implements DshellBackend {
 
   async providerList(): Promise<ProviderList> {
     const connection = this.requireControl()
-    connection.send({ type: 'provider/list' })
     try {
-      const message = await connection.waitFor<ProviderListMessage>(
+      const message = await connection.request<ProviderListMessage>(
+        { type: 'provider/list' },
         (candidate) => candidate.type === 'provider-list',
         15_000,
       )
@@ -166,9 +166,9 @@ export class SocketBackend implements DshellBackend {
 
   async updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList> {
     const connection = this.requireControl()
-    connection.send({ type: 'provider/update', providerId, field, value })
     try {
-      const message = await connection.waitFor<ProviderUpdatedMessage>(
+      const message = await connection.request<ProviderUpdatedMessage>(
+        { type: 'provider/update', providerId, field, value },
         (candidate) => candidate.type === 'provider-updated',
         15_000,
       )
@@ -180,16 +180,16 @@ export class SocketBackend implements DshellBackend {
 
   async createProvider(spec: NewProviderSpec): Promise<ProviderList> {
     const connection = this.requireControl()
-    connection.send({
+    try {
+      const message = await connection.request<ProviderCreatedMessage>(
+        {
       type: 'provider/create',
       providerId: spec.id,
       baseURL: spec.baseURL,
       models: spec.models,
       ...(spec.apiKeyEnv === undefined ? {} : { apiKeyEnv: spec.apiKeyEnv }),
       ...(spec.displayName === undefined ? {} : { displayName: spec.displayName }),
-    })
-    try {
-      const message = await connection.waitFor<ProviderCreatedMessage>(
+    },
         (candidate) => candidate.type === 'provider-created',
         15_000,
       )
@@ -201,9 +201,9 @@ export class SocketBackend implements DshellBackend {
 
   async deleteProvider(providerId: string): Promise<ProviderList> {
     const connection = this.requireControl()
-    connection.send({ type: 'provider/delete', providerId })
     try {
-      const message = await connection.waitFor<ProviderDeletedMessage>(
+      const message = await connection.request<ProviderDeletedMessage>(
+        { type: 'provider/delete', providerId },
         (candidate) => candidate.type === 'provider-deleted',
         15_000,
       )
@@ -215,9 +215,9 @@ export class SocketBackend implements DshellBackend {
 
   async restartHost(): Promise<{ pid: number; argv: string[] }> {
     const connection = this.requireControl()
-    connection.send({ type: 'host/restart' })
     try {
-      const message = await connection.waitFor<HostRestartingMessage>(
+      const message = await connection.request<HostRestartingMessage>(
+        { type: 'host/restart' },
         (candidate) => candidate.type === 'host-restarting',
         10_000,
       )
@@ -229,14 +229,14 @@ export class SocketBackend implements DshellBackend {
 
   async saveDefaultModel(selection: ModelSelection): Promise<ModelSelection> {
     const connection = this.requireControl()
-    connection.send({
-      type: 'model/default',
-      provider: selection.provider,
-      model: selection.model,
-      ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
-    })
     try {
-      const message = await connection.waitFor<ModelSelectedMessage>(
+      const message = await connection.request<ModelSelectedMessage>(
+        {
+          type: 'model/default',
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+        },
         (candidate) => candidate.type === 'model-selected',
         10_000,
       )
@@ -289,12 +289,12 @@ export class SocketBackend implements DshellBackend {
 
   async listSessions(workspaceId?: string): Promise<SessionSummary[]> {
     const connection = this.requireControl()
-    connection.send({ type: 'session/list', ...(workspaceId === undefined ? {} : { workspaceId }) })
     let message: SessionsMessage
     try {
       // A shared DSH home can hold hundreds of sessions; enumeration plus
       // title snapshots is allowed to take a while before it reports empty.
-      message = await connection.waitFor<SessionsMessage>(
+      message = await connection.request<SessionsMessage>(
+        { type: 'session/list', ...(workspaceId === undefined ? {} : { workspaceId }) },
         (candidate) => candidate.type === 'sessions',
         25_000,
       )
@@ -311,9 +311,9 @@ export class SocketBackend implements DshellBackend {
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
     const connection = this.requireControl()
-    connection.send({ type: 'workspaces' })
     try {
-      const message = await connection.waitFor<{ type: 'workspaces'; workspaces: WorkspaceSummary[] }>(
+      const message = await connection.request<{ type: 'workspaces'; workspaces: WorkspaceSummary[] }>(
+        { type: 'workspaces' },
         (candidate) => candidate.type === 'workspaces',
         10_000,
       )
@@ -325,15 +325,15 @@ export class SocketBackend implements DshellBackend {
 
   async createSession(options: CreateSessionOptions = {}): Promise<SessionHandle> {
     const connection = this.requireControl()
-    connection.send({
-      type: 'session/create',
-      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-      ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
-      ...(options.title === undefined ? {} : { title: options.title }),
-    })
     let created: SessionCreatedMessage | ErrorMessage
     try {
-      created = await connection.waitFor<SessionCreatedMessage | ErrorMessage>(
+      created = await connection.request<SessionCreatedMessage | ErrorMessage>(
+        {
+          type: 'session/create',
+          ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+          ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
+          ...(options.title === undefined ? {} : { title: options.title }),
+        },
         (candidate) => candidate.type === 'session-created' || candidate.type === 'error',
         60_000,
       )
@@ -658,6 +658,10 @@ export class SocketSessionHandle implements SessionHandle {
       }
       if (this.pendingQuestionAnswer !== null) {
         this.pendingQuestionAnswer = null
+      }
+      if (this.pendingHistory !== null) {
+        this.pendingHistory.reject(error)
+        this.pendingHistory = null
       }
     }
   }

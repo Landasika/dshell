@@ -13,6 +13,7 @@ async function socketServer(handler) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-test-'))
   const socketPath = join(directory, 'dshell.sock')
   const server = createServer((socket) => {
+    server.lastSocket = socket
     socket.setEncoding('utf8')
     let buffer = ''
     socket.on('data', (chunk) => {
@@ -33,6 +34,9 @@ async function socketServer(handler) {
   })
   return {
     socketPath,
+    get lastSocket() {
+      return server.lastSocket
+    },
     close: async () => {
       await new Promise((resolve) => server.close(resolve))
       await rm(directory, { recursive: true, force: true })
@@ -131,9 +135,12 @@ test('a command error rejects the pending waiter immediately', async (t) => {
   })
 
   const started = Date.now()
-  connection.send({ type: 'model/select', sessionId: 's1', provider: 'x', model: 'y', reasoningEffort: 'off' })
   await assert.rejects(
-    connection.waitFor((message) => message.type === 'model-selected', 20_000),
+    connection.request(
+      { type: 'model/select', sessionId: 's1', provider: 'x', model: 'y', reasoningEffort: 'off' },
+      (message) => message.type === 'model-selected',
+      20_000,
+    ),
     (error) =>
       error instanceof DshellError &&
       error.code === 'INTERNAL' &&
@@ -228,3 +235,59 @@ test('waiters are released when the connection drops mid-flood', async (t) => {
   await assert.rejects(pending, /closed|HOST/i)
   connection.close()
 })
+
+test('a failing command does not disturb concurrent or stream waiters (DS-006)', async (t) => {
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') {
+      write(socket, {
+        type: 'welcome',
+        protocol: 2,
+        pluginVersion: 'test',
+        dshVersion: 'test',
+        capabilities: ['list', 'models', 'workspaces'],
+        socketPath: 'test.sock',
+        sessions: [],
+      })
+    } else if (message.type === 'model/select') {
+      write(socket, { type: 'error', code: 'INTERNAL', message: 'select failed' })
+    } else if (message.type === 'workspaces') {
+      setTimeout(() => {
+        write(socket, { type: 'workspaces', workspaces: [{ id: 'w1', path: '/w', title: 'w' }] })
+      }, 25)
+    }
+  })
+  const connection = await HostConnection.connect(server.socketPath)
+  t.after(async () => {
+    connection.close()
+    await server.close()
+  })
+
+  // An event-stream waiter is not a command: an error reply must leave it
+  // alive to consume the next broadcast.
+  const nextEvent = connection.waitFor((message) => message.type === 'event', 2_000)
+  const failing = connection.request(
+    { type: 'model/select', sessionId: 's1', provider: 'x', model: 'y' },
+    (candidate) => candidate.type === 'model-selected',
+    2_000,
+  )
+  await assert.rejects(failing, /select failed/)
+
+  // The queued command after the failure still runs and resolves.
+  const workspaces = await connection.request(
+    { type: 'workspaces' },
+    (candidate) => candidate.type === 'workspaces',
+    2_000,
+  )
+  assert.equal(workspaces.workspaces[0]?.id, 'w1')
+
+  // And the stream waiter survives to see a late event.
+  write(serverSocketOf(server, connection), { type: 'event', sessionId: 's1', event: { type: 'user/message', seq: 1, data: {} } })
+  const event = await nextEvent
+  assert.equal(event.event.type, 'user/message')
+})
+
+// The fake server helper keeps one live socket per test; expose it so a test
+// can inject unsolicited broadcasts from the host side.
+function serverSocketOf(server, connection) {
+  return server.lastSocket
+}
