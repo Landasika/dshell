@@ -87,10 +87,8 @@ export class TerminalScreen {
     return this.selection !== null
   }
 
-  /** Copy the current selection through the terminal's clipboard (OSC 52). */
-  copySelection(): string {
-    if (this.selection === null) return ''
-    const text = selectionText(this.lastLines, this.selection)
+  /** Copy arbitrary text through the terminal's clipboard (OSC 52). */
+  copyText(text: string): string {
     if (text.length === 0) return ''
     const payload = Buffer.from(text, 'utf8').toString('base64')
     try {
@@ -99,6 +97,12 @@ export class TerminalScreen {
       // no clipboard support; the caller still gets the text back
     }
     return text
+  }
+
+  /** Copy the current selection through the terminal's clipboard (OSC 52). */
+  copySelection(): string {
+    if (this.selection === null) return ''
+    return this.copyText(selectionText(this.lastLines, this.selection))
   }
 
   /**

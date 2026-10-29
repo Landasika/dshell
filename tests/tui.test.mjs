@@ -2576,3 +2576,72 @@ test('session picker only labels a resident agent, never "cold"', async () => {
     await backend.disconnect()
   }
 })
+
+test('panel viewers copy their body with y and with a mouse drag', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 110
+    rows = 34
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = []
+  let seq = 0
+  for (let turn = 0; turn < 6; turn += 1) {
+    events.push({ type: 'user/message', seq: seq++, data: { message: { id: `u${String(turn)}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `request ${String(turn)}` }] } } })
+    events.push({ type: 'tool/call', seq: seq++, data: { name: 'bash', callId: `c${String(turn)}`, arguments: JSON.stringify({ command: `echo ${String(turn)}`, description: `Step ${String(turn)}` }) } })
+    events.push({ type: 'tool/result', seq: seq++, data: { message: { toolCallId: `c${String(turn)}`, isError: false, content: [{ type: 'text', text: `output ${String(turn)}` }] } } })
+  }
+  events.push({ type: 'turn/end', seq, data: { reason: { kind: 'completed' } } })
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', title: 't', events }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-700))}`)
+  }
+
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('idle'), 'the session to attach')
+    input.push('\u001b[1;3A') // alt+up: focus the newest block
+    await waitFor(() => stripAnsi(output.text).includes('enter open'), 'a focused block')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('y copy'), 'the detail panel')
+
+    output.text = ''
+    input.push('y')
+    await waitFor(() => stripAnsi(output.text).includes('copied'), 'the copy toast')
+
+    // A drag inside the open panel must select (and copy) the panel rows.
+    output.text = ''
+    input.push('\u001b[<0;10;12M')
+    input.push('\u001b[<32;30;14M')
+    input.push('\u001b[<0;30;14m')
+    await waitFor(() => stripAnsi(output.text).includes('copied'), 'a drag copy inside the panel')
+  } finally {
+    input.push('\u001b')
+    input.push('\u0004')
+    await app
+    await backend.disconnect()
+  }
+})

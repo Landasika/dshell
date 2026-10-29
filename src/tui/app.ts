@@ -41,7 +41,7 @@ import { renderMarkdown } from './markdown.js'
 import { TerminalScreen, Viewport } from './screen.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
 import { createTheme } from './theme.js'
-import { displayWidth, pad, sanitizeText, truncate, wrapText } from './width.js'
+import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from './width.js'
 import {
   averageTps,
   collectMetrics,
@@ -1606,6 +1606,79 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  /**
+   * Mouse selection is shell-level, not transcript-level: the Screen buffer
+   * holds the overlay rows too, so dragging inside a detail panel copies what
+   * the user can see. Returns whether the key was a mouse event.
+   */
+  const handleSelectionKey = (key: Key): boolean => {
+    if (key.type === 'click') {
+      if (pillRow !== null && key.row === pillRow) {
+        viewport.reset()
+        schedule()
+        return true
+      }
+      // Start a selection anchor; a plain click (no drag) copies nothing.
+      selectAnchor = { row: key.row, column: key.column }
+      screen.setSelection(null)
+      schedule()
+      return true
+    }
+    if (key.type === 'drag') {
+      if (selectAnchor !== null) {
+        screen.setSelection({
+          startRow: selectAnchor.row,
+          startColumn: selectAnchor.column,
+          endRow: key.row,
+          endColumn: key.column,
+        })
+        schedule()
+      }
+      return true
+    }
+    if (key.type === 'release') {
+      if (selectAnchor === null) return true
+      const moved = key.row !== selectAnchor.row || key.column !== selectAnchor.column
+      selectAnchor = null
+      if (moved) {
+        const text = screen.copySelection()
+        if (text.length > 0) {
+          const lines = text.split('\n').length
+          toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
+        }
+      } else {
+        screen.setSelection(null)
+      }
+      schedule()
+      return true
+    }
+    return false
+  }
+
+  /**
+   * `y` copies the whole panel body of a read-only viewer. Terminals without
+   * OSC 52 drop the clipboard write silently, but the text is still returned
+   * and the toast still confirms what was sent.
+   */
+  const copyOverlayContent = (): boolean => {
+    const overlay = state.overlay
+    if (overlay === null) return false
+    const lines =
+      overlay.kind === 'detail' || overlay.kind === 'agentView' || overlay.kind === 'skillView'
+        ? overlay.lines
+        : undefined
+    if (lines === undefined) return false
+    const text = stripAnsi(lines.join('\n')).replace(/[ \t]+$/gm, '').trim()
+    if (text.length === 0) {
+      toast('nothing to copy')
+      return true
+    }
+    screen.copyText(text)
+    toast(`copied ${text.split('\n').length} lines`)
+    schedule()
+    return true
+  }
+
   const handleOverlayKey = (rawKey: Key): void => {
     // Some terminals (and Shift+Enter) send LF where the rest of the app means
     // "confirm". Inside a picker both should commit, so alias them here.
@@ -1638,6 +1711,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       quit(0)
       return
     }
+    if (key.type === 'text' && key.text === 'y' && copyOverlayContent()) return
     if (overlay.kind === 'approval') {
       if (key.type === 'text' && key.text.toLowerCase() === 'a') void answerApproval('allowed-once')
       else if (key.type === 'text' && key.text.toLowerCase() === 'r') void answerApproval('rejected')
@@ -2116,59 +2190,22 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       handleStartupKey(key)
       return
     }
-    if (state.overlay !== null) {
-      handleOverlayKey(key)
-      return
-    }
-    // Any non-mouse key ends a text selection.
+    // Any non-mouse key ends a text selection, wherever it was started.
     if (key.type !== 'click' && key.type !== 'drag' && key.type !== 'release' && key.type !== 'wheel') {
       selectAnchor = null
       screen.setSelection(null)
+    }
+    // Text selection runs before the overlay branch so a drag inside a panel
+    // copies the panel, not the transcript under it.
+    if ((key.type === 'click' || key.type === 'drag' || key.type === 'release') && handleSelectionKey(key)) return
+    if (state.overlay !== null) {
+      handleOverlayKey(key)
+      return
     }
     if (key.type === 'wheel') {
       selectAnchor = null
       screen.setSelection(null)
       viewport.scroll(-key.delta * 3, transcriptLineCount(), transcriptHeight())
-      schedule()
-      return
-    }
-    if (key.type === 'click') {
-      if (pillRow !== null && key.row === pillRow) {
-        viewport.reset()
-        schedule()
-        return
-      }
-      // Start a selection anchor; a plain click (no drag) copies nothing.
-      selectAnchor = { row: key.row, column: key.column }
-      screen.setSelection(null)
-      schedule()
-      return
-    }
-    if (key.type === 'drag') {
-      if (selectAnchor !== null) {
-        screen.setSelection({
-          startRow: selectAnchor.row,
-          startColumn: selectAnchor.column,
-          endRow: key.row,
-          endColumn: key.column,
-        })
-        schedule()
-      }
-      return
-    }
-    if (key.type === 'release') {
-      if (selectAnchor === null) return
-      const moved = key.row !== selectAnchor.row || key.column !== selectAnchor.column
-      selectAnchor = null
-      if (moved) {
-        const text = screen.copySelection()
-        if (text.length > 0) {
-          const lines = text.split('\n').length
-          toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
-        }
-      } else {
-        screen.setSelection(null)
-      }
       schedule()
       return
     }
@@ -2989,7 +3026,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           ? [paint(theme, 'error', overlay.error)]
           : overlay.lines.slice(overlay.scroll, overlay.scroll + height)
       return panelBox(theme, `skill · ${truncate(overlay.name, 40)}`, body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ scroll · backspace back · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ scroll · backspace back · y copy · esc close')],
       })
     }
     if (overlay.kind === 'agents') {
@@ -3017,14 +3054,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           ? [paint(theme, 'error', overlay.error)]
           : overlay.lines.slice(overlay.scroll, overlay.scroll + height)
       return panelBox(theme, `agent · ${truncate(overlay.label, 40)}`, body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · backspace back · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · y copy · backspace back · esc close')],
       })
     }
     if (overlay.kind === 'detail') {
       const height = Math.max(4, rows - 12)
       const body = overlay.lines.slice(overlay.scroll, overlay.scroll + height)
       return panelBox(theme, overlay.title, body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · y copy · esc close')],
       })
     }
     if (overlay.kind === 'dashboard') {
