@@ -15,9 +15,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # No `version` here on purpose: the action reads packageManager from
+      # package.json. Passing both is a hard error in pnpm/action-setup@v4.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 24
