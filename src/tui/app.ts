@@ -2399,7 +2399,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const buildFocusItems = (ranges: readonly BlockRange[], lineCount: number): FocusItem[] => {
     const items: FocusItem[] = []
     for (const range of ranges) {
-      if (range.block.kind === 'turn') continue
+      if (range.block.kind === 'turn' || range.block.kind === 'turnend') continue
       items.push({ start: range.start, end: range.end, kind: 'block', block: range.block })
     }
     for (const entry of queuedEntries()) {

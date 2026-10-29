@@ -2433,3 +2433,38 @@ test('git polling survives the activity tick stopping (DS-008)', async (t) => {
     await backend.disconnect()
   }
 })
+
+test('a finished turn reports how long it ran and when', () => {
+  const start = new Date(2026, 9, 29, 11, 18, 0).getTime()
+  const events = [
+    { type: 'user/message', seq: 1, time: start - 1200, data: { message: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] } } },
+    { type: 'turn/start', seq: 2, time: start, data: { turn: 1 } },
+    { type: 'assistant/message', seq: 3, time: start + 4000, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } } },
+    { type: 'turn/end', seq: 4, time: start + 76_000, data: { reason: { kind: 'completed' } } },
+  ]
+  const lines = renderTranscript(events, 80, theme)
+  const footer = lines.find((line) => stripAnsi(line).includes('Worked for'))
+  assert.ok(footer !== undefined, 'expected a turn footer')
+  assert.match(stripAnsi(footer), /✻ Worked for 1m 16s · done 11:19/)
+
+  // A cancelled turn says so instead of claiming work.
+  const cancelled = renderTranscript(
+    [
+      { type: 'turn/start', seq: 1, time: start, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: start + 5000, data: { reason: { kind: 'cancelled' } } },
+    ],
+    80,
+    theme,
+  )
+  assert.match(stripAnsi(cancelled.join('\n')), /✻ Stopped after 5s · done 11:18/)
+})
+
+test('turn footers are not focusable blocks', async () => {
+  const { buildBlocks: blocks } = await import('../dist/tui/events.js')
+  const events = [
+    { type: 'turn/start', seq: 1, time: 1_790_000_000_000, data: { turn: 1 } },
+    { type: 'turn/end', seq: 2, time: 1_790_000_060_000, data: { reason: { kind: 'completed' } } },
+  ]
+  const kinds = blocks(events).map((block) => block.kind)
+  assert.deepEqual(kinds, ['turnend'])
+})

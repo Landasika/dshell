@@ -175,7 +175,7 @@ function messageOf(data: Json): Json {
   return asObject(data.message) ?? data
 }
 
-function eventTime(event: SessionEvent): number | undefined {
+export function eventTime(event: SessionEvent): number | undefined {
   const raw = event.time
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return undefined
   // DSH logs use epoch milliseconds; tolerate seconds from older exports.

@@ -2,6 +2,7 @@ import type { AskedQuestion, SessionEvent } from '../protocol/index.js'
 import { renderDiff, renderMarkdown } from './markdown.js'
 import { BRAND_ICON, BRAND_NAME } from './brand.js'
 import { paint, paintBand, type Theme } from './theme.js'
+import { eventTime, formatDuration } from './metrics.js'
 import { displayWidth, pad, sanitizeText, truncate, wrapText } from './width.js'
 
 type Json = Record<string, any>
@@ -13,6 +14,7 @@ export type BlockKind =
   | 'tool'
   | 'todo'
   | 'turn'
+  | 'turnend'
   | 'notice'
   | 'error'
 
@@ -32,6 +34,12 @@ export interface Block {
   steps?: number
   /** One-line call signature for a tool block, e.g. `Bash(ls -la)`. */
   headline?: string
+}
+
+/** Local `HH:MM`, the finish time shown next to a turn's duration. */
+function clockLabel(time: number): string {
+  const date = new Date(time)
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 }
 
 function shortAgent(id: string): string {
@@ -318,6 +326,8 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
   const agentBlocks = new Map<string, Block>()
   const reasoningByTurn = new Map<string, Block>()
   let userTurns = 0
+  // Wall-clock start of the open turn, so the footer can report how long it ran.
+  let turnStartedAt: number | undefined
 
   for (const event of events) {
     const data = dataOf(event)
@@ -473,20 +483,29 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
         }
         break
       }
+      case 'turn/start': {
+        turnStartedAt = eventTime(event)
+        break
+      }
       case 'turn/end':
       case 'turn/failed': {
         const reason = (data.reason ?? {}) as Json
         const kind = String(reason.kind ?? '')
-        if (kind === 'error' || kind === 'failed' || event.type === 'turn/failed') {
+        const failed = kind === 'error' || kind === 'failed' || event.type === 'turn/failed'
+        if (failed) {
           // A failed turn otherwise leaves the transcript silent: the user
           // sees the prompt and then nothing. Always surface the reason.
           const failure = (reason.error ?? reason.failure ?? {}) as Json
           const message = String(failure.message ?? failure.code ?? 'the Host ended the turn with an error')
           blocks.push({ kind: 'error', title: 'turn failed', body: truncate(message, 400) })
-        } else if (verbose) {
-          const label = kind === 'completed' ? 'turn completed' : `turn ${kind || 'ended'}`
-          blocks.push({ kind: 'turn', title: label, body: '' })
         }
+        const endedAt = eventTime(event)
+        if (turnStartedAt !== undefined && endedAt !== undefined && endedAt >= turnStartedAt) {
+          const verb = failed ? 'Failed after' : kind === 'cancelled' ? 'Stopped after' : 'Worked for'
+          const title = `${verb} ${formatDuration(endedAt - turnStartedAt)} · done ${clockLabel(endedAt)}`
+          blocks.push({ kind: 'turnend', title, body: '' })
+        }
+        turnStartedAt = undefined
         break
       }
       case 'system/message': {
@@ -682,6 +701,10 @@ export function renderBlocksWithRanges(
       case 'turn': {
         out.push(paint(theme, 'dim', paint(theme, 'gray', '─'.repeat(separatorWidth))))
         if (block.title !== undefined) out.push(paint(theme, 'dim', block.title))
+        break
+      }
+      case 'turnend': {
+        out.push(`${paint(theme, 'accentSoft', '✻')} ${paint(theme, 'dim', block.title ?? '')}`)
         break
       }
     }
