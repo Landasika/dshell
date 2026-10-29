@@ -2645,3 +2645,71 @@ test('panel viewers copy their body with y and with a mouse drag', async () => {
     await backend.disconnect()
   }
 })
+
+test('a user-invocable skill reaches the model as a /name gesture', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 110
+    rows = 34
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', title: 't' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-700))}`)
+  }
+
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('idle'), 'the session to attach')
+
+    // A skill name is not a dshell command: the whole line goes to the model,
+    // which is how the Host recognises the `/name` gesture and injects it.
+    input.push('/triage-issues why is it slow')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('echo: /triage-issues why is it slow'), 'the echoed skill prompt')
+    assert.ok(!stripAnsi(output.text).includes('unknown command /triage-issues'))
+
+    // Anything else still fails like a command.
+    input.push('/not-a-skill')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('unknown command /not-a-skill'), 'the unknown-command toast')
+
+    // The panel can hand the invocation back to the editor.
+    output.text = ''
+    input.push('/skills')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('release-checklist'), 'the skills panel')
+    output.text = '' // frames accumulate, so a stale panel would satisfy the check
+    input.push('i')
+    await waitFor(() => stripAnsi(output.text).includes('/release-checklist '), 'the inserted invocation')
+    assert.ok(!stripAnsi(output.text).includes('↑/↓ move'), 'the panel closed')
+  } finally {
+    input.push('\u001b')
+    input.push('\u0015') // the editor holds the inserted line; clear it so ^D quits
+    input.push('\u0004')
+    await app
+    await backend.disconnect()
+  }
+})

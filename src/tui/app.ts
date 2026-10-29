@@ -202,6 +202,8 @@ interface AppState {
   tpsSamples: TpsSample[]
   speedPrevious?: { at: number; tokens: number }
   escapeAt: number
+  /** Skill catalog last read for this session, reused by `/name` invocation. */
+  skillCatalog?: { sessionId?: string; entries: SkillEntry[] }
   /** Provider/model catalog loaded by `/model`. */
   modelCatalog?: ModelCatalog
   /** Optimistic selection until the next durable request header arrives. */
@@ -1449,6 +1451,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.view?.header.cwd ?? options.cwd,
         state.view?.sessionId,
       )
+      state.skillCatalog = { sessionId: state.view?.sessionId, entries: catalog.skills }
       const current = state.overlay
       if (current !== null && current.kind === 'skills') {
         state.overlay = { ...current, hub: catalog.hub, entries: catalog.skills, index: Math.min(current.index, Math.max(0, catalog.skills.length - 1)) }
@@ -1482,6 +1485,34 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
     }
     schedule()
+  }
+
+  /**
+   * `/name args` for a user-invocable skill is not a dshell command: the Host
+   * scans user text for that gesture and injects the rendered skill body, so
+   * the line has to reach the model verbatim. Unknown names still fall through
+   * to the usual command error.
+   */
+  const invokeSkill = async (line: string, name: string): Promise<boolean> => {
+    if (name.length === 0 || !backend.capabilities().skills) return false
+    const cached = state.skillCatalog
+    let entries = cached !== undefined && cached.sessionId === state.view?.sessionId ? cached.entries : undefined
+    if (entries === undefined) {
+      try {
+        const catalog = await backend.listSkills(
+          state.view?.header.cwd ?? options.cwd,
+          state.view?.sessionId,
+        )
+        entries = catalog.skills
+        state.skillCatalog = { sessionId: state.view?.sessionId, entries }
+      } catch {
+        return false
+      }
+    }
+    if (!entries.some((entry) => entry.name === name && entry.userInvocable)) return false
+    toast(`skill ${name}`)
+    await send(line)
+    return true
   }
 
   const runCommand = async (text: string): Promise<void> => {
@@ -1573,6 +1604,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         await openProviderList()
         return
       default:
+        if (await invokeSkill(text, command.slice(1))) return
         toast(`unknown command ${command}; try /help`)
     }
   }
@@ -1815,6 +1847,21 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       } else if (key.type === 'enter' || key.type === 'tab') {
         const chosen = overlay.entries[overlay.index]
         if (chosen !== undefined) void openSkillView(chosen.name)
+        return
+      } else if (key.type === 'text' && key.text === 'i') {
+        // Insert the invocation line: the Host injects the skill body when a
+        // user message contains `/name`, so this is how a skill gets used.
+        const chosen = overlay.entries[overlay.index]
+        if (chosen !== undefined) {
+          if (!chosen.userInvocable) {
+            toast(`${chosen.name} cannot be invoked by the user`)
+          } else {
+            state.overlay = null
+            state.editor = insertText(createEditor(), `/${chosen.name} `)
+            refreshCompletion()
+            schedule()
+          }
+        }
         return
       }
       schedule()
@@ -2356,8 +2403,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (key.type === 'alt-enter' || key.type === 'alt-q') {
       if (state.completion !== undefined) {
         const item = state.completion.items[state.completion.index]
-        acceptCompletion(item?.kind === 'command' && item.execute !== undefined)
-        return
+        // No candidate means Enter is not picking anything: fall through to the
+        // normal submit path, or a typo would leave the editor dead.
+        if (item !== undefined) {
+          acceptCompletion(item.kind === 'command' && item.execute !== undefined)
+          return
+        }
+        state.completion = undefined
       }
       const text = state.editor.text
       if (isCommand(text)) {
@@ -2372,8 +2424,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (key.type === 'enter') {
       if (state.completion !== undefined) {
         const item = state.completion.items[state.completion.index]
-        acceptCompletion(item?.kind === 'command' && item.execute !== undefined)
-        return
+        // No candidate means Enter is not picking anything: fall through to the
+        // normal submit path, or a typo would leave the editor dead.
+        if (item !== undefined) {
+          acceptCompletion(item.kind === 'command' && item.execute !== undefined)
+          return
+        }
+        state.completion = undefined
       }
       const text = state.editor.text
       if (state.editingQueued !== undefined) {
@@ -3022,7 +3079,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         body.push('', paint(theme, 'dim', `hub: ${truncate(overlay.hub.join(':'), inner)}`))
       }
       return panelBox(theme, 'skills', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ move · enter open · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ move · enter open · i insert · esc close')],
       })
     }
     if (overlay.kind === 'skillView') {

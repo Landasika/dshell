@@ -13,6 +13,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `/name args` reaches the model as a skill gesture: an unknown dshell command
+  whose name is a user-invocable skill is forwarded as a prompt, and `i` in the
+  `/skills` panel writes the invocation into the editor.
+
 - `/skills` browses the Host's `ctx.skills` catalog: every source, with the
   hub roots, and `Enter` renders the skill body as Markdown.
 - A configurable **skill hub**: directories of `SKILL.md` bundles served

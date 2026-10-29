@@ -222,7 +222,8 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-D` | quit |
 
 In `/skills`: `↑/↓` move, `Enter` opens the skill body (rendered markdown),
-`Backspace` goes back to the list, `Esc` closes.
+`i` puts `/name ` into the editor to invoke it, `Backspace` goes back to the
+list, `Esc` closes.
 
 In an `ask_user_question` card: `↑/↓` move, `Space` toggles a choice (multi-
 select), `c` types a custom answer, `Enter` submits, `Esc` leaves it pending
@@ -356,8 +357,10 @@ local discovery behind its presets: a host-level-only read would come back
 empty even though the model can see those skills. Resuming that agent is the
 same work opening the session in the Web UI does, and the Host caches it — the
 session row then shows `● live`. When a session cannot be resumed (another
-frontend owns it), `/skills` still lists the hub and host-wide providers. The hub defaults to `$DSH_HOME/dshell-skills` and is configurable
-without touching DSH:
+frontend owns it), `/skills` still lists the hub and host-wide providers.
+
+The hub defaults to `$DSH_HOME/dshell-skills` and is configurable without
+touching DSH:
 
 ```text
 DSHELL_SKILL_HUB=/srv/skills:~/.dshell/skills     # environment
@@ -371,6 +374,13 @@ or, for a profile that ships its own shelf, in the patch file:
   config:
     skillHub: ['/srv/skills']
 ```
+
+Invoking one needs no dshell syntax of its own: the Host scans user text for a
+`/name` gesture and injects the rendered `<skill_content>` before the turn, so
+typing `/blackboard split this work` works exactly like it does in the Web UI.
+When the typed name is not a dshell command but is a user-invocable skill, the
+line is sent to the model verbatim instead of being rejected; a name that is
+neither still fails with `unknown command`.
 
 Layout per root — a directory bundle keeps its resources next to `SKILL.md`,
 a flat file is enough for a one-pager:
