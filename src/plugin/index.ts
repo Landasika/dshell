@@ -21,10 +21,14 @@ import {
   CAPABILITIES,
   PROTOCOL_VERSION,
   type ProviderEntry,
+  type QuestionAnswer,
+  type QuestionClosedMessage,
+  type QuestionRequestMessage,
   type SkillEntry,
   type ApprovalRequestMessage,
   type Capability,
   type ErrorMessage,
+  type AskedQuestion,
   type HistoryMessage,
   type ModelCatalog,
   type ModelSelection,
@@ -1173,6 +1177,170 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     broadcast,
   })
 
+  /**
+   * The Host's `ask_user_question` blocks inside a `user-questions/request`
+   * waterfall until an answerer returns. The Web UI is that answerer in a
+   * browser; in a terminal Host nobody was — so the tool failed immediately
+   * with `NO_PROVIDER` and the overlay never appeared. This plugin answers for
+   * sessions a TUI client is watching and passes everything else on.
+   */
+  interface PendingQuestion {
+    sessionId: string
+    callId: string
+    questions: AskedQuestion[]
+    // The Host tool reads `.answers` off the waterfall's return value.
+    resolve: (result: { answers: QuestionAnswer[] }) => void
+    reject: (error: unknown) => void
+    close: (reason: 'answered' | 'aborted' | 'detached') => void
+  }
+
+  const questionRequests = new Map<string, PendingQuestion>()
+  /** Asks already settled, so a second window's answer is rejected, not steered. */
+  const settledAsks = new Set<string>()
+  /** `ask_user_question` calls in the durable log without a result yet. */
+  const askCalls = new Map<string, { callId: string; ids: string }[]>()
+
+  const questionIds = (questions: readonly { id: string }[]): string => questions.map((question) => question.id).join('\u0000')
+
+  /** Remember logged ask calls so a legacy request can borrow its real callId. */
+  const noteAskCall = (sessionId: string, event: SessionEvent): void => {
+    const data = (event.data ?? {}) as Record<string, any>
+    if (event.type === 'tool/call' && data.name === 'ask_user_question' && typeof data.callId === 'string') {
+      let args: Record<string, any> = {}
+      try {
+        args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : ((data.arguments ?? {}) as Record<string, any>)
+      } catch {
+        args = {}
+      }
+      const questions = Array.isArray(args.questions) ? (args.questions as { id?: unknown }[]) : []
+      const list = askCalls.get(sessionId) ?? []
+      list.push({ callId: data.callId, ids: questionIds(questions.map((question) => ({ id: String(question.id ?? '') }))) })
+      askCalls.set(sessionId, list)
+      return
+    }
+    if (event.type === 'tool/result') {
+      const message = (data.message ?? {}) as Record<string, any>
+      if (typeof message.toolCallId !== 'string') return
+      const list = askCalls.get(sessionId)
+      if (list === undefined) return
+      const next = list.filter((entry) => entry.callId !== message.toolCallId)
+      if (next.length === 0) askCalls.delete(sessionId)
+      else askCalls.set(sessionId, next)
+    }
+  }
+
+  /** Pop the newest logged ask whose questions match; the case is what pairs them. */
+  const claimAskCall = (sessionId: string, ids: string): string | undefined => {
+    const list = askCalls.get(sessionId) ?? []
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const entry = list[index]!
+      if (entry.ids !== ids) continue
+      list.splice(index, 1)
+      if (list.length === 0) askCalls.delete(sessionId)
+      return entry.callId
+    }
+    return undefined
+  }
+
+  /** Settle one live request once: resolve, reject, and close the client overlay. */
+  const settleQuestion = (
+    callId: string,
+    reason: 'answered' | 'aborted' | 'detached',
+    answers?: QuestionAnswer[],
+    error?: unknown,
+  ): boolean => {
+    const pending = questionRequests.get(callId)
+    if (pending === undefined) return false
+    questionRequests.delete(callId)
+    settledAsks.add(callId)
+    if (settledAsks.size > 200) {
+      const oldest = settledAsks.values().next().value
+      if (oldest !== undefined) settledAsks.delete(oldest)
+    }
+    pending.close(reason)
+    if (reason === 'answered') pending.resolve({ answers: answers ?? [] })
+    else pending.reject(error ?? new Error(`stopped waiting for the answer (${reason})`))
+    return true
+  }
+
+  const handleQuestion = async (
+    request: {
+      questions: AskedQuestion[]
+      agent?: AgentLike
+      signal?: AbortSignal
+      wait?: { callId?: string; timed?: boolean }
+    },
+    next: () => Promise<unknown>,
+  ): Promise<unknown> => {
+    const sessionId = request.agent?.session?.id
+    // No TUI is looking at this session: let the Web answerer have it.
+    if (sessionId === undefined || watchersFor(sessionId).length === 0) return await next()
+    const ids = questionIds(request.questions)
+    // A timed ask names its call; a legacy one borrows the logged call. If the
+    // log has not reached us yet, the id only has to be unique: the answer is
+    // delivered through this waterfall, not keyed by it anywhere else.
+    const callId = request.wait?.callId ?? claimAskCall(sessionId, ids) ?? `ask-${randomUUID()}`
+    if (questionRequests.has(callId)) return await next()
+
+    const message: QuestionRequestMessage = {
+      type: 'question/request',
+      sessionId,
+      callId,
+      questions: request.questions.map((question) => ({
+        id: question.id,
+        question: question.question,
+        ...(question.header === undefined ? {} : { header: question.header }),
+        ...(question.multiSelect === undefined ? {} : { multiSelect: question.multiSelect }),
+        ...(question.options === undefined
+          ? {}
+          : { options: question.options.map((option) => ({ ...option })) }),
+      })),
+      timed: request.wait?.timed === true,
+    }
+    return await new Promise<{ answers: QuestionAnswer[] }>((resolve, reject) => {
+      const signal = request.signal
+      const onAbort = (): void => {
+        settleQuestion(callId, 'aborted', undefined, signal?.reason)
+      }
+      questionRequests.set(callId, {
+        sessionId,
+        callId,
+        questions: message.questions,
+        resolve,
+        reject,
+        close: (reason) => {
+          signal?.removeEventListener('abort', onAbort)
+          broadcast(sessionId, {
+            type: 'question/closed',
+            sessionId,
+            callId,
+            reason,
+          } satisfies QuestionClosedMessage)
+        },
+      })
+      if (signal?.aborted === true) {
+        onAbort()
+        return
+      }
+      signal?.addEventListener('abort', onAbort)
+      broadcast(sessionId, message)
+    })
+  }
+
+  // Agent-scoped waterfalls only reach global listeners, like approvals.
+  const disposeQuestion = ctx.on('user-questions/request', handleQuestion as never, { global: true, prepend: true })
+
+  /** Refuse an answer whose request already settled (a second TUI window). */
+  const lateQuestionAnswer = (socket: Socket, callId: string): boolean => {
+    if (!settledAsks.has(callId)) return false
+    sendError(socket, {
+      type: 'error',
+      code: 'QUESTION_NOT_PENDING',
+      message: `question ${callId} was already answered`,
+    })
+    return true
+  }
+
   const attach = async (socket: Socket, sessionId: unknown): Promise<void> => {
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       sendError(socket, {
@@ -1487,6 +1655,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
 
     if (socket.destroyed) return
+    if (questionRequests.has(message.callId)) {
+      watch(socket, message.sessionId)
+      settleQuestion(message.callId, 'answered', answers)
+      jsonLine(socket, {
+        type: 'question-answered',
+        sessionId: message.sessionId,
+        callId: message.callId,
+      })
+      return
+    }
+    if (lateQuestionAnswer(socket, message.callId)) return
     const agent = await liveAgent(message.sessionId)
     if (socket.destroyed) return
     watch(socket, message.sessionId)
@@ -1675,6 +1854,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     unwatch(socket)
     queues.delete(socket)
     approvals.watchersChanged()
+    for (const [callId, pending] of questionRequests) {
+      if (watchersFor(pending.sessionId).length > 0) continue
+      settleQuestion(callId, 'detached', undefined, new Error('the dshell client disconnected before answering'))
+    }
   }
 
   const server = createServer((socket) => {
@@ -1694,6 +1877,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   })
 
   const disposeSessionEvent = ctx.on('session/event', (session: { id: string }, event: SessionEvent) => {
+    noteAskCall(session.id, event)
     broadcast(session.id, { type: 'event', sessionId: session.id, event })
   })
 
@@ -1746,6 +1930,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     disposeAssistantStream()
     disposeAgentStatus()
     disposeApproval()
+    disposeQuestion()
     await closeServer(server)
     throw error
   }
@@ -1771,6 +1956,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     disposeAssistantStream()
     disposeAgentStatus()
     disposeApproval()
+    disposeQuestion()
+    for (const callId of [...questionRequests.keys()]) {
+      settleQuestion(callId, 'detached', undefined, new Error('the dshell Host stopped before the user answered'))
+    }
     approvals.dispose()
     // End (don't destroy) the clients so final frames — approval-resolved on
     // shutdown, host-restarting — flush before the connection drops; a

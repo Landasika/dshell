@@ -34,6 +34,7 @@ export type DshellErrorCode =
   | 'SESSION_NOT_FOUND'
   | 'SESSION_ALREADY_LIVE'
   | 'APPROVAL_NOT_PENDING'
+  | 'QUESTION_NOT_PENDING'
   | 'QUEUE_ITEM_NOT_FOUND'
   | 'SKILLS_UNAVAILABLE'
   | 'SKILLS_FAILED'
@@ -345,6 +346,32 @@ export interface QuestionAnswer {
   custom?: string
 }
 
+/**
+ * A live `user-questions/request` the Host is waiting on. The Host's
+ * `ask_user_question` pauses inside a waterfall until an answerer returns, so
+ * this message — not the durable log — is what makes the overlay appear the
+ * moment the model asks.
+ */
+export interface QuestionRequestMessage {
+  type: 'question/request'
+  sessionId: string
+  /** The `ask_user_question` call this request belongs to. */
+  callId: string
+  questions: AskedQuestion[]
+  /** True when an unanswered wait settles as `{pending: true}` at the deadline. */
+  timed: boolean
+  /** Foreground wait in milliseconds, when the Host declared one. */
+  timeoutMs?: number
+}
+
+/** The Host stopped waiting: answered, aborted with the turn, or the client left. */
+export interface QuestionClosedMessage {
+  type: 'question/closed'
+  sessionId: string
+  callId: string
+  reason: 'answered' | 'aborted' | 'detached'
+}
+
 export interface QuestionAnsweredMessage {
   type: 'question-answered'
   sessionId: string
@@ -418,6 +445,8 @@ export type ServerMessage =
   | StatusMessage
   | ApprovalRequestMessage
   | ApprovalResolvedMessage
+  | QuestionRequestMessage
+  | QuestionClosedMessage
   | QuestionAnsweredMessage
   | SkillsMessage
   | SkillMessage

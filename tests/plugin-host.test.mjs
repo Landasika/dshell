@@ -579,6 +579,148 @@ test('question/answer steers a user-question-reply message (plugin level)', asyn
   assert.equal(payload.callId, 'q1')
 })
 
+test('question waterfall: a TUI watcher answers ask_user_question while the tool waits', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  // The durable log names the call before the tool blocks.
+  await harness.emit('session/event', { id: 's1' }, {
+    type: 'tool/call',
+    seq: 1,
+    data: {
+      name: 'ask_user_question',
+      callId: 'q1',
+      arguments: JSON.stringify({ questions: [{ id: 'pkg', question: 'which package manager?', options: [{ label: 'pnpm' }] }] }),
+    },
+  })
+  await client.burst()
+
+  const questions = [{ id: 'pkg', question: 'which package manager?', options: [{ label: 'pnpm' }] }]
+  const outcome = harness.emit('user-questions/request', {
+    questions,
+    agent: { session: { id: 's1' } },
+    signal: new AbortController().signal,
+  }, async () => 'from-web')
+
+  const request = await client.next()
+  assert.equal(request.type, 'question/request')
+  assert.equal(request.sessionId, 's1')
+  assert.equal(request.callId, 'q1')
+  assert.equal(request.timed, false)
+  assert.deepEqual(request.questions, questions)
+
+  client.send({
+    type: 'question/answer',
+    sessionId: 's1',
+    callId: 'q1',
+    answers: [{ id: 'pkg', selected: ['pnpm'] }],
+  })
+  const first = await client.next()
+  // The overlay closes before the answer acknowledgement.
+  assert.equal(first.type, 'question/closed')
+  assert.equal(first.reason, 'answered')
+  const second = await client.next()
+  assert.equal(second.type, 'question-answered')
+  assert.equal(second.callId, 'q1')
+
+  const resolved = await outcome
+  // The tool reads `.answers` off the waterfall result.
+  assert.deepEqual(resolved[0], { answers: [{ id: 'pkg', selected: ['pnpm'] }] })
+})
+
+test('question waterfall: no watcher defers to the Web answerer', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const resolved = await harness.emit('user-questions/request', {
+    questions: [{ id: 'pkg', question: 'which?' }],
+    agent: { session: { id: 's1' } },
+    signal: new AbortController().signal,
+  }, async () => 'from-web')
+  assert.equal(resolved[0], 'from-web')
+})
+
+test('question waterfall: aborting the turn closes the overlay and rejects the tool', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  await harness.emit('session/event', { id: 's1' }, {
+    type: 'tool/call',
+    seq: 1,
+    data: { name: 'ask_user_question', callId: 'q1', arguments: JSON.stringify({ questions: [{ id: 'pkg', question: 'which?' }] }) },
+  })
+  await client.burst()
+
+  const controller = new AbortController()
+  const outcome = harness.emit('user-questions/request', {
+    questions: [{ id: 'pkg', question: 'which?' }],
+    agent: { session: { id: 's1' } },
+    signal: controller.signal,
+  }, async () => 'from-web')
+  // Catch now: the rejection lands before the assertions below run.
+  const failure = outcome.catch((error) => error)
+  assert.equal((await client.next()).type, 'question/request')
+
+  controller.abort(new Error('turn cancelled'))
+  const closed = await client.next()
+  assert.equal(closed.type, 'question/closed')
+  assert.equal(closed.reason, 'aborted')
+  assert.match(String((await failure).message), /turn cancelled/)
+})
+
+test('question waterfall: a late answer from a second window is refused, not steered', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const unit = makeAgent('s1')
+  harness.agents.set('s1', unit.agent)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  await harness.emit('session/event', { id: 's1' }, {
+    type: 'tool/call',
+    seq: 1,
+    data: { name: 'ask_user_question', callId: 'q1', arguments: JSON.stringify({ questions: [{ id: 'pkg', question: 'which?' }] }) },
+  })
+  await client.burst()
+
+  const outcome = harness.emit('user-questions/request', {
+    questions: [{ id: 'pkg', question: 'which?' }],
+    agent: { session: { id: 's1' } },
+    signal: new AbortController().signal,
+  }, async () => 'from-web')
+  assert.equal((await client.next()).type, 'question/request')
+
+  client.send({ type: 'question/answer', sessionId: 's1', callId: 'q1', answers: [{ id: 'pkg', selected: ['pnpm'] }] })
+  await client.next() // question/closed
+  await client.next() // question-answered
+  await outcome
+
+  // The first answer settled the call; a stale second one must not steer a reply.
+  client.send({ type: 'question/answer', sessionId: 's1', callId: 'q1', answers: [{ id: 'pkg', selected: ['npm'] }] })
+  const rejected = await client.next()
+  assert.equal(rejected.type, 'error')
+  assert.equal(rejected.code, 'QUESTION_NOT_PENDING')
+  assert.equal(unit.sentMessages.length, 0)
+})
+
 test('dispose unlinks the socket and settles pending approvals unavailable', async (t) => {
   const harness = await startHarness(t)
   makeSession(harness, 's1', [])

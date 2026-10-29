@@ -1,4 +1,5 @@
 import type {
+  AskedQuestion,
   DshellErrorCode,
   ModelCatalog,
   ModelSelection,
@@ -115,6 +116,16 @@ export interface ApprovalView {
   reason?: string
 }
 
+/** A live `ask_user_question` the Host is holding open for an answer. */
+export interface PendingAskView {
+  sessionId: string
+  callId: string
+  questions: AskedQuestion[]
+  /** False for the blocking legacy tool: the model waits until answered. */
+  timed: boolean
+  timeoutMs?: number
+}
+
 export interface SessionView {
   sessionId: string
   header: SessionHeader
@@ -126,6 +137,12 @@ export interface SessionView {
   /** Reasoning accumulated from the same stream (reasoning-delta chunks). */
   streamReasoning: string
   pendingApproval?: ApprovalView
+  /**
+   * The Host's live question request. Durable events alone are not enough: the
+   * tool blocks inside the Host, so an overlay driven only by the log would
+   * appear late (or never, when no answerer is registered).
+   */
+  pendingAsk?: PendingAskView
 }
 
 export interface SendOptions {

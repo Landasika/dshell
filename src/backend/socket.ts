@@ -427,6 +427,7 @@ export class SocketSessionHandle implements SessionHandle {
   private streamText = ''
   private streamReasoning = ''
   private pendingApproval: SessionView['pendingApproval']
+  private pendingAsk: SessionView['pendingAsk']
   private pendingHistory: {
     resolve: (hasMore: boolean) => void
     reject: (error: Error) => void
@@ -490,6 +491,9 @@ export class SocketSessionHandle implements SessionHandle {
       ...(this.pendingApproval === undefined
         ? {}
         : { pendingApproval: { ...this.pendingApproval } }),
+      ...(this.pendingAsk === undefined
+        ? {}
+        : { pendingAsk: { ...this.pendingAsk, questions: [...this.pendingAsk.questions] } }),
     }
   }
 
@@ -689,6 +693,22 @@ export class SocketSessionHandle implements SessionHandle {
       this.emit()
       return
     }
+    if (message.type === 'question/request' && message.sessionId === this.id) {
+      this.pendingAsk = {
+        sessionId: message.sessionId,
+        callId: message.callId,
+        questions: message.questions,
+        timed: message.timed,
+        ...(message.timeoutMs === undefined ? {} : { timeoutMs: message.timeoutMs }),
+      }
+      this.emit()
+      return
+    }
+    if (message.type === 'question/closed' && message.sessionId === this.id) {
+      if (this.pendingAsk?.callId === message.callId) this.pendingAsk = undefined
+      this.emit()
+      return
+    }
     if (message.type === 'question-answered' && message.sessionId === this.id) {
       this.pendingQuestionAnswer = null
       this.emit()
@@ -725,6 +745,10 @@ export class SocketSessionHandle implements SessionHandle {
     // The durable `approval/asked` event has its own id and may be replayed
     // from history; using it would send an answer for an already-dead request.
     if (event.type === 'approval/decided') this.pendingApproval = undefined
+    if (event.type === 'tool/result') {
+      const message = (data.message ?? {}) as Record<string, unknown>
+      if (this.pendingAsk?.callId === message.toolCallId) this.pendingAsk = undefined
+    }
   }
 
   private emit(): void {

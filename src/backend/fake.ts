@@ -52,6 +52,7 @@ interface FakeSession {
   streamText: string
   streamReasoning: string
   pendingApproval?: SessionView['pendingApproval']
+  pendingAsk?: SessionView['pendingAsk']
 }
 
 export interface FakeSessionSeed {
@@ -418,17 +419,58 @@ export class FakeBackend implements DshellBackend {
     for (const handle of this.handles) handle.notify()
   }
 
-  /** Test helper: raise a pending `ask_user_question` through the event flow. */
-  askQuestion(sessionId: string, callId: string, questions: unknown[]): void {
+  /**
+   * Test helper: raise a pending `ask_user_question`. The fake mirrors the real
+   * Host, which logs the call and then holds it open through the question
+   * service: the TUI learns about both the call and the live request.
+   */
+  askQuestion(
+    sessionId: string,
+    callId: string,
+    questions: SessionView['pendingAsk'] extends undefined ? never : NonNullable<SessionView['pendingAsk']>['questions'],
+    options: { timed?: boolean; timeoutMs?: number } = {},
+  ): void {
+    const session = this.requireSession(sessionId)
+    session.pendingAsk = {
+      sessionId,
+      callId,
+      questions,
+      timed: options.timed ?? true,
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    }
     this.emit(sessionId, {
       type: 'tool/call',
-      seq: this.requireSession(sessionId).cursor + 1,
+      seq: session.cursor + 1,
       data: { name: 'ask_user_question', callId, arguments: JSON.stringify({ questions }) },
+    })
+  }
+
+  /** Test helper: the Host stopped waiting (turn cancelled) and closed the ask. */
+  abortQuestion(sessionId: string, callId: string): void {
+    const session = this.requireSession(sessionId)
+    if (session.pendingAsk?.callId === callId) session.pendingAsk = undefined
+    this.emit(sessionId, {
+      type: 'tool/result',
+      seq: session.cursor + 1,
+      data: {
+        message: {
+          role: 'tool',
+          toolCallId: callId,
+          isError: true,
+          content: [{ type: 'text', text: 'ask_user_question was aborted before the user answered' }],
+        },
+      },
     })
   }
 
   /** Answers submitted through `SessionHandle.answerQuestion`, for assertions. */
   readonly answeredQuestions: { sessionId: string; callId: string; answers: QuestionAnswer[] }[] = []
+
+  /**
+   * Test helper: when false, an answer is recorded but the call stays open, so
+   * a test can observe the window before the Host appends the result.
+   */
+  settleAnswers = true
 
   requireSession(sessionId: string): FakeSession {
     const session = this.sessions.get(sessionId)
@@ -517,6 +559,9 @@ class FakeSessionHandle implements SessionHandle {
       ...(this.session.pendingApproval === undefined
         ? {}
         : { pendingApproval: { ...this.session.pendingApproval } }),
+      ...(this.session.pendingAsk === undefined
+        ? {}
+        : { pendingAsk: { ...this.session.pendingAsk, questions: [...this.session.pendingAsk.questions] } }),
     }
   }
 
@@ -622,6 +667,15 @@ class FakeSessionHandle implements SessionHandle {
   async answerQuestion(callId: string, answers: QuestionAnswer[]): Promise<void> {
     this.assertOpen()
     this.backend.answeredQuestions.push({ sessionId: this.id, callId, answers })
+    // The live request settles as soon as the answer arrives, even when this
+    // fake keeps the durable call open for a slow-Host scenario.
+    if (this.session.pendingAsk?.callId === callId) {
+      this.session.pendingAsk = undefined
+      this.emitChange()
+    }
+    // A real Host settles the waiting call through the durable log a few frames
+    // later; tests that exercise that window turn settlement off.
+    if (!this.backend.settleAnswers) return
     // The Host settles the waiting tool call with the answer batch as its
     // result; mirror that so the pending-question detector clears.
     this.append({

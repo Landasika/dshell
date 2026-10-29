@@ -73,7 +73,9 @@ test('FakeBackend exposes workspaces, sessions, streaming, and approval', async 
 
 test('SocketBackend answers pending questions', async (t) => {
   let answered = null
+  let host = null
   const server = await socketServer((message, socket) => {
+    host = socket
     if (message.type === 'hello') {
       write(socket, {
         type: 'welcome',
@@ -103,6 +105,25 @@ test('SocketBackend answers pending questions', async (t) => {
   await backend.connect()
   assert.equal(backend.capabilities().questions, true)
   const handle = await backend.openSession('s1')
+
+  // A live request becomes part of the view the moment the Host sends it.
+  const views = []
+  const off = handle.subscribe((view) => views.push(view))
+  write(host, {
+    type: 'question/request',
+    sessionId: 's1',
+    callId: 'q1',
+    questions: [{ id: 'pkg', question: 'which?', options: [{ label: 'A' }, { label: 'B' }] }],
+    timed: false,
+  })
+  for (let index = 0; index < 100 && views.at(-1)?.pendingAsk === undefined; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(views.at(-1)?.pendingAsk?.callId, 'q1')
+  assert.equal(views.at(-1)?.pendingAsk?.timed, false)
+  assert.equal(views.at(-1)?.pendingAsk?.questions[0].id, 'pkg')
+  off()
+
   await handle.answerQuestion('q1', [{ id: 'pkg', selected: ['A'], custom: 'note' }])
   // answerQuestion resolves once the batch is written; the fake host sees it
   // on its next read tick, so wait for the round-trip before asserting.
@@ -111,6 +132,16 @@ test('SocketBackend answers pending questions', async (t) => {
   }
   assert.equal(answered?.callId, 'q1')
   assert.deepEqual(answered?.answers, [{ id: 'pkg', selected: ['A'], custom: 'note' }])
+
+  // `question/closed` retires the request; the overlay goes with it.
+  const latest = []
+  const off2 = handle.subscribe((view) => latest.push(view))
+  write(host, { type: 'question/closed', sessionId: 's1', callId: 'q1', reason: 'answered' })
+  for (let index = 0; index < 100 && latest.at(-1)?.pendingAsk !== undefined; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(latest.at(-1)?.pendingAsk, undefined)
+  off2()
   handle.dispose()
   await backend.disconnect()
 })
@@ -122,7 +153,10 @@ test('FakeBackend raises and settles pending questions', async () => {
   const views = []
   const off = handle.subscribe((view) => views.push(view))
   backend.askQuestion('s1', 'q1', [{ id: 'a', question: 'pick one', options: [{ label: 'One' }] }])
+  assert.equal(views.at(-1)?.pendingAsk?.callId, 'q1')
+  assert.equal(views.at(-1)?.pendingAsk?.timed, true)
   await handle.answerQuestion('q1', [{ id: 'a', selected: ['One'] }])
+  assert.equal(views.at(-1)?.pendingAsk, undefined)
   assert.deepEqual(backend.answeredQuestions, [
     { sessionId: 's1', callId: 'q1', answers: [{ id: 'a', selected: ['One'] }] },
   ])
