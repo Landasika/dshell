@@ -100,6 +100,13 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
 - **Reconnects itself** — a Host restart or plugin reload shows
   `host connection lost · reconnecting`, then `host back · reattached`.
 
+## Status
+
+`0.2.0` is the V1 candidate: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
+plan (TUI, scriptable CLI, sessions/workspaces, approval bridge,
+models/providers, subagents, terminal questions) is complete — see the
+[changelog](CHANGELOG.md) and [supported versions](docs/SUPPORTED-VERSIONS.md).
+
 ## Install
 
 ### Prerequisites
@@ -368,6 +375,19 @@ npm with provenance.
   [compatibility risks](find/compatibility-risks.md) ·
   [P3](find/p3-evidence.md) · [P4](find/p4-evidence.md) ·
   [P5](find/p5-evidence.md) · [P6](find/p6-evidence.md)
+
+## Contributing
+
+Issues and pull requests are welcome. Before sending a patch, run the local
+gate — it is the same one CI runs:
+
+```bash
+pnpm typecheck && pnpm lint && pnpm test
+./scripts/ci.sh   # adds a clean pack/install round trip
+```
+
+Keep changes inside `dshell`; the Host plugin may use the public DSH plugin
+API, but never patches DSH itself.
 
 ## License
 
