@@ -21,7 +21,6 @@ import {
   PROTOCOL_VERSION,
   type ProviderEntry,
   type ApprovalRequestMessage,
-  type ApprovalResolvedMessage,
   type Capability,
   type ErrorMessage,
   type HistoryMessage,
@@ -34,6 +33,7 @@ import {
   type WorkspaceSummary,
 } from '../protocol/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
+import { ApprovalCoordinator } from './approval.js'
 import {
   ProviderEditError,
   addProvider,
@@ -410,11 +410,6 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const handles = new Map<string, AgentHandleLike>()
   const resuming = new Map<string, Promise<AgentHandleLike>>()
   const queues = new WeakMap<Socket, Promise<void>>()
-  const pendingApprovals = new Map<string, {
-    sessionId: string
-    resolve: (outcome: string) => void
-    timer: NodeJS.Timeout
-  }>()
   const approvalTimeoutMs = config.approvalTimeoutMs ?? 120_000
   let closing = false
 
@@ -1006,6 +1001,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     for (const socket of watchersFor(sessionId)) jsonLine(socket, message)
   }
 
+  const approvals = new ApprovalCoordinator({
+    watchers: (sessionId) => watchersFor(sessionId).length,
+    broadcast,
+  })
+
   const attach = async (socket: Socket, sessionId: unknown): Promise<void> => {
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       sendError(socket, {
@@ -1255,27 +1255,6 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     jsonLine(socket, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'remove' })
   }
 
-  const settleApproval = (
-    requestId: string,
-    outcome: string,
-    source: 'cli' | 'other' | 'timeout' | 'disconnect',
-  ): boolean => {
-    const pending = pendingApprovals.get(requestId)
-    if (pending === undefined) return false
-    clearTimeout(pending.timer)
-    pendingApprovals.delete(requestId)
-    const resolved: ApprovalResolvedMessage = {
-      type: 'approval-resolved',
-      sessionId: pending.sessionId,
-      requestId,
-      outcome,
-      source,
-    }
-    broadcast(pending.sessionId, resolved)
-    pending.resolve(outcome)
-    return true
-  }
-
   const answerApproval = (socket: Socket, message: Record<string, unknown>): void => {
     if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'approval/answer requires requestId' })
@@ -1285,8 +1264,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'approval outcome must be allowed-once or rejected' })
       return
     }
-    const pending = pendingApprovals.get(message.requestId)
-    if (pending === undefined) {
+    const sessionId = approvals.sessionOf(message.requestId)
+    if (sessionId === undefined) {
       sendError(socket, {
         type: 'error',
         code: 'APPROVAL_NOT_PENDING',
@@ -1294,7 +1273,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    if (watched.get(socket)?.has(pending.sessionId) !== true) {
+    if (watched.get(socket)?.has(sessionId) !== true) {
       sendError(socket, {
         type: 'error',
         code: 'BAD_REQUEST',
@@ -1302,7 +1281,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    settleApproval(message.requestId, message.outcome, 'cli')
+    approvals.answer(message.requestId, message.outcome)
   }
 
   /**
@@ -1521,11 +1500,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     clients.delete(socket)
     unwatch(socket)
     queues.delete(socket)
-    for (const [requestId, pending] of [...pendingApprovals]) {
-      if (watchersFor(pending.sessionId).length === 0) {
-        settleApproval(requestId, 'unavailable', 'disconnect')
-      }
-    }
+    approvals.watchersChanged()
   }
 
   const server = createServer((socket) => {
@@ -1564,21 +1539,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
   const handleApproval = async (request: ApprovalRequestLike, next: () => Promise<string>): Promise<string> => {
     const sessionId = request.agent.session.id
-    if (watchersFor(sessionId).length === 0) return next()
-
     const requestId = `approval-${randomUUID()}`
-    let resolveCli!: (outcome: string) => void
-    const cli = new Promise<string>((resolve) => {
-      resolveCli = resolve
-    })
-    const timer = setTimeout(() => {
-      settleApproval(requestId, 'unavailable', 'timeout')
-    }, approvalTimeoutMs)
-    pendingApprovals.set(requestId, { sessionId, resolve: resolveCli, timer })
-    const onAbort = (): void => {
-      settleApproval(requestId, 'unavailable', 'disconnect')
-    }
-    request.signal?.addEventListener('abort', onAbort, { once: true })
     const requestMessage: ApprovalRequestMessage = {
       type: 'approval-request',
       sessionId,
@@ -1588,23 +1549,14 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       ...(request.reason === undefined ? {} : { reason: request.reason }),
       expiresAt: Date.now() + approvalTimeoutMs,
     }
-    broadcast(sessionId, requestMessage)
-
-    const other = Promise.resolve()
-      .then(() => next())
-      .then(
-        (outcome) => ({ source: 'other' as const, outcome }),
-        () => ({ source: 'other' as const, outcome: 'unavailable' }),
-      )
-    const winner = await Promise.race([
-      cli.then((outcome) => ({ source: 'cli' as const, outcome })),
-      other,
-    ])
-    request.signal?.removeEventListener('abort', onAbort)
-    if (winner.source === 'other' && pendingApprovals.has(requestId)) {
-      settleApproval(requestId, winner.outcome, 'other')
-    }
-    return winner.outcome
+    return await approvals.begin({
+      requestId,
+      sessionId,
+      timeoutMs: approvalTimeoutMs,
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+      message: requestMessage,
+      next,
+    })
   }
 
   // Agent-scoped waterfalls filter ordinary listeners by context. A global
@@ -1633,9 +1585,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     disposeAssistantStream()
     disposeAgentStatus()
     disposeApproval()
-    for (const requestId of [...pendingApprovals.keys()]) {
-      settleApproval(requestId, 'unavailable', 'disconnect')
-    }
+    approvals.dispose()
     for (const socket of clients) socket.destroy()
     clients.clear()
     watched.clear()

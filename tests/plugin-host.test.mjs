@@ -601,3 +601,95 @@ test('dispose unlinks the socket and settles pending approvals unavailable', asy
   await client.closed
   await assert.rejects(() => import('node:fs').then((fs) => fs.promises.access(harness.socketPath)))
 })
+
+test('approval survives an immediate waterfall unavailable and the CLI answers (DS-002)', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  // No Web answerer exists: the waterfall fallback resolves at once.
+  const outcomes = harness.emit('approval/request', {
+    agent: { session: { id: 's1' } },
+    toolName: 'bash',
+    reason: 'sandbox escalation',
+  }, async () => 'unavailable')
+
+  const request = await client.next()
+  assert.equal(request.type, 'approval-request')
+  // The request must still be answerable — this is the DS-002 regression.
+  await new Promise((resolve) => setTimeout(resolve, 25))
+  client.send({ type: 'approval/answer', requestId: request.requestId, outcome: 'allowed-once' })
+  const resolved = await client.next()
+  assert.equal(resolved.type, 'approval-resolved')
+  assert.equal(resolved.outcome, 'allowed-once')
+  assert.equal(resolved.source, 'cli')
+  assert.equal((await outcomes)[0], 'allowed-once')
+})
+
+test('a web decision settles first and a late CLI answer is not-pending (DS-002)', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  const outcomes = harness.emit('approval/request', {
+    agent: { session: { id: 's1' } },
+    toolName: 'bash',
+  }, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    return 'allowed-once'
+  })
+
+  const request = await client.next()
+  assert.equal(request.type, 'approval-request')
+  const resolved = await client.next()
+  assert.equal(resolved.type, 'approval-resolved')
+  assert.equal(resolved.outcome, 'allowed-once')
+  assert.equal(resolved.source, 'other')
+  assert.equal((await outcomes)[0], 'allowed-once')
+
+  client.send({ type: 'approval/answer', requestId: request.requestId, outcome: 'rejected' })
+  const late = await client.next()
+  assert.equal(late.type, 'error')
+  assert.equal(late.code, 'APPROVAL_NOT_PENDING')
+})
+
+test('losing the last watcher settles the approval unavailable (DS-002)', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const first = new NdjClient(harness.socketPath)
+  const second = new NdjClient(harness.socketPath)
+  t.after(() => first.destroy())
+  for (const client of [first, second]) {
+    client.send({ type: 'hello', protocol: 2 })
+    await client.next()
+    client.send({ type: 'attach', sessionId: 's1' })
+    await client.next()
+    await client.next()
+  }
+
+  const never = new Promise(() => {})
+  const outcomes = harness.emit('approval/request', {
+    agent: { session: { id: 's1' } },
+    toolName: 'bash',
+  }, async () => 'unavailable')
+  await first.next() // approval-request
+
+  second.destroy()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(Array.isArray(await Promise.race([outcomes, new Promise((resolve) => setTimeout(() => resolve('pending'), 5))])), false, 'one watcher still online')
+
+  first.destroy()
+  assert.equal((await outcomes)[0], 'unavailable')
+})
