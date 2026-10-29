@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
@@ -799,9 +799,12 @@ test('session cost folds durable usage, peak/idle rates, and unpriced models', (
 test('usage rail carries model route, cwd, git, agents and cache', () => {
   const tokens = { input: 12_400, cacheRead: 3_000, cacheWrite: 0, output: 840 }
   const git = { branch: 'main', ahead: 10, behind: 0, dirty: false }
+  // Derive the home-scoped path from the actual HOME so the ~/ shortening
+  // assertion holds on any machine and CI, not just one developer's box.
+  const homeCwd = join(homedir(), 'dshell')
   const wide = renderUsageRail(theme, {
     tokens, cost: 0.42, model: 'deepseek-v4.1-flash', provider: 'deepseek-relay',
-    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, width: 150,
+    cwd: homeCwd, git, agents: { done: 1, total: 1, running: 0 }, width: 150,
   })
   assert.equal(displayWidth(wide), 150)
   const text = stripAnsi(wide)
@@ -816,7 +819,7 @@ test('usage rail carries model route, cwd, git, agents and cache', () => {
 
   const narrow = renderUsageRail(theme, {
     tokens, model: 'deepseek-v4.1-flash', provider: 'deepseek-relay',
-    cwd: '/home/landasika/dshell', git, agents: { done: 1, total: 1, running: 0 }, width: 60,
+    cwd: homeCwd, git, agents: { done: 1, total: 1, running: 0 }, width: 60,
   })
   assert.equal(displayWidth(narrow), 60)
   assert.match(stripAnsi(narrow), /deepseek-relay\/deepseek-v4\.1-flash/)
@@ -826,7 +829,7 @@ test('usage rail carries model route, cwd, git, agents and cache', () => {
   assert.equal(displayWidth(bare), 70)
   assert.match(stripAnsi(bare), /↑12\.4k/)
 
-  assert.equal(shortCwd(`${process.env.HOME}/dshell`), '~/dshell')
+  assert.equal(shortCwd(homeCwd), '~/dshell')
   assert.ok(displayWidth(shortCwd('/a/very/long/path/that/keeps/going/dshell', 16)) <= 16)
 })
 
