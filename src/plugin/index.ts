@@ -1457,8 +1457,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'session/cancel':
           cancel(socket, message)
+          return
         case 'queue/edit':
           queueEdit(socket, message)
+          return
         case 'queue/remove':
           queueRemove(socket, message)
           return
