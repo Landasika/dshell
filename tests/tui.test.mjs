@@ -8,7 +8,8 @@ import { test } from 'node:test'
 import { createTheme } from '../dist/tui/theme.js'
 import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from '../dist/tui/width.js'
 import { renderMarkdown, renderDiff } from '../dist/tui/markdown.js'
-import { buildBlocks, pendingQuestions, renderBlocks, renderTranscript, summarizeTool, turnFailureMessage } from '../dist/tui/events.js'
+import { centerBlock, panelRule } from '../dist/tui/chrome.js'
+import { askAnswerLines, askQuestionLines, buildBlocks, pendingQuestions, renderBlocks, renderTranscript, summarizeTool, toolLabel, turnFailureMessage } from '../dist/tui/events.js'
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
 import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
@@ -38,6 +39,27 @@ test('wrapText hard-breaks long tokens and keeps CJK within the width', () => {
   assert.equal(long.every((line) => displayWidth(line) <= 6), true)
   const cjk = wrapText('中文中文中文', 5)
   assert.equal(cjk.every((line) => displayWidth(line) <= 5), true)
+})
+
+test('panelRule keeps the frame to one rule so copies carry no border columns', () => {
+  const lines = panelRule(theme, 'model', ['▸● Fake Flash  fake/fake-flash', '', '● in use'], 40, {
+    footer: ['↑/↓ select · enter'],
+  })
+  const plain = lines.map(stripAnsi)
+  assert.equal(plain[0], 'model')
+  assert.equal(plain[1], '─'.repeat(40))
+  // No box corners or vertical rules anywhere: a drag selection must stay clean.
+  assert.equal(plain.some((line) => /[│╭╮╰╯]/u.test(line)), false)
+  assert.equal(plain.at(-2), '')
+  assert.equal(plain.at(-1), '↑/↓ select · enter')
+  // Overlong rows never push past the rule.
+  const clipped = panelRule(theme, 'model', ['x'.repeat(60)], 40).map(stripAnsi)
+  assert.equal(clipped.slice(2).every((line) => displayWidth(line) <= 40), true)
+})
+
+test('centerBlock aligns a borderless block on its widest row', () => {
+  const block = centerBlock(['abc', 'abcdef', '', 'ab'], 12).map(stripAnsi)
+  assert.deepEqual(block, ['   abc', '   abcdef', '', '   ab'])
 })
 
 test('markdown renderer handles headings, bullets, fences, and diffs', () => {
@@ -102,6 +124,47 @@ test('pendingQuestions tracks open, timed, answered, and aborted asks', () => {
   assert.equal(lines.some((line) => line.includes('which name?')), true)
 })
 
+test('ask labels read as a question, never as raw tool JSON', () => {
+  const args = JSON.stringify({
+    questions: [
+      { id: 'pkg', header: 'Package manager', question: 'which package manager?', options: [{ label: 'pnpm', description: 'fast' }, { label: 'npm' }] },
+      { id: 'extra', question: 'anything else?', multi_select: true, options: [{ label: 'lint' }] },
+    ],
+  })
+  const call = { type: 'tool/call', seq: 1, data: { name: 'ask_user_question', callId: 'q1', arguments: args } }
+  const [block] = buildBlocks([call], false)
+
+  // The card, the focus hint and the viewer all use the same friendly label.
+  assert.equal(toolLabel(block), 'Ask(which package manager?)')
+  assert.equal(summarizeTool('ask_user_question', args).includes('questions=['), false)
+  assert.match(summarizeTool('ask_user_question', args), /which package manager\? · pnpm \/ npm \(\+1 more\)/)
+
+  // The viewer expands the call structurally instead of dumping arguments.
+  assert.deepEqual(askQuestionLines(args)?.slice(0, 5), [
+    'Package manager',
+    'which package manager?',
+    '· one choice',
+    '  ○ pnpm — fast',
+    '  ○ npm',
+  ])
+  assert.deepEqual(askQuestionLines(args)?.slice(6, 9), ['extra', 'anything else?', '· checkbox, space toggles'])
+  assert.equal(askQuestionLines(args)?.[9], '  ☐ lint')
+
+  // Answers render as `id → value`, including a custom reply.
+  assert.deepEqual(askAnswerLines('{"answers":[{"id":"pkg","selected":["pnpm"],"custom":"or yarn"}]}'), ['pkg → pnpm, or yarn'])
+  assert.deepEqual(askAnswerLines('{"answers":[{"id":"pkg","selected":[]}]}'), ['pkg → (no answer)'])
+  assert.equal(askAnswerLines('not json'), undefined)
+  assert.equal(askAnswerLines('{"output":"ls"}'), undefined)
+
+  // An answer batch whose call was cleared still names itself.
+  const orphan = buildBlocks([
+    { type: 'tool/result', seq: 2, data: { message: { toolCallId: 'q1', content: [{ type: 'text', text: '{"answers":[{"id":"pkg","selected":["pnpm"]}]}' }] } } },
+  ], false)
+  const orphanLines = renderBlocks(orphan, 80, theme).map(stripAnsi)
+  assert.equal(orphanLines.some((line) => line.includes('{"answers"')), false)
+  assert.equal(orphanLines.some((line) => line.includes('Ask')), true)
+})
+
 test('the model can ask questions and the TUI answers from an overlay', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
@@ -146,7 +209,7 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   // Space selects the option under the cursor (single-select radio).
   const beforeSelection = output.text.length
   input.push(' ')
-  await waitFor(() => output.text.slice(beforeSelection).includes('● A'))
+  await waitFor(() => output.text.slice(beforeSelection).includes('● 1. A'))
 
   // Enter submits the batch; the overlay closes and the answer is recorded.
   input.push('\r')
@@ -158,6 +221,86 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
+})
+
+test('a custom answer keeps the cursor, submits with Enter, and Esc backs out of the field', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 28
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    backend.emit('s1', {
+      type: 'tool/call',
+      seq: 1,
+      data: {
+        name: 'ask_user_question',
+        callId: 'q1',
+        arguments: JSON.stringify({ questions: [{ id: 'pkg', question: 'which package manager?', options: [{ label: 'pnpm' }] }] }),
+      },
+    })
+    await waitFor(() => stripAnsi(output.text).includes('the model asks'), 'the ask overlay')
+    await waitFor(() => stripAnsi(output.text).includes('▸ ○ 1. pnpm'), 'the option cursor')
+
+    // The custom row is navigable, so it carries the cursor like any other row.
+    output.text = ''
+    input.push('\u001b[B')
+    await waitFor(() => stripAnsi(output.text).includes('▸ ✎'), 'the custom-row cursor')
+
+    // Typing shows the text and swaps the footer for a typing hint.
+    output.text = ''
+    input.push('c')
+    input.push('yarn')
+    await waitFor(() => stripAnsi(output.text).includes('✎ yarn'), 'the typed custom answer')
+    assert.match(stripAnsi(output.text), /enter submit · esc cancel text/)
+
+    // Esc backs out of the field, not out of the question: the footer returns
+    // to the row hints and the next Enter still reaches this ask.
+    const beforeEsc = output.text.length
+    input.push('\u001b')
+    await waitFor(() => output.text.length > beforeEsc, 'a repaint after esc')
+    assert.equal(stripAnsi(output.text.slice(beforeEsc)).includes('esc cancel text'), false)
+
+    // One Enter submits the committed custom answer.
+    output.text = ''
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('answers sent'), 'the submitted answer')
+    assert.deepEqual(backend.answeredQuestions.at(-1)?.answers, [{ id: 'pkg', selected: [], custom: 'yarn' }])
+    assert.equal(stripAnsi(output.text).includes('ask_user_question'), false)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
 })
 
 test('escape hides the ask overlay until that call settles', async () => {
@@ -211,6 +354,265 @@ test('escape hides the ask overlay until that call settles', async () => {
   input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
+})
+
+test('the ask card, focus hint and viewer label the question, not the tool id', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 28
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    backend.emit('s1', {
+      type: 'tool/call',
+      seq: 1,
+      data: {
+        name: 'ask_user_question',
+        callId: 'q1',
+        arguments: JSON.stringify({
+          questions: [{ id: 'pkg', header: 'Package manager', question: 'which package manager?', options: [{ label: 'pnpm' }, { label: 'npm' }] }],
+        }),
+      },
+    })
+    await waitFor(() => stripAnsi(output.text).includes('the model asks'), 'the ask overlay')
+    // Esc hides the overlay so the transcript card underneath is visible.
+    output.text = ''
+    input.push('\u001b')
+    await waitFor(() => !stripAnsi(output.text).includes('the model asks'), 'the dismissed overlay')
+    // The wizard shares the composer's row budget, so leaving it only repaints
+    // the rows that changed; ctrl+l forces the full transcript back.
+    input.push('\u000c')
+    await waitFor(() => stripAnsi(output.text).includes('Ask(which package manager?)'), 'the folded ask card')
+
+    // The focus hint names the question, not `ask_user_question`.
+    input.push('\u001b[1;3A')
+    await waitFor(() => stripAnsi(output.text).includes('▸ 1/1'), 'the focus hint')
+    const hint = stripAnsi(output.text)
+    assert.equal(hint.includes('ask_user_question'), false)
+    assert.match(hint, /Ask\(which package manager\?\) · enter open/)
+
+    // Enter opens a readable viewer with the questions, not the arguments JSON.
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('one choice'), 'the ask viewer')
+    const viewer = stripAnsi(output.text)
+    assert.match(viewer, /ask · which package manager\?/)
+    assert.match(viewer, /· one choice/)
+    assert.match(viewer, /○ pnpm/)
+    assert.equal(viewer.includes('questions=['), false)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
+
+test('an answered ask does not reopen while the Host settles it', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 28
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  // Hold the settlement open: a real Host resolves the call through its durable
+  // log, so events can land between the answer and the tool result.
+  backend.settleAnswers = false
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    backend.emit('s1', {
+      type: 'tool/call',
+      seq: 1,
+      data: { name: 'ask_user_question', callId: 'q1', arguments: JSON.stringify({ questions: [{ id: 'pkg', question: 'which?', options: [{ label: 'A' }] }] }) },
+    })
+    await waitFor(() => stripAnsi(output.text).includes('the model asks'), 'the ask overlay')
+    input.push(' ')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('answers sent'), 'the submitted answer')
+
+    // The turn keeps running before the answer is settled: the overlay must not
+    // pop back over the transcript.
+    output.text = ''
+    backend.emit('s1', { type: 'assistant/message', seq: 2, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'moving on' }] } } })
+    await waitFor(() => output.text.includes('moving on'), 'the unrelated event')
+    assert.equal(stripAnsi(output.text).includes('the model asks'), false)
+
+    output.text = ''
+    backend.settleAnswers = true
+    backend.emit('s1', {
+      type: 'tool/result',
+      seq: 3,
+      data: { message: { toolCallId: 'q1', content: [{ type: 'text', text: '{"answers":[{"id":"pkg","selected":["A"]}]}' }] } },
+    })
+    await waitFor(() => stripAnsi(output.text).includes('✓ Ask(which?)'), 'the settled ask card')
+    assert.equal(stripAnsi(output.text).includes('the model asks'), false)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
+
+test('a cancelled ask closes its overlay, and the card records the failure', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 28
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  const handle = await backend.openSession('s1')
+  const views = []
+  const off = handle.subscribe((view) => views.push(view))
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    backend.askQuestion('s1', 'q1', [{ id: 'pkg', question: 'which?', options: [{ label: 'A' }] }])
+    await waitFor(() => stripAnsi(output.text).includes('the model asks'), 'the ask overlay')
+    // The live request is what surfaced it, not only the durable scan.
+    assert.equal(views.at(-1)?.pendingAsk?.callId, 'q1')
+
+    output.text = ''
+    backend.abortQuestion('s1', 'q1')
+    await waitFor(() => !stripAnsi(output.text).includes('the model asks'), 'the closed overlay')
+    assert.equal(views.at(-1)?.pendingAsk, undefined)
+    await waitFor(() => stripAnsi(output.text).includes('Ask(which?)'), 'the failed card')
+    assert.match(stripAnsi(output.text), /Ask\(which\?\)/)
+  } finally {
+    off()
+    handle.dispose()
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
+
+test('the durable log can start at seq 0 without hiding the first event', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 24
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  // Real DSH logs number their first durable event 0.
+  const backend = new FakeBackend([{
+    sessionId: 's1',
+    cwd: '/work',
+    events: [
+      { type: 'user/message', seq: 0, data: { message: { id: 'u0', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'the very first prompt' }] } } },
+    ],
+  }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('the very first prompt'), 'the seq 0 event')
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
 })
 
 test('durable events become stable blocks and pair tool results by callId', () => {
@@ -1139,6 +1541,61 @@ test('jump-to-bottom pill fits the row and switches label with unread output', (
   assert.match(stripAnsi(unread), /End/)
 })
 
+test('the job chip right-aligns on the finished turn line', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 92
+    rows = 24
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  try {
+    await waitFor(() => output.text.includes('idle'), 'the first attach')
+    let seq = 0
+    const emit = (type, data) => backend.emit('s1', { type, seq: ++seq, time: Date.now(), data })
+    emit('turn/start', { turn: 1 })
+    emit('job/registered', { jobId: 'j1' })
+    emit('job/registered', { jobId: 'j2' })
+    emit('job/settled', { jobId: 'j1', status: 'failed' })
+    emit('job/settled', { jobId: 'j2', status: 'failed' })
+    emit('turn/end', { reason: { kind: 'completed' } })
+
+    // The chip shares the turn line, right-aligned, instead of taking a footer
+    // row of its own.
+    await waitFor(() => /Worked for[^\n\u001b]*✗ 2 jobs failed/u.test(output.text), 'the merged job chip')
+    assert.equal(output.text.includes('✗ jobs 0'), false)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
+
 test('footer status strip folds agents, jobs and todo progress', () => {
   const allDone = renderStatusStrip(theme, {
     agentsDone: 1, agentsTotal: 1, agentsRunning: 0,
@@ -1157,7 +1614,7 @@ test('footer status strip folds agents, jobs and todo progress', () => {
     jobsRunning: 0, jobsFailed: 1, jobsTotal: 1,
     todosDone: 0, todosTotal: 0, width: 80,
   })
-  assert.equal(stripAnsi(failed), '✗ jobs 0 · ✗ 1')
+  assert.equal(stripAnsi(failed), '✗ 1 job failed')
   assert.equal(renderStatusStrip(theme, {
     agentsDone: 0, agentsTotal: 0, agentsRunning: 0,
     jobsRunning: 0, jobsFailed: 0, jobsTotal: 0,
@@ -1975,6 +2432,76 @@ test('alt+arrows walk blocks and enter opens tools and subagents', async () => {
   }
 })
 
+test('secondary pages are framed by rules, so a copy carries no border columns', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'list the files' }] } } },
+    { type: 'tool/call', seq: 2, data: { name: 'bash', callId: 'c1', arguments: '{"command":"ls","description":"List files"}' } },
+    { type: 'tool/result', seq: 3, data: { message: { toolCallId: 'c1', isError: false, content: [{ type: 'text', text: 'a.txt\nb.txt' }] } } },
+    { type: 'turn/end', seq: 4, data: { reason: { kind: 'completed' } } },
+  ]
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    // The model picker and the tool viewer are both secondary pages; neither
+    // may paint box corners or side borders into the rows a user copies.
+    output.text = ''
+    for (const char of '/model') input.push(char)
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('in use'), 'the model picker')
+    assert.equal(/[╭╮╰╯│]/u.test(stripAnsi(output.text)), false)
+
+    input.push('\u001b')
+    output.text = ''
+    input.push('\u001b[1;3B')
+    input.push('\u001b[1;3B')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('pgup/pgdn'), 'the tool viewer')
+    assert.equal(/[╭╮╰╯│]/u.test(stripAnsi(output.text)), false)
+
+    input.push('\u001b')
+    input.push('\u0003')
+    input.push('\u0004')
+    assert.equal(await app, 0)
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
+
 test('a queued prompt can be edited or deleted from the block cursor', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
@@ -2358,13 +2885,99 @@ test('enter opens the focused block even after scrolling up', async () => {
     output.text = ''
     input.push('\u001b[1;3A')
     input.push('\u001b[1;3A')
-    await waitFor(() => stripAnsi(output.text).includes('tool · bash'), 'the focus hint')
+    await waitFor(() => stripAnsi(output.text).includes('Bash('), 'the focus hint')
     output.text = ''
     input.push('\r')
     await waitFor(() => stripAnsi(output.text).includes('pgup/pgdn'), 'the tool detail panel')
     output.text = ''
     input.push('\u001b')
     await waitFor(() => !stripAnsi(output.text).includes('pgup/pgdn'), 'the detail panel to close')
+  } finally {
+    input.push('\u0004')
+    await app
+  }
+})
+
+test('a streaming turn does not move a reader who scrolled up', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 24
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  // Enough history that the transcript is several screens tall.
+  const events = []
+  let seq = 0
+  for (let turn = 0; turn < 8; turn += 1) {
+    events.push({ type: 'user/message', seq: seq++, data: { message: { id: `u${String(turn)}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `request ${String(turn)}` }] } } })
+    events.push({ type: 'assistant/message', seq: seq++, data: { message: { role: 'assistant', content: [{ type: 'text', text: `answer ${String(turn)}: ${'words '.repeat(30)}` }] } } })
+    events.push({ type: 'turn/end', seq: seq++, data: { reason: { kind: 'completed' } } })
+  }
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', title: 't', events }])
+  await backend.connect()
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  // A size flip forces a full repaint, so a snapshot never reads stale rows.
+  // The width never changes, so the transcript is not re-wrapped between them.
+  const snapshot = async () => {
+    const paint = async (rows) => {
+      output.text = ''
+      output.rows = rows
+      output.emit('resize')
+      await waitFor(() => stripAnsi(output.text).includes('Jump to bottom') || stripAnsi(output.text).includes('· End'), 'a repaint')
+    }
+    await paint(25)
+    await paint(24)
+    const frame = output.text.slice(output.text.lastIndexOf('\u001b[1;1H'))
+    const parts = frame.split(/\u001b\[(\d+);1H\u001b\[2K/)
+    const grid = Array.from({ length: 24 }, () => '')
+    for (let index = 1; index < parts.length; index += 2) {
+      const row = Number(parts[index]) - 1
+      if (row < 0 || row >= 24) continue
+      grid[row] = stripAnsi(parts[index + 1] ?? '').replace(/\r?\n[\s\S]*$/u, '').replace(/\s+$/u, '')
+    }
+    return grid
+  }
+
+  await waitFor(() => output.text.includes('idle'), 'the first attach')
+  try {
+    // Five wheel-ups leave the reader well inside history, not at the edge.
+    for (let index = 0; index < 5; index += 1) input.push('\u001b[<64;10;5M')
+    await waitFor(() => stripAnsi(output.text).includes('Jump to bottom'), 'the scroll pill')
+    const before = await snapshot()
+
+    // A running turn appends streamed reasoning and text below the window.
+    backend.markLive('s1', true)
+    backend.stream('s1', `${'fresh output '.repeat(80)}\nsecond line`, 'thinking about it\nsecond thought')
+    await waitFor(() => stripAnsi(output.text).includes(' new · End'), 'the unseen pill')
+    const after = await snapshot()
+
+    // Rows 2..15 are transcript body: they must show the same lines as before.
+    assert.deepEqual(after.slice(1, 15), before.slice(1, 15))
   } finally {
     input.push('\u0004')
     await app
@@ -2710,6 +3323,69 @@ test('a user-invocable skill reaches the model as a /name gesture', async () => 
     input.push('\u0015') // the editor holds the inserted line; clear it so ^D quits
     input.push('\u0004')
     await app
+    await backend.disconnect()
+  }
+})
+
+test('an ask that arrives behind a panel is announced, then surfaces when the panel closes', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('dshell'), 'the first frame')
+
+    // A panel the user opened owns the keyboard when the ask arrives.
+    input.push('/model')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('enter model/level'), 'the model picker')
+    backend.askQuestion('s1', 'q1', [
+      { id: 'pkg', header: '包名', question: '包名用哪个？', options: [{ label: 'A' }, { label: 'B' }] },
+    ])
+    await waitFor(() => stripAnsi(output.text).includes('close this panel'), 'the ask notice')
+    assert.equal(stripAnsi(output.text).includes('包名用哪个？'), false, 'the ask waits behind the panel')
+
+    // Esc closes the panel; the waiting ask takes the screen instead of the ask
+    // staying invisible until the next event arrives.
+    output.text = ''
+    input.push('\u001b')
+    await waitFor(() => stripAnsi(output.text).includes('包名用哪个？'), 'the ask after the panel closes')
+    output.text = ''
+    input.push(' ')
+    await waitFor(() => stripAnsi(output.text).includes('● 1. A'), 'an option selected from the ask')
+    assert.deepEqual(backend.answeredQuestions, [])
+  } finally {
+    input.push('\u0003')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
     await backend.disconnect()
   }
 })

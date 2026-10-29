@@ -161,11 +161,13 @@ export function renderStatusStrip(theme: Theme, input: StatusStripInput): string
     const style: ThemeStyle = settled ? 'success' : 'info'
     segments.push(`${paint(theme, style, glyph)} ${paint(theme, 'muted', `agents ${input.agentsDone}/${input.agentsTotal}`)}`)
   }
-  if (input.jobsRunning > 0 || input.jobsFailed > 0) {
-    const glyph = input.jobsRunning > 0 ? '●' : '✗'
-    const style: ThemeStyle = input.jobsRunning > 0 ? 'info' : 'error'
-    const failed = input.jobsFailed > 0 ? paint(theme, 'error', ` · ✗ ${input.jobsFailed}`) : ''
-    segments.push(`${paint(theme, style, glyph)} ${paint(theme, 'muted', 'jobs')} ${paint(theme, 'text', String(input.jobsRunning))}${failed}`)
+  if (input.jobsRunning > 0) {
+    const failed = input.jobsFailed > 0 ? paint(theme, 'error', ` · ✗ ${input.jobsFailed} failed`) : ''
+    segments.push(`${paint(theme, 'info', '●')} ${paint(theme, 'muted', 'jobs')} ${paint(theme, 'text', String(input.jobsRunning))}${failed}`)
+  } else if (input.jobsFailed > 0) {
+    // Nothing is running: counting "0" would read as "0 failed".
+    const label = input.jobsFailed === 1 ? 'job failed' : 'jobs failed'
+    segments.push(`${paint(theme, 'error', '✗')} ${paint(theme, 'error', `${String(input.jobsFailed)} ${label}`)}`)
   }
   if (input.todosTotal > 0) {
     const done = input.todosDone === input.todosTotal

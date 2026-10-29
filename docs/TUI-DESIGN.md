@@ -159,6 +159,77 @@ showing `copied N lines`/`copied N chars`. Holding Shift still hands the drag
 to the terminal's native selection for environments where OSC 52 is disabled.
 `DSHELL_NO_MOUSE=1` disables the whole mouse protocol.
 
+## Secondary pages
+
+Every overlay — `/model`, the tool and subagent viewers opened with `Alt+↑` then
+`Enter`, the pickers, the session panel, approvals and model questions — is one
+component: the title, a horizontal rule, the body, then a blank line and the
+shortcut footer.
+
+```
+model
+────────────────────────────────────────────────────
+▸● sonnet-4.5  anthropic/claude-sonnet-4.5
+   ...
+
+● in use   ◆ default for new sessions   ▸ cursor
+
+↑/↓ select · enter model/level · e levels · d default · esc close
+```
+
+There is deliberately no box. A drag selection reads the rendered rows, so a
+vertical border on either edge ends up in the clipboard and turns a copied list
+into decorated text; with rules the chrome is horizontal and the rows are plain.
+
+A tool viewer labels its block the way the transcript does — `Ask(which package
+manager?)`, not `ask_user_question` — and expands an ask structurally:
+
+```
+ask · which package manager?
+────────────────────────────────────────────────────
+Package manager
+which package manager?
+· one choice
+  ○ pnpm
+  ○ npm
+
+↑/↓ scroll · pgup/pgdn · y copy · esc close
+```
+
+Once answered, the same viewer ends with an `answers` section of `id → answer`
+rows instead of the raw `{"answers":[…]}` result.
+
+The ask is driven by the Host, not by scanning the log. `ask_user_question`
+blocks inside the `user-questions/request` waterfall; a browser is the
+answerer in the Web UI, and in a terminal the Host plugin is: it answers that
+waterfall for every session a TUI client is watching and forwards a live
+`question/request` carrying the call id and the questions. The durable-log
+scan is the fallback — it restores an unanswered ask after a reattach and
+still settles a timed-out question when the user answers late.
+
+The ask is a **bottom-pane wizard**, not a page, so the transcript stays
+readable while the model waits. It takes the composer's row budget:
+
+```
+🐳 dshell · s1                                   ● idle · /work
+▸ Ask(包管理器用哪个？)
+─ the model asks ───────────────────────────────────────────────
+☐ Package manager  ☐ Checks  ✓ Submit
+Package manager
+包管理器用哪个？
+▸ ○ 1. pnpm  仓库里现在用的就是这个
+  ○ 2. npm
+  ○ 3. yarn
+  ✎ type a custom answer (c)
+─ ↑↓ move · space select · ←→ question · c custom · enter next · esc later ─
+```
+
+One question per tab, `☑` once answered, then a `✓ Submit` tab that reviews
+every answer (`● Package manager  pnpm`, `○ Checks  — skipped`) before it is
+sent. `←/→` switch tabs, `↑/↓` move, `space` selects or toggles, `1-9` answer
+at once, `c` types an `Other` answer, `enter` advances (and submits on the
+review page), `esc` hides the ask until it settles.
+
 ## Herdr
 
 Inside a Herdr pane (`HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH`) the
@@ -184,8 +255,11 @@ offset is non-zero the renderer emits a right-aligned `↓ N new · End` pill
 above the composer and remembers its 1-based row for click hit-testing. `End`,
 `Enter`, `Esc`, a click on the pill, or scrolling back to the bottom all
 restore the tail; `N` counts transcript lines appended since the last time the
-tail was visible. `DSHELL_NO_MOUSE=1` skips mouse capture (native scrollback),
-and `Shift`+drag still selects in most terminals.
+tail was visible. A reader who scrolled up is anchored to their first visible
+line: rows appended by a streaming turn (and rows the composer gains or loses)
+move the offset, so the text under their eyes never slides away.
+`DSHELL_NO_MOUSE=1` skips mouse capture (native scrollback), and `Shift`+drag
+still selects in most terminals.
 
 **Subagents.** The roster is a pure fold over durable events:
 `subagent/catalog` opens a row (`childId`, `label`, `mode`, `childCreatedAt`),

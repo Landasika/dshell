@@ -3,13 +3,78 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-29
+
+### Changed
+
+- Background jobs read plainly and sit where the eye already is: the chip no
+  longer says `✗ jobs 0 · ✗ 2` (which meant "none running, two failed" and
+  looked like "zero failed") but `✗ 2 jobs failed`, and it rides the right edge
+  of `✻ Worked for 48s · done 23:24` instead of taking a footer row of its own.
+
+- The model's question is a bottom-pane wizard now, not a page: the transcript
+  stays readable above it and the wizard takes the composer's place, one
+  question per tab (`☐ Package manager  ☑ Checks  ✓ Submit`), a review page
+  before anything is sent, `←/→` to move between questions, `1-9` to answer at
+  once, and `Other` typed in place. It follows what Codex
+  ([#9904](https://github.com/openai/codex/pull/9904)), mayfly's
+  `question-wizard` and Claude Code all do: one question at a time, then a
+  submission summary, instead of a wall of every question at once.
 
 ### Fixed
+
+- `ask_user_question` now reaches the terminal at all. The Host's tool blocks
+  inside a `user-questions/request` waterfall whose only answerer was the Web
+  UI, so a Host driven purely from `dshell` failed the call with `NO_PROVIDER`
+  the moment the model asked — nothing could ever be shown. The Host plugin now
+  registers as that answerer for sessions a TUI client is watching and forwards
+  the request as a live `question/request` (durable events remain the replay and
+  late-answer path). Aborting the turn or losing the last client closes the
+  overlay, and a second window's late answer is refused (`QUESTION_NOT_PENDING`)
+  instead of steering a duplicate reply.
+
+- A waiting model question no longer hides behind a panel. When the ask arrives
+  while `/model` (or any other secondary page) owns the keyboard, the footer
+  says `the model asks · close this panel (esc) to answer`; closing that panel
+  opens the ask straight away instead of leaving it invisible — and the composer
+  taking the answer as a prompt — until the next session event arrives.
+
+- Model questions read like questions everywhere: the focus hint and the
+  detail viewer show `Ask(which package manager?)` instead of
+  `ask_user_question`, and the viewer lays out every header, question and option
+  (`○` for one choice, `☐` for multi-select) then `id → answer` rows once
+  answered, instead of the raw `questions=[{…}]` arguments. An answer batch whose call is gone is labelled `Ask` rather than
+  `tool result` with JSON in the headline, and the custom answer row carries the
+  `▸` cursor like every other row.
+
+- A custom answer row behaves like the rest of the ask overlay: `Esc` backs out
+  of the text field before hiding the ask, the footer swaps to a typing hint,
+  and `Enter` commits and submits a single-question answer in one press.
+
+- Answering a question no longer lets it pop back open: the answered call is
+  dismissed locally until the Host settles it, and a failed submission restores
+  the overlay instead of leaving it closed.
+
+- The durable log can start at `seq: 0`: the first event is no longer hidden by
+  the `/clear` watermark (`clearedAtSeq` starts at `-1`).
+
+- Reading history while a turn streams no longer drags the transcript: the
+  viewport anchors a reader who scrolled up to their first visible line, so
+  rows appended below the window (and rows the composer grows into) move the
+  scroll offset instead of sliding the text away.
 
 - `/skills` now reads the catalog through the session's agent scope, so
   DSH-native skills (`~/.agents/skills`, preset-mounted discovery) show up
   instead of an empty list.
+
+### Changed
+
+- Every secondary page drops the box frame for a title, one horizontal rule and
+  plain rows: `/model` and its reasoning-level page, the tool/subagent/skill
+  viewers opened with `Alt+↑` → `Enter`, the pickers, the session panel,
+  approvals and model questions. A drag selection no longer drags `│` border
+  columns into the clipboard, and a centered block now aligns every row on its
+  widest line instead of centering rows one by one.
 
 ### Added
 
@@ -346,5 +411,6 @@ First V1 candidate for Linux.
 - No npm publication in this repository's automated release workflow; the
   `v*` workflow produces a verified tarball and SHA256SUMS.
 
+[0.3.0]: https://github.com/Landasika/dshell/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Landasika/dshell/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Landasika/dshell/releases/tag/v0.1.0

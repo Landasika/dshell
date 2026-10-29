@@ -7,35 +7,45 @@ import { formatPercent, pressureStyle } from './metrics.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
 import { displayWidth, pad, truncate } from './width.js'
 
-export interface BoxOptions {
+export interface PanelOptions {
   tone?: ThemeStyle
-  /** Rows appended inside the box, separated from the body by a blank line. */
+  /** Rows appended under the body, separated from it by a blank line. */
   footer?: readonly string[]
 }
 
-/** Rounded panel with an inline title. `width` includes both borders. */
-export function panelBox(
+/**
+ * The one panel used by every overlay: a title, a horizontal rule, the body.
+ *
+ * A boxed panel is nice to look at but painful to copy from: a drag selection
+ * picks up the `│` on both edges of every row, so pasting into a prompt or an
+ * issue drags the frame along. Every secondary page (`/model`, tool and
+ * subagent viewers opened with Alt+↑, pickers, approvals) is therefore framed
+ * by rules only — chrome is horizontal, the rows stay plain text.
+ */
+export function panelRule(
   theme: Theme,
   title: string,
   body: readonly string[],
   width: number,
-  options: BoxOptions = {},
+  options: PanelOptions = {},
 ): string[] {
   const total = Math.max(16, Math.floor(width))
-  const inner = total - 4
   const tone: ThemeStyle = options.tone ?? 'border'
-  const safeTitle = truncate(title, Math.max(1, inner - 2))
-  const titleWidth = displayWidth(safeTitle)
-  const top = `${paint(theme, tone, '╭─')} ${paint(theme, 'accentSoft', safeTitle)} ${paint(theme, tone, '─'.repeat(Math.max(0, total - titleWidth - 5)))}${paint(theme, tone, '╮')}`
-  const content = body.map((line) => `${paint(theme, tone, '│')} ${pad(line, inner)} ${paint(theme, tone, '│')}`)
+  const heading = options.tone === undefined
+    ? paint(theme, 'bold', paint(theme, 'accentSoft', truncate(title, total)))
+    : paint(theme, 'bold', paint(theme, tone, truncate(title, total)))
+  const lines = [
+    heading,
+    paint(theme, tone, '─'.repeat(total)),
+    ...body.map((line) => (displayWidth(line) > total ? truncate(line, total) : line)),
+  ]
   if (options.footer !== undefined && options.footer.length > 0) {
-    content.push(`${paint(theme, tone, '│')} ${' '.repeat(inner)} ${paint(theme, tone, '│')}`)
+    lines.push('')
     for (const line of options.footer) {
-      content.push(`${paint(theme, tone, '│')} ${pad(line, inner)} ${paint(theme, tone, '│')}`)
+      lines.push(displayWidth(line) > total ? truncate(line, total) : line)
     }
   }
-  const bottom = paint(theme, tone, `╰${'─'.repeat(total - 2)}╯`)
-  return [top, ...content, bottom]
+  return lines
 }
 
 /** One-line application header with brand, session title and status. */
@@ -185,12 +195,16 @@ export function renderHintLine(theme: Theme, columns: number): string {
   return paint(theme, 'muted', truncate(text, columns))
 }
 
-/** Center a block horizontally inside `columns`. */
+/**
+ * Center a block horizontally inside `columns`, using the widest row so every
+ * line starts at the same column. Centering each row by its own width would
+ * ragged-edge a borderless panel; boxed panels are padded to one width, so
+ * they are unaffected.
+ */
 export function centerBlock(lines: readonly string[], columns: number): string[] {
-  return lines.map((line) => {
-    const left = Math.max(0, Math.floor((columns - displayWidth(line)) / 2))
-    return `${' '.repeat(left)}${line}`
-  })
+  const width = lines.reduce((widest, line) => Math.max(widest, displayWidth(line)), 0)
+  const indent = ' '.repeat(Math.max(0, Math.floor((columns - width) / 2)))
+  return lines.map((line) => (line.length === 0 ? '' : `${indent}${line}`))
 }
 
 /** Vertically center a block inside `rows`, returning empty padding rows too. */

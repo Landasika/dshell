@@ -27,11 +27,14 @@ import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, t
 import { createEditor, editKey, insertText, type EditorState } from './editor.js'
 import { normalizePaste, pastePlaceholder, shouldFoldPaste } from './paste.js'
 import {
+  askAnswerLines,
+  askQuestionLines,
   buildBlocks,
   isInjectedContext,
   pendingQuestions,
   renderBlocks,
   renderBlocksWithRanges,
+  toolLabel,
   turnFailureMessage,
   type Block,
   type BlockRange,
@@ -71,7 +74,7 @@ import { createHerdrReporter, resumeCommand, type HerdrReporter, type HerdrState
 import {
   centerBlock,
   centerVertically,
-  panelBox,
+  panelRule,
   renderComposer,
   renderHeader,
   renderHintLine,
@@ -113,7 +116,9 @@ type Overlay =
       kind: 'questions'
       callId: string
       questions: AskedQuestion[]
-      /** Cursor into the flattened option/custom rows across all questions. */
+      /** Tab index: one per question, then the review/submit page. */
+      tab: number
+      /** Cursor into the current question's option/custom rows. */
       cursor: number
       selected: Record<string, string[]>
       custom: Record<string, string>
@@ -155,27 +160,25 @@ interface QuestionRow {
   multi: boolean
 }
 
-function questionRows(questions: readonly AskedQuestion[]): QuestionRow[] {
+function questionRows(question: AskedQuestion): QuestionRow[] {
   const rows: QuestionRow[] = []
-  for (const question of questions) {
-    for (const option of question.options ?? []) {
-      rows.push({
-        qid: question.id,
-        kind: 'option',
-        label: option.label,
-        ...(option.description === undefined ? {} : { description: option.description }),
-        multi: question.multiSelect === true,
-      })
-    }
-    // Every question keeps one custom row so the cursor can always reach it,
-    // and option-less questions are still answerable by typing.
-    rows.push({ qid: question.id, kind: 'custom', multi: question.multiSelect === true })
+  for (const option of question.options ?? []) {
+    rows.push({
+      qid: question.id,
+      kind: 'option',
+      label: option.label,
+      ...(option.description === undefined ? {} : { description: option.description }),
+      multi: question.multiSelect === true,
+    })
   }
+  // Every question keeps one custom row so the cursor can always reach it,
+  // and option-less questions are still answerable by typing.
+  rows.push({ qid: question.id, kind: 'custom', multi: question.multiSelect === true })
   return rows
 }
 
 function freshQuestionsOverlay(callId: string, questions: AskedQuestion[]): Overlay {
-  return { kind: 'questions', callId, questions, cursor: 0, selected: {}, custom: {}, customMode: false }
+  return { kind: 'questions', callId, questions, tab: 0, cursor: 0, selected: {}, custom: {}, customMode: false }
 }
 
 interface AppState {
@@ -193,6 +196,7 @@ interface AppState {
   error?: string
   toast?: { text: string; until: number }
   verbose: boolean
+  /** Highest durable seq hidden by `/clear`; -1 keeps seq 0 (real logs start there). */
   clearedAtSeq: number
   approvalBusy: boolean
   completion?: CompletionState
@@ -368,7 +372,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     overlay: null,
     status: 'starting',
     verbose: options.verbose === true,
-    clearedAtSeq: 0,
+    clearedAtSeq: -1,
     approvalBusy: false,
     quitting: false,
     todosFolded: false,
@@ -398,6 +402,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let lastBodyHeight = 3
   let reattaching = false
   let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
+  /** Call id already announced as waiting behind another panel. */
+  let askNotice: string | undefined
   let resolveDone: ((code: number) => void) | undefined
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve
@@ -414,7 +420,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (item.kind === 'queue') return `queued · ${item.queue?.text.replace(/\s+/g, ' ').slice(0, 40) ?? ''}`
     const block = item.block
     if (block === undefined) return 'block'
-    if (block.kind === 'tool') return `tool · ${block.toolName ?? 'call'}`
+    if (block.kind === 'tool') return toolLabel(block)
     if (block.kind === 'notice') return block.title ?? 'notice'
     if (block.kind === 'user') return `you · ${block.body.replace(/\s+/g, ' ').slice(0, 40)}`
     if (block.kind === 'assistant') return `dshell · ${block.body.replace(/\s+/g, ' ').slice(0, 40)}`
@@ -600,6 +606,41 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return entries
   }
 
+  /**
+   * Surface a pending `ask_user_question`, or close the overlay once the call
+   * settled. Runs on every view *and* whenever an overlay closes: an ask that
+   * arrives while a panel the user opened is up must not stay invisible after
+   * that panel is gone. While the panel is up the ask is announced once, so a
+   * blocked turn never waits silently.
+   */
+  const surfaceAsk = (): void => {
+    const view = state.view
+    // The Host's live request names the call and arrives while the tool is
+    // blocked; the durable scan is the fallback for replay and late answers.
+    const ask = view === undefined || !backend.capabilities().questions
+      ? undefined
+      : view.pendingAsk !== undefined
+        ? { callId: view.pendingAsk.callId, questions: view.pendingAsk.questions }
+        : pendingQuestions(view.events)
+    const current = state.overlay
+    if (ask === undefined || state.dismissedAsks.has(ask.callId)) {
+      if (current?.kind === 'questions') state.overlay = null
+      askNotice = undefined
+      return
+    }
+    if (current === null) {
+      state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
+      askNotice = undefined
+    } else if (current.kind === 'questions') {
+      if (current.callId === ask.callId) current.questions = ask.questions
+      else state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
+    } else if (current.kind !== 'approval' && askNotice !== ask.callId) {
+      // The open panel owns the keyboard until it closes; say where the ask is.
+      askNotice = ask.callId
+      toast('the model asks · close this panel (esc) to answer')
+    }
+  }
+
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
@@ -633,19 +674,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     } else if (state.overlay?.kind === 'approval') {
       state.overlay = null
     }
-    const ask = backend.capabilities().questions ? pendingQuestions(view.events) : undefined
-    if (ask !== undefined && !state.dismissedAsks.has(ask.callId)) {
-      const current = state.overlay
-      if (current === null) {
-        state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
-      } else if (current.kind === 'questions' && current.callId !== ask.callId) {
-        state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
-      } else if (current.kind === 'questions') {
-        current.questions = ask.questions
-      }
-    } else if (state.overlay?.kind === 'questions') {
-      state.overlay = null
-    }
+    surfaceAsk()
     ensureTick()
     schedule()
   }
@@ -676,7 +705,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       void off
       state.status = 'idle'
       state.startup = undefined
-      state.clearedAtSeq = 0
+      state.clearedAtSeq = -1
       viewport.reset()
       const pending = state.pendingPrompt
       state.pendingPrompt = undefined
@@ -743,7 +772,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.overlay = null
       state.startup = undefined
       state.status = 'new session'
-      state.clearedAtSeq = 0
+      state.clearedAtSeq = -1
       viewport.reset()
       const pending = state.pendingPrompt
       state.pendingPrompt = undefined
@@ -1560,7 +1589,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         await cancel()
         return
       case '/clear':
-        state.clearedAtSeq = state.view?.cursor ?? 0
+        state.clearedAtSeq = state.view?.cursor ?? -1
         viewport.reset()
         toast('local transcript cleared; durable history is unchanged')
         schedule()
@@ -1718,6 +1747,40 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return true
   }
 
+  /** Send the overlay's selections; shared by `Enter` and a committed custom row. */
+  const submitAnswers = (overlay: Extract<Overlay, { kind: 'questions' }>): void => {
+    const answers = overlay.questions.map((question) => {
+      const selected = overlay.selected[question.id] ?? []
+      const custom = (overlay.custom[question.id] ?? '').trim()
+      return { id: question.id, selected, ...(custom.length > 0 ? { custom } : {}) }
+    })
+    if (answers.every((answer) => answer.selected.length === 0 && answer.custom === undefined)) {
+      toast('pick an option (space) or type an answer (c) first')
+      return
+    }
+    const callId = overlay.callId
+    state.overlay = null
+    // The Host settles the call through its durable log, which can take a few
+    // frames. Dismissing it here stops any event in that window from popping
+    // the answered question back open.
+    state.dismissedAsks.add(callId)
+    const handle = state.handle
+    if (handle === undefined) return
+    void (async () => {
+      try {
+        await handle.answerQuestion(callId, answers)
+        toast('answers sent')
+      } catch (error) {
+        state.error = errorText(error)
+        // The answer never left, so the question is still answerable.
+        state.dismissedAsks.delete(callId)
+        state.overlay = overlay
+        toast('answer failed; the ask stays open')
+      }
+      schedule()
+    })()
+  }
+
   const handleOverlayKey = (rawKey: Key): void => {
     // Some terminals (and Shift+Enter) send LF where the rest of the app means
     // "confirm". Inside a picker both should commit, so alias them here.
@@ -1736,9 +1799,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       } else if (overlay.kind === 'providerCreate') {
         state.overlay = { kind: 'providers', index: Math.max(0, (state.providers?.providers.length ?? 1) - 1) }
       } else if (overlay.kind === 'questions') {
-        // Hide this ask until it settles; a new call shows a fresh overlay.
-        state.dismissedAsks.add(overlay.callId)
-        state.overlay = null
+        if (overlay.customMode) {
+          // Esc leaves the text field; a second Esc hides the ask.
+          overlay.customMode = false
+        } else {
+          // Hide this ask until it settles; a new call shows a fresh overlay.
+          state.dismissedAsks.add(overlay.callId)
+          state.overlay = null
+        }
       } else {
         if (overlay.kind === 'agentView') closeAgentView()
         state.overlay = null
@@ -1761,66 +1829,92 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (overlay.kind === 'questions') {
-      const rows = questionRows(overlay.questions)
+      const questions = overlay.questions
+      const last = Math.max(0, questions.length - 1)
+      const submitTab = overlay.tab > last
+      const question = questions[Math.min(overlay.tab, last)]
+      const rows = question === undefined ? [] : questionRows(question)
       const row = rows[overlay.cursor]
-      const currentQid = row?.qid ?? overlay.questions[0]?.id ?? ''
+      const qid = question?.id ?? ''
+      /** Move on: next question, then the review page, then submit. */
+      const advance = (): void => {
+        overlay.customMode = false
+        if (questions.length === 1) {
+          submitAnswers(overlay)
+        } else if (overlay.tab < last) {
+          overlay.tab += 1
+          overlay.cursor = 0
+        } else if (overlay.tab === last) {
+          overlay.tab = questions.length
+          overlay.cursor = 0
+        } else {
+          submitAnswers(overlay)
+        }
+      }
       if (overlay.customMode) {
-        if (key.type === 'text') overlay.custom[currentQid] = (overlay.custom[currentQid] ?? '') + key.text
+        if (key.type === 'text') overlay.custom[qid] = (overlay.custom[qid] ?? '') + key.text
         else if (key.type === 'backspace') {
-          const chars = Array.from(overlay.custom[currentQid] ?? '')
+          const chars = Array.from(overlay.custom[qid] ?? '')
           chars.pop()
-          overlay.custom[currentQid] = chars.join('')
+          overlay.custom[qid] = chars.join('')
         } else if (key.type === 'ctrl-u' || key.type === 'ctrl-k') {
-          overlay.custom[currentQid] = ''
+          overlay.custom[qid] = ''
         } else if (key.type === 'enter' || key.type === 'tab') {
-          overlay.customMode = false
+          advance()
         }
         schedule()
         return
       }
-      if (key.type === 'up' || key.type === 'ctrl-p') {
+      if (key.type === 'left') {
+        overlay.tab = Math.max(0, overlay.tab - 1)
+        overlay.cursor = 0
+      } else if (key.type === 'right' || key.type === 'tab') {
+        overlay.tab = Math.min(questions.length, overlay.tab + 1)
+        overlay.cursor = 0
+      } else if (key.type === 'up' || key.type === 'ctrl-p') {
         overlay.cursor = Math.max(0, overlay.cursor - 1)
-      } else if (key.type === 'down' || key.type === 'ctrl-n' || key.type === 'tab') {
+      } else if (key.type === 'down' || key.type === 'ctrl-n') {
         overlay.cursor = Math.min(Math.max(0, rows.length - 1), overlay.cursor + 1)
-      } else if (key.type === 'text' && key.text === ' ' && row !== undefined) {
-        if (row.kind === 'custom') {
+      } else if (key.type === 'text' && key.text === ' ') {
+        if (row?.kind === 'custom') {
           overlay.customMode = true
-        } else if (row.label !== undefined) {
+        } else if (row?.label !== undefined) {
           const selected = overlay.selected[row.qid] ?? []
-          if (row.multi) {
-            overlay.selected[row.qid] = selected.includes(row.label)
+          overlay.selected[row.qid] = row.multi
+            ? selected.includes(row.label)
               ? selected.filter((label) => label !== row.label)
               : [...selected, row.label]
+            : selected.includes(row.label)
+              ? []
+              : [row.label]
+        }
+      } else if (key.type === 'text' && /^[1-9]$/u.test(key.text) && question?.options !== undefined) {
+        // Digits answer at once, as the numbered rows invite.
+        const options = question.options
+        const index = Number(key.text) - 1
+        const option = options[index]
+        if (option !== undefined) {
+          if (question?.multiSelect === true) {
+            const selected = overlay.selected[qid] ?? []
+            overlay.selected[qid] = selected.includes(option.label)
+              ? selected.filter((label) => label !== option.label)
+              : [...selected, option.label]
           } else {
-            overlay.selected[row.qid] = selected.includes(row.label) ? [] : [row.label]
+            overlay.selected[qid] = [option.label]
+            advance()
           }
         }
       } else if (key.type === 'text' && (key.text === 'c' || key.text === 'C')) {
         overlay.customMode = true
+        overlay.cursor = Math.max(0, rows.length - 1)
       } else if (key.type === 'enter') {
-        const answers = overlay.questions.map((question) => {
-          const selected = overlay.selected[question.id] ?? []
-          const custom = (overlay.custom[question.id] ?? '').trim()
-          return { id: question.id, selected, ...(custom.length > 0 ? { custom } : {}) }
-        })
-        if (answers.every((answer) => answer.selected.length === 0 && answer.custom === undefined)) {
-          toast('pick an option (space) or type an answer (c) first')
+        if (submitTab) {
+          submitAnswers(overlay)
+        } else if (row?.kind === 'custom' && (overlay.custom[qid] ?? '').trim().length === 0) {
+          overlay.customMode = true
         } else {
-          const callId = overlay.callId
-          state.overlay = null
-          const handle = state.handle
-          if (handle !== undefined) {
-            void (async () => {
-              try {
-                await handle.answerQuestion(callId, answers)
-                toast('answers sent')
-              } catch (error) {
-                state.error = errorText(error)
-                toast('answer failed; the ask stays open')
-              }
-              schedule()
-            })()
-          }
+          if (row?.label !== undefined && row.multi !== true) overlay.selected[qid] = [row.label]
+          advance()
         }
       }
       schedule()
@@ -2254,6 +2348,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if ((key.type === 'click' || key.type === 'drag' || key.type === 'release') && handleSelectionKey(key)) return
     if (state.overlay !== null) {
       handleOverlayKey(key)
+      // A panel that just closed may have been covering a waiting question.
+      if (state.overlay === null) {
+        surfaceAsk()
+        schedule()
+      }
       return
     }
     if (key.type === 'wheel') {
@@ -2696,15 +2795,33 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (block.kind === 'tool') {
       const width = Math.max(20, screen.size.columns - 10)
-      const body: string[] = [
-        `${paint(theme, 'bold', paint(theme, 'accentSoft', block.toolName ?? 'tool'))}${block.failed === true ? ` ${paint(theme, 'error', '· failed')}` : ''}`,
-      ]
-      if (block.title !== undefined && block.title !== block.toolName) body.push(paint(theme, 'muted', block.title))
-      if (block.body.length > 0) body.push('', ...wrapText(block.body, width).map((line) => paint(theme, 'text', line)))
-      if (block.detail !== undefined && block.detail.length > 0) {
-        body.push('', paint(theme, 'bold', paint(theme, 'accentSoft', 'result')), ...wrapText(block.detail, width).map((line) => paint(theme, 'muted', line)))
+      const isAsk = block.toolName === 'ask_user_question'
+      const label = toolLabel(block)
+      // The ask panel title already names the question, so its body starts at
+      // the questions; other tools lead with their name.
+      const body: string[] = isAsk
+        ? []
+        : [`${paint(theme, 'bold', paint(theme, 'accentSoft', block.toolName ?? 'tool'))}${block.failed === true ? ` ${paint(theme, 'error', '· failed')}` : ''}`]
+      if (!isAsk && block.title !== undefined && block.title !== block.toolName) {
+        body.push(paint(theme, 'muted', block.title))
       }
-      state.overlay = { kind: 'detail', title: `tool · ${block.toolName ?? 'call'}`, lines: body, scroll: 0 }
+      // An ask renders its questions structurally; other tools show the summary
+      // line. Neither dumps the raw `questions=[{…}]` JSON at the reader.
+      const questions = isAsk ? askQuestionLines(block.input) : undefined
+      if (questions !== undefined) {
+        body.push(...questions.map((line) => paint(theme, 'text', line)))
+      } else if (!isAsk && block.body.length > 0) {
+        body.push('', ...wrapText(block.body, width).map((line) => paint(theme, 'text', line)))
+      }
+      if (block.detail !== undefined && block.detail.length > 0) {
+        const answers = isAsk ? askAnswerLines(block.detail) : undefined
+        if (body.length > 0) body.push('')
+        body.push(paint(theme, 'bold', paint(theme, 'accentSoft', answers === undefined ? 'result' : 'answers')))
+        const rows = answers ?? wrapText(block.detail, width)
+        body.push(...rows.map((line) => paint(theme, 'muted', line)))
+      }
+      const title = isAsk ? `ask · ${label.replace(/^Ask(?:\((.*)\))?$/u, '$1') || 'question'}` : `tool · ${block.toolName ?? 'call'}`
+      state.overlay = { kind: 'detail', title: truncate(title, 48), lines: body, scroll: 0 }
       schedule()
       return
     }
@@ -2794,7 +2911,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     })
   }
 
-  const footerLines = (metrics: SessionMetrics, now: number): string[] => {
+  const footerLines = (metrics: SessionMetrics, now: number, strip: string, mergeStrip: boolean): string[] => {
     const columns = screen.size.columns
     const lines: string[] = []
     const phase = metrics.activity.phase
@@ -2810,8 +2927,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (!state.todosFolded && metrics.todos.length > 0) {
       lines.push(renderTodoStrip(theme, metrics.todos, { width: columns, now, folded: false }))
     }
+    if (!mergeStrip && strip.length > 0) lines.push(strip)
+    return lines
+  }
+
+  /** The footer's last line: the status strip, when the session has one. */
+  const statusStripLine = (metrics: SessionMetrics): string => {
     const counts = todoCounts(metrics.todos)
-    const statusStrip = renderStatusStrip(theme, {
+    return renderStatusStrip(theme, {
       agentsDone: 0,
       agentsTotal: 0,
       agentsRunning: 0,
@@ -2820,10 +2943,136 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       jobsTotal: metrics.jobs.total,
       todosDone: counts.completed,
       todosTotal: counts.total,
-      width: columns,
+      width: screen.size.columns,
     })
-    if (statusStrip.length > 0) lines.push(statusStrip)
-    return lines
+  }
+
+  /** The ask wizard that takes the composer's place while the model waits. */
+  const askWizard = (
+    overlay: Extract<Overlay, { kind: 'questions' }>,
+    columns: number,
+  ): { lines: string[]; height: number; cursorRow?: number; cursorColumn?: number } => {
+    const total = Math.max(20, columns)
+    const inner = Math.max(10, total - 4)
+    const questions = overlay.questions
+    const last = Math.max(0, questions.length - 1)
+    const submitTab = overlay.tab > last
+    const question = questions[Math.min(overlay.tab, last)]
+    const rows = question === undefined ? [] : questionRows(question)
+    const qid = question?.id ?? ''
+    const lines: string[] = []
+
+    /** One row that reads as a page rule: title, then the line to the edge. */
+    const heading = (label: string, tone: ThemeStyle = 'accentSoft'): string => {
+      const text = ` ${paint(theme, 'bold', paint(theme, tone, label))} `
+      const used = displayWidth(stripAnsi(text))
+      return `${paint(theme, 'border', '─')}${text}${paint(theme, 'border', '─'.repeat(Math.max(0, total - used - 1)))}`
+    }
+    const footer = (label: string): string => {
+      const text = ` ${paint(theme, 'muted', label)} `
+      const used = displayWidth(stripAnsi(text))
+      return `${paint(theme, 'border', '─')}${text}${paint(theme, 'border', '─'.repeat(Math.max(0, total - used - 1)))}`
+    }
+
+    lines.push(heading('the model asks'))
+    const answered = (id: string): boolean =>
+      (overlay.selected[id] ?? []).length > 0 || (overlay.custom[id] ?? '').trim().length > 0
+    if (questions.length > 1) {
+      const cells = questions.map((entry, index) => {
+        const icon = answered(entry.id) ? '☑' : '☐'
+        const name = entry.header ?? `Q${String(index + 1)}`
+        const text = `${icon} ${truncate(name, 18)}`
+        return index === overlay.tab ? paint(theme, 'accent', paint(theme, 'bold', text)) : paint(theme, 'muted', text)
+      })
+      cells.push(submitTab ? paint(theme, 'accent', paint(theme, 'bold', '✓ Submit')) : paint(theme, 'muted', '✓ Submit'))
+      lines.push(` ${truncate(cells.join(paint(theme, 'border', '  ')), total - 1)}`)
+    }
+
+    if (submitTab) {
+      lines.push(paint(theme, 'bold', paint(theme, 'text', ' Review')))
+      for (const entry of questions) {
+        const selected = overlay.selected[entry.id] ?? []
+        const custom = (overlay.custom[entry.id] ?? '').trim()
+        const answer = [...selected, ...(custom.length > 0 ? [custom] : [])].join(' · ')
+        const mark = answer.length > 0 ? paint(theme, 'success', '●') : paint(theme, 'dim', '○')
+        const name = truncate(entry.header ?? entry.id, 18)
+        lines.push(` ${mark} ${paint(theme, 'muted', pad(name, 18))} ${answer.length > 0 ? paint(theme, 'text', truncate(answer, Math.max(6, inner - 22))) : paint(theme, 'dim', '— skipped')}`)
+      }
+      lines.push(footer('enter submit · ←→ switch · esc later'))
+      return { lines, height: lines.length }
+    }
+
+    if (question === undefined) {
+      lines.push(paint(theme, 'muted', ' no questions'))
+      lines.push(footer('esc later'))
+      return { lines, height: lines.length }
+    }
+    if (question.header !== undefined && question.header.length > 0) {
+      lines.push(paint(theme, 'bold', paint(theme, 'accentSoft', ` ${truncate(question.header, total - 2)}`)))
+    }
+    for (const line of wrapText(question.question, inner)) {
+      lines.push(paint(theme, 'bold', paint(theme, 'text', ` ${line}`)))
+    }
+    if (question.multiSelect === true) {
+      lines.push(paint(theme, 'muted', ' select all that apply · space toggles'))
+    }
+
+    const options = question.options ?? []
+    const optionRows = rows.filter((entry) => entry.kind === 'option')
+    const cursorRow = rows[overlay.cursor]
+    const cursorOption = optionRows.findIndex((entry) => entry === cursorRow)
+    const limit = 8
+    const start = options.length <= limit
+      ? 0
+      : Math.max(0, Math.min(options.length - limit, Math.max(0, cursorOption) - Math.floor(limit / 2)))
+    for (let index = start; index < Math.min(options.length, start + limit); index += 1) {
+      const option = options[index]!
+      const isCursor = overlay.customMode === false && cursorRow?.kind === 'option' && cursorRow.label === option.label
+      const selected = (overlay.selected[qid] ?? []).includes(option.label)
+      const marker = question.multiSelect === true
+        ? selected ? paint(theme, 'success', '☑') : '☐'
+        : selected ? paint(theme, 'accent', '●') : '○'
+      const cursorMark = isCursor ? paint(theme, 'accent', '▸') : ' '
+      const number = paint(theme, 'dim', `${String(index + 1)}.`)
+      const label = paint(theme, isCursor ? 'text' : 'muted', option.label)
+      const description = isCursor && option.description !== undefined
+        ? `  ${paint(theme, 'dim', truncate(option.description, Math.max(6, inner - 8 - option.label.length)))}`
+        : ''
+      lines.push(`${cursorMark} ${marker} ${number} ${label}${description}`)
+    }
+    if (options.length > limit) {
+      const hidden = options.length - Math.min(options.length, start + limit)
+      lines.push(paint(theme, 'dim', `    ${hidden > 0 ? `… ${String(hidden)} more` : `… ${String(start)} above`}`))
+    }
+    const custom = overlay.custom[qid] ?? ''
+    const customCursor = overlay.customMode === true
+    const onCustomRow = rows[overlay.cursor]?.kind === 'custom'
+    const customMark = customCursor || onCustomRow ? paint(theme, 'accent', '▸') : ' '
+    let customRow: number | undefined
+    if (customCursor) {
+      customRow = lines.length
+      lines.push(paint(theme, 'accent', `${customMark} ✎ ${custom}▏`))
+    } else if (custom.trim().length > 0) {
+      lines.push(paint(theme, 'dim', `${customMark} ✎ ${truncate(custom, Math.max(10, inner - 4))}`))
+    } else {
+      lines.push(paint(theme, onCustomRow ? 'text' : 'dim', `${customMark} ✎ type a custom answer (c)`))
+    }
+
+    const hint = customCursor
+      ? questions.length === 1
+        ? 'type an answer · enter submit · esc cancel text'
+        : 'type an answer · enter done · esc cancel text'
+      : questions.length === 1
+        ? `↑↓ move · ${question.multiSelect === true ? 'space toggle' : 'space select'} · c custom · enter submit · esc later`
+        : `↑↓ move · ${question.multiSelect === true ? 'space toggle' : 'space select'} · ←→ question · c custom · enter next · esc later`
+    lines.push(footer(hint))
+    return {
+      lines,
+      height: lines.length,
+      ...(customCursor && customRow !== undefined
+        ? { cursorRow: customRow, cursorColumn: displayWidth(`  ✎ ${custom}`) + 1 }
+        : {}),
+    }
   }
 
   const overlayLines = (): string[] => {
@@ -2832,7 +3081,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const columns = screen.size.columns
     const rows = screen.size.rows
     const width = Math.max(30, Math.min(columns - 4, 88))
-    const inner = width - 4
+    const inner = width
     if (overlay.kind === 'help') {
       const body: string[] = [paint(theme, 'bold', paint(theme, 'accentSoft', 'commands')), '']
       for (const { name, description } of COMMAND_SPECS) {
@@ -2852,7 +3101,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
       body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} cancel/quit · ${paint(theme, 'text', 'ctrl-d')} quit`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
-      return panelBox(theme, 'help & shortcuts', body, width)
+      return panelRule(theme, 'help & shortcuts', body, width)
     }
     if (overlay.kind === 'models') {
       const entries = modelRows()
@@ -2889,7 +3138,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(
         `${paint(theme, 'success', '●')} ${paint(theme, 'muted', 'in use')}   ${paint(theme, 'accent', '◆')} ${paint(theme, 'muted', 'default for new sessions')}   ${paint(theme, 'accent', '▸')} ${paint(theme, 'muted', 'cursor')}`,
       )
-      return panelBox(theme, 'model', body, width, {
+      return panelRule(theme, 'model', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter model/level · e levels · d default · esc close')],
       })
     }
@@ -2914,7 +3163,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(
         `${paint(theme, 'success', '●')} ${paint(theme, 'muted', 'in use')}   ${paint(theme, 'accent', '▸')} ${paint(theme, 'muted', 'cursor · enter applies')}`,
       )
-      return panelBox(theme, 'reasoning level', body, width, {
+      return panelRule(theme, 'reasoning level', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ or 1-9 pick · enter switch · d default · ← back · esc close')],
       })
     }
@@ -2935,7 +3184,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push('')
       body.push(paint(theme, 'muted', list?.file ?? 'no patch file found'))
       if (list?.writable === false) body.push(paint(theme, 'error', 'read-only: fix the file permissions to edit'))
-      return panelBox(theme, 'providers', body, width, {
+      return panelRule(theme, 'providers', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter edit · a add · x remove · r restart · esc close')],
       })
     }
@@ -2955,7 +3204,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(paint(theme, 'muted', overlay.editing === undefined
         ? 'enter edit · s save & reload · esc back'
         : 'enter commit field · esc cancel field'))
-      return panelBox(theme, `provider · ${overlay.providerId}`, body, width, {
+      return panelRule(theme, `provider · ${overlay.providerId}`, body, width, {
         footer: [paint(theme, 'muted', overlay.editing === undefined
           ? 'enter edit · s save · esc back'
           : 'type to edit · enter commit · esc cancel')],
@@ -2976,7 +3225,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push('')
       body.push(paint(theme, 'muted', 'the new block is appended to the providers map'))
       body.push(paint(theme, 'muted', 'the API key itself stays in the environment'))
-      return panelBox(theme, 'add provider', body, width, {
+      return panelRule(theme, 'add provider', body, width, {
         footer: [paint(theme, 'muted', overlay.editing === undefined
           ? 'enter edit · s add · esc back'
           : 'type to edit · enter commit · esc cancel')],
@@ -2990,7 +3239,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const marker = selected ? paint(theme, 'accent', '▸') : ' '
         body.push(`${marker} ${paint(theme, selected ? 'text' : 'muted', option)}`)
       }
-      return panelBox(theme, overlay.title, body, width, {
+      return panelRule(theme, overlay.title, body, width, {
         footer: [paint(theme, 'muted', '↑/↓ choose · enter confirm · y restart · n later')],
       })
     }
@@ -3003,7 +3252,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         return `${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(workspace.title, 20))}  ${paint(theme, 'muted', truncate(workspace.path, Math.max(8, inner - 28)))}`
       })
       if (body.length === 0) body.push(paint(theme, 'muted', 'no workspaces'))
-      return panelBox(theme, 'workspaces', body, width, {
+      return panelRule(theme, 'workspaces', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter sessions · n new session · esc close')],
       })
     }
@@ -3027,7 +3276,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         return `${row}${' '.repeat(Math.max(1, inner - displayWidth(row) - displayWidth(right)))}${right}`
       })
       if (body.length === 0) body.push(paint(theme, 'muted', 'no sessions; press n to create one'))
-      return panelBox(theme, 'sessions', body, width, {
+      return panelRule(theme, 'sessions', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter attach · n new · esc close')],
       })
     }
@@ -3044,7 +3293,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const marker = offset === index ? paint(theme, 'accent', '▸') : ' '
         body.push(`${marker} ${paint(theme, offset === index ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
       }
-      return panelBox(theme, 'history search', body, width, {
+      return panelRule(theme, 'history search', body, width, {
         footer: [paint(theme, 'muted', 'type to filter · ↑/↓ select · enter insert · esc cancel')],
       })
     }
@@ -3058,7 +3307,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const marker = offset === index ? paint(theme, 'accent', '▸') : ' '
         body.push(`${marker} ${paint(theme, offset === index ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
       }
-      return panelBox(theme, 'rewind', body, width, {
+      return panelRule(theme, 'rewind', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter restore · esc cancel')],
       })
     }
@@ -3078,7 +3327,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (entries.length > 0 && overlay.hub.length > 0) {
         body.push('', paint(theme, 'dim', `hub: ${truncate(overlay.hub.join(':'), inner)}`))
       }
-      return panelBox(theme, 'skills', body, width, {
+      return panelRule(theme, 'skills', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ move · enter open · i insert · esc close')],
       })
     }
@@ -3089,7 +3338,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         : overlay.error !== undefined
           ? [paint(theme, 'error', overlay.error)]
           : overlay.lines.slice(overlay.scroll, overlay.scroll + height)
-      return panelBox(theme, `skill · ${truncate(overlay.name, 40)}`, body, width, {
+      return panelRule(theme, `skill · ${truncate(overlay.name, 40)}`, body, width, {
         footer: [paint(theme, 'muted', '↑/↓ scroll · backspace back · y copy · esc close')],
       })
     }
@@ -3106,7 +3355,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const id = agent.agentId.length > 8 ? agent.agentId.slice(0, 8) : agent.agentId
         body.push(`${marker} ${glyph} ${paint(theme, 'text', truncate(agent.label, Math.max(10, inner - 34)))} ${paint(theme, 'muted', `${id} · ${agent.status}${age}`)}`)
       }
-      return panelBox(theme, 'agents', body, width, {
+      return panelRule(theme, 'agents', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ move · enter open transcript · esc close')],
       })
     }
@@ -3117,14 +3366,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         : overlay.error !== undefined
           ? [paint(theme, 'error', overlay.error)]
           : overlay.lines.slice(overlay.scroll, overlay.scroll + height)
-      return panelBox(theme, `agent · ${truncate(overlay.label, 40)}`, body, width, {
+      return panelRule(theme, `agent · ${truncate(overlay.label, 40)}`, body, width, {
         footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · y copy · backspace back · esc close')],
       })
     }
     if (overlay.kind === 'detail') {
       const height = Math.max(4, rows - 12)
       const body = overlay.lines.slice(overlay.scroll, overlay.scroll + height)
-      return panelBox(theme, overlay.title, body, width, {
+      return panelRule(theme, overlay.title, body, width, {
         footer: [paint(theme, 'muted', '↑/↓ scroll · pgup/pgdn · y copy · esc close')],
       })
     }
@@ -3132,7 +3381,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const metrics = currentMetrics()
       const view = state.view
       if (view === undefined) {
-        return panelBox(theme, 'session panel', [paint(theme, 'muted', 'no session attached')], width)
+        return panelRule(theme, 'session panel', [paint(theme, 'muted', 'no session attached')], width)
       }
       const core: string[] = []
       core.push(`${paint(theme, 'muted', 'session')}  ${paint(theme, 'bold', sessionTitle())}`)
@@ -3188,9 +3437,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       todosSection.push(paint(theme, 'bold', paint(theme, 'accentSoft', 'todos')))
       todosSection.push(...renderTodoList(theme, metrics.todos, inner))
 
-      // Keep the panel inside the viewport: borders (2) + footer (2) + the
-      // header row and one slack row belong to the overlay frame, not the
-      // body. Todos are the first section to go, then the tail is clipped.
+      // Keep the panel inside the viewport: the title and rule (2) + footer (2)
+      // + the header row and one slack row belong to the overlay frame, not
+      // the body. Todos are the first section to go, then the tail is clipped.
       const maxBody = Math.max(6, rows - 7)
       let body = [...core]
       const append = (section: string[]): boolean => {
@@ -3205,60 +3454,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (hidden.length > 0 && body.length < maxBody) {
         body.push(paint(theme, 'muted', `${hidden.join(' + ')} hidden (terminal too short)`))
       }
-      return panelBox(theme, 'session panel', body, width, {
+      return panelRule(theme, 'session panel', body, width, {
         footer: [paint(theme, 'muted', 'ctrl+b / esc close · ctrl+r history · double esc rewind')],
-      })
-    }
-    if (overlay.kind === 'questions') {
-      const rows = questionRows(overlay.questions)
-      const body: string[] = []
-      for (const question of overlay.questions) {
-        const title = question.header !== undefined && question.header.length > 0 ? question.header : question.id
-        body.push(paint(theme, 'bold', paint(theme, 'accentSoft', truncate(title, Math.max(6, inner - 2)))))
-        for (const line of wrapText(question.question, Math.max(10, inner - 2))) {
-          body.push(paint(theme, 'text', line))
-        }
-        const selected = overlay.selected[question.id] ?? []
-        for (const option of question.options ?? []) {
-          const rowIndex = rows.findIndex(
-            (candidate) => candidate.qid === question.id && candidate.kind === 'option' && candidate.label === option.label,
-          )
-          const isCursor = overlay.customMode === false && rowIndex === overlay.cursor
-          const marker = question.multiSelect === true
-            ? selected.includes(option.label)
-              ? paint(theme, 'success', '☑')
-              : '☐'
-            : selected.includes(option.label)
-              ? paint(theme, 'accent', '●')
-              : '○'
-          const cursorMark = isCursor ? paint(theme, 'accent', '▸') : ' '
-          const label = paint(theme, isCursor ? 'text' : 'muted', option.label)
-          body.push(`${cursorMark}${marker} ${label}`)
-          if (isCursor && option.description !== undefined) {
-            body.push(paint(theme, 'dim', `    ${truncate(option.description, Math.max(10, inner - 4))}`))
-          }
-        }
-        const customRowIndex = rows.findIndex(
-          (candidate) => candidate.qid === question.id && candidate.kind === 'custom',
-        )
-        const custom = overlay.custom[question.id] ?? ''
-        if (overlay.customMode && rows[overlay.cursor]?.qid === question.id && customRowIndex === overlay.cursor) {
-          body.push(paint(theme, 'accent', `  ✎ ${custom}▏`))
-        } else if (custom.trim().length > 0) {
-          body.push(paint(theme, 'dim', `  ✎ ${truncate(custom, Math.max(10, inner - 4))}`))
-        } else {
-          body.push(paint(theme, 'dim', '  ✎ type a custom answer (c)'))
-        }
-        body.push('')
-      }
-      if (body.length > 0) body.pop()
-      return panelBox(theme, 'the model asks', body, width, {
-        footer: [paint(theme, 'muted', '↑↓ move · space toggle · c custom · enter submit · esc later')],
       })
     }
     if (overlay.kind !== 'approval') return []
     const pending = state.view?.pendingApproval
-    if (pending === undefined) return panelBox(theme, 'approval', [paint(theme, 'muted', 'no approval pending')], width)
+    if (pending === undefined) return panelRule(theme, 'approval', [paint(theme, 'muted', 'no approval pending')], width)
     const body = [
       `${paint(theme, 'muted', 'tool')}     ${paint(theme, 'bold', pending.toolName)}`,
       `${paint(theme, 'muted', 'reason')}   ${truncate(pending.reason ?? '(no reason)', inner - 10)}`,
@@ -3269,7 +3471,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     body.push('', paint(theme, 'warning', '[a] allow once   [r] reject   [d] details   [esc] later'))
     body.push(paint(theme, 'muted', 'A timeout, disconnect, or non-TTY frontend fails closed.'))
-    return panelBox(theme, 'approval required', body, width, { tone: 'warning' })
+    return panelRule(theme, 'approval required', body, width, { tone: 'warning' })
   }
 
   const startupLines = (): string[] => {
@@ -3303,7 +3505,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (completion === undefined) return []
     const columns = screen.size.columns
     const width = Math.max(30, Math.min(columns - 4, 80))
-    const inner = width - 4
+    const inner = width
     const title = completion.context.kind === 'command' ? 'commands' : 'files'
     const body: string[] = []
     const visibleCount = Math.max(1, Math.min(8, screen.size.rows - 14))
@@ -3322,7 +3524,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (completion.items.length === 0) {
       body.push(paint(theme, 'muted', completion.context.kind === 'command' ? 'no matching command' : 'no matching file'))
     }
-    return panelBox(theme, title, body, width, {
+    return panelRule(theme, title, body, width, {
       footer: [paint(theme, 'muted', '↑/↓ select · tab insert · enter run/select · esc close')],
     })
   }
@@ -3377,15 +3579,31 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
 
     const transcriptData = transcript()
-    const menu = completionMenuLines()
-    const footer = footerLines(metrics, now)
+    const askOverlay = state.overlay?.kind === 'questions' ? state.overlay : undefined
+    // The ask wizard owns the composer's place, not the page: the transcript
+    // stays readable above it, the way a bottom-pane wizard should.
+    const menu = askOverlay === undefined ? completionMenuLines() : []
+    const strip = statusStripLine(metrics)
+    const lastRange = transcriptData.ranges.at(-1)
+    // The turn summary owns the last transcript row; the job/todo chip rides
+    // its right edge instead of taking a footer row of its own.
+    const mergeStrip = strip.length > 0
+      && viewport.scrollOffset === 0
+      && transcriptData.lines.length > 0
+      && lastRange !== undefined
+      && lastRange.block.kind === 'turnend'
+      && lastRange.end === transcriptData.lines.length
+      && displayWidth(transcriptData.lines.at(-1) ?? '') + displayWidth(strip) + 1 <= columns
+    const footer = footerLines(metrics, now, strip, mergeStrip)
     const usage = usageRailLine(metrics, now)
     const speed = speedFor(metrics, now)
     const showSpeed = metrics.turnStartedAt !== undefined || state.tpsSamples.length > 0
-    const composer = renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns), {
-      ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
-      ...(showSpeed ? { tps: speed } : {}),
-    })
+    const composer = askOverlay !== undefined
+      ? askWizard(askOverlay, columns)
+      : renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns), {
+          ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
+          ...(showSpeed ? { tps: speed } : {}),
+        })
     const noticeRows = notice === undefined ? 0 : 1
     const total = transcriptData.lines.length
     lastTranscriptTotal = total
@@ -3415,15 +3633,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     )
     lastBodyHeight = bodyHeight
     const visible = viewport.visible(transcriptData.lines, bodyHeight)
+    const body = visible.lines.slice()
+    if (mergeStrip && body.length > 0) {
+      const left = body.at(-1) ?? ''
+      body[body.length - 1] = `${left}${' '.repeat(Math.max(1, columns - displayWidth(left) - displayWidth(strip)))}${strip}`
+    }
     lines.push(...header)
-    for (let index = 0; index < visible.lines.length; index += 1) {
-      const line = visible.lines[index] ?? ''
+    for (let index = 0; index < body.length; index += 1) {
+      const line = body[index] ?? ''
       const absolute = visible.start + index
       const selected =
         focused !== undefined && focused.kind === 'block' && absolute >= focused.start && absolute < focused.end
       lines.push(selected ? selectionBand(line) : line)
     }
-    for (let index = visible.lines.length; index < bodyHeight; index += 1) lines.push('')
+    for (let index = body.length; index < bodyHeight; index += 1) lines.push('')
     if (queuedRows.length > 0) lines.push(...queuedRows)
     if (notice !== undefined) {
       const tone: ThemeStyle = !toastActive && state.error !== undefined ? 'error' : 'warning'
@@ -3438,7 +3661,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     lines.push(...menu)
     const composerStart = lines.length
     lines.push(...composer.lines)
-    cursor = { row: composerStart + composer.cursorRow + 1, column: composer.cursorColumn }
+    if (askOverlay === undefined) {
+      cursor = { row: composerStart + (composer as { cursorRow: number }).cursorRow + 1, column: (composer as { cursorColumn: number }).cursorColumn }
+    } else if (composer.cursorRow !== undefined) {
+      cursor = { row: composerStart + composer.cursorRow + 1, column: composer.cursorColumn ?? 1 }
+    }
     lines.push(usage)
     screen.draw(lines.slice(0, rows), cursor)
     if (state.toast !== undefined && state.toast.until <= now) state.toast = undefined

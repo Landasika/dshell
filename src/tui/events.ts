@@ -34,6 +34,8 @@ export interface Block {
   steps?: number
   /** One-line call signature for a tool block, e.g. `Bash(ls -la)`. */
   headline?: string
+  /** Raw call arguments, kept for viewers that render them structurally. */
+  input?: unknown
 }
 
 /** Local `HH:MM`, the finish time shown next to a turn's duration. */
@@ -128,6 +130,15 @@ export function summarizeTool(name: string, rawArguments: unknown): string {
         : ''
     return truncate(path, 180)
   }
+  if (name === 'ask_user_question') {
+    // The raw `questions=[{…}]` dump is unreadable; lead with what was asked.
+    const questions = askedQuestions(args)
+    const first = questions[0]
+    if (first === undefined) return ''
+    const options = first.options?.map((option) => option.label).join(' / ') ?? ''
+    const more = questions.length > 1 ? ` (+${String(questions.length - 1)} more)` : ''
+    return truncate(options.length > 0 ? `${first.question} · ${options}${more}` : `${first.question}${more}`, 180)
+  }
   const compact = Object.entries(args)
     .slice(0, 3)
     .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`)
@@ -205,6 +216,68 @@ export function toolSignature(name: string, rawArguments: unknown): string {
   const primary = primaryArgument(name, args).replace(/\s+/g, ' ').trim()
   if (primary.length === 0) return label
   return `${label}(${truncate(primary, 300)})`
+}
+
+/**
+ * Human label for a tool block: the call signature (`Ask(which?)`, `Bash(ls)`)
+ * when one was built, otherwise the friendly tool name. The focus hint and the
+ * detail panel use this so they never surface `ask_user_question` or a raw
+ * argument dump.
+ */
+export function toolLabel(block: Block): string {
+  if (block.headline !== undefined && block.headline.length > 0) return block.headline
+  const name = block.toolName ?? block.title ?? 'tool'
+  return TOOL_LABELS[name] ?? name
+}
+
+/** The question rows of an `ask_user_question` call, for the detail panel. */
+export function askQuestionLines(rawArguments: unknown): string[] | undefined {
+  const questions = askedQuestions(rawArguments)
+  if (questions.length === 0) return undefined
+  const lines: string[] = []
+  for (const [index, question] of questions.entries()) {
+    if (index > 0) lines.push('')
+    lines.push(question.header ?? question.id)
+    lines.push(question.question)
+    const multi = question.multiSelect === true
+    if (question.options !== undefined && question.options.length > 0) {
+      lines.push(`· ${multi ? 'checkbox, space toggles' : 'one choice'}`)
+      for (const option of question.options) {
+        lines.push(`  ${multi ? '☐' : '○'} ${option.label}${option.description === undefined ? '' : ` — ${option.description}`}`)
+      }
+    } else {
+      lines.push('· free text')
+    }
+  }
+  return lines
+}
+
+/**
+ * `{"answers":[{"id":"pkg","selected":["pnpm"]}]}` as `pkg → pnpm` rows. Returns
+ * undefined when the payload is not an answer batch, so callers can fall back to
+ * the raw tool output.
+ */
+export function askAnswerLines(output: string): string[] | undefined {
+  let parsed: Json
+  try {
+    parsed = JSON.parse(output) as Json
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || !Array.isArray(parsed.answers)) return undefined
+  const lines: string[] = []
+  for (const raw of parsed.answers as unknown[]) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const answer = raw as Json
+    const id = typeof answer.id === 'string' ? answer.id : 'answer'
+    const selected = Array.isArray(answer.selected)
+      ? (answer.selected as unknown[]).filter((item): item is string => typeof item === 'string')
+      : []
+    const custom = typeof answer.custom === 'string' && answer.custom.trim().length > 0 ? answer.custom.trim() : undefined
+    const value = [...selected, ...(custom === undefined ? [] : [custom])].join(', ')
+    lines.push(`${id} → ${value.length > 0 ? value : '(no answer)'}`)
+  }
+  return lines.length > 0 ? lines : undefined
 }
 
 function toolResultText(data: Json): string {
@@ -382,6 +455,7 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
           callId,
           body: summarizeTool(name, data.arguments ?? data.input),
           headline: toolSignature(name, data.arguments ?? data.input),
+          input: data.arguments ?? data.input,
         }
         blocks.push(block)
         callBlocks.set(callId, block)
@@ -403,11 +477,16 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
           target.failed = failed
           target.detail = output
         } else {
+          // The call was cleared or never seen. An answer batch still names
+          // itself instead of dumping JSON under a generic "tool result".
+          const answers = askAnswerLines(output)
           blocks.push({
             kind: 'tool',
-            title: 'tool result',
+            title: answers === undefined ? 'tool result' : 'Ask',
+            ...(answers === undefined ? {} : { toolName: 'ask_user_question', headline: 'Ask' }),
             callId,
-            body: output,
+            body: answers === undefined ? output : 'answers received',
+            detail: output,
             failed,
           })
         }

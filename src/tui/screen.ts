@@ -162,6 +162,9 @@ export class TerminalScreen {
 /** Scroll window over rendered lines; keeps a tail view unless the user scrolled up. */
 export class Viewport {
   private offset = 0
+  /** Transcript length and body height of the last painted frame. */
+  private lastTotal = 0
+  private lastHeight = 0
 
   get scrollOffset(): number {
     return this.offset
@@ -194,9 +197,19 @@ export class Viewport {
   }
 
   visible(all: readonly string[], height: number): { lines: string[]; start: number } {
-    const max = Math.max(0, all.length - height)
+    const total = all.length
+    // A reader who scrolled up is anchored to the first visible line: rows that
+    // land below the window (or room the composer takes away) must move the
+    // offset, never the text under their eyes. Without this a streaming turn
+    // drags the window toward the tail while the user is reading history.
+    if (this.offset > 0 && (total !== this.lastTotal || height !== this.lastHeight)) {
+      this.offset = Math.max(0, this.offset + (total - this.lastTotal) - (height - this.lastHeight))
+    }
+    this.lastTotal = total
+    this.lastHeight = height
+    const max = Math.max(0, total - height)
     this.offset = Math.min(this.offset, max)
-    const start = Math.max(0, all.length - height - this.offset)
+    const start = Math.max(0, total - height - this.offset)
     return { lines: all.slice(start, start + height), start }
   }
 }
