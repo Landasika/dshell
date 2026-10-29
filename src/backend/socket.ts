@@ -154,11 +154,15 @@ export class SocketBackend implements DshellBackend {
     }
   }
 
-  async listSkills(cwd?: string): Promise<SkillCatalog> {
+  async listSkills(cwd?: string, sessionId?: string): Promise<SkillCatalog> {
     const connection = this.requireControl()
     try {
       const message = await connection.request<SkillsMessage>(
-        { type: 'skills/list', ...(cwd === undefined ? {} : { cwd }) },
+        {
+          type: 'skills/list',
+          ...(cwd === undefined ? {} : { cwd }),
+          ...(sessionId === undefined ? {} : { sessionId }),
+        },
         (candidate) => candidate.type === 'skills',
         20_000,
       )
@@ -168,11 +172,16 @@ export class SocketBackend implements DshellBackend {
     }
   }
 
-  async getSkill(name: string, cwd?: string): Promise<string> {
+  async getSkill(name: string, cwd?: string, sessionId?: string): Promise<string> {
     const connection = this.requireControl()
     try {
       const message = await connection.request<SkillMessage>(
-        { type: 'skills/get', name, ...(cwd === undefined ? {} : { cwd }) },
+        {
+          type: 'skills/get',
+          name,
+          ...(cwd === undefined ? {} : { cwd }),
+          ...(sessionId === undefined ? {} : { sessionId }),
+        },
         (candidate) => candidate.type === 'skill',
         20_000,
       )

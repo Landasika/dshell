@@ -192,6 +192,8 @@ export interface SkillEntry {
 
 export interface SkillsMessage {
   type: 'skills'
+  /** True when the catalog was read through a session's agent scope. */
+  scoped?: boolean
   /** Workspace the catalog was read for (project roots are cwd sensitive). */
   cwd?: string
   /** Skill hub directories the Host is configured to serve. */
@@ -381,8 +383,8 @@ export type ClientMessage =
     }
   | { type: 'approval/answer'; requestId: string; outcome: ApprovalOutcome }
   | { type: 'question/answer'; sessionId: string; callId: string; answers: QuestionAnswer[] }
-  | { type: 'skills/list'; cwd?: string }
-  | { type: 'skills/get'; name: string; cwd?: string }
+  | { type: 'skills/list'; cwd?: string; sessionId?: string }
+  | { type: 'skills/get'; name: string; cwd?: string; sessionId?: string }
   | { type: 'model/catalog' }
   | { type: 'provider/list' }
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }

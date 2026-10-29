@@ -5,6 +5,12 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
+### Fixed
+
+- `/skills` now reads the catalog through the session's agent scope, so
+  DSH-native skills (`~/.agents/skills`, preset-mounted discovery) show up
+  instead of an empty list.
+
 ### Added
 
 - `/skills` browses the Host's `ctx.skills` catalog: every source, with the

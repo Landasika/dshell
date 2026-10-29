@@ -346,9 +346,17 @@ DSHELL_SKILL_HUB      colon-separated extra skill roots (see below)
 ### Skill hub
 
 `/skills` lists whatever the Host's `ctx.skills` registry serves: project
-skills (`<repo>/.dsh/skills`), user skills (`$DSH_HOME/skills`), bundled
-skills, and the **hub** — a shelf of skills shared by every project and
-profile. The hub defaults to `$DSH_HOME/dshell-skills` and is configurable
+skills (`<repo>/.dsh/skills`), user skills (`$DSH_HOME/skills` and
+`~/.agents/skills` — where DSH itself keeps `blackboard` and friends),
+bundled skills, skills a preset mounts for the session's agent, and the
+**hub** — a shelf of skills shared by every project and profile.
+
+The read goes through the session's agent, because the Web profile mounts
+local discovery behind its presets: a host-level-only read would come back
+empty even though the model can see those skills. Resuming that agent is the
+same work opening the session in the Web UI does, and the Host caches it — the
+session row then shows `● live`. When a session cannot be resumed (another
+frontend owns it), `/skills` still lists the hub and host-wide providers. The hub defaults to `$DSH_HOME/dshell-skills` and is configurable
 without touching DSH:
 
 ```text

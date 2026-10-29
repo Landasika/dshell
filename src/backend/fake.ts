@@ -181,7 +181,7 @@ export class FakeBackend implements DshellBackend {
     return selected
   }
 
-  async listSkills(): Promise<SkillCatalog> {
+  async listSkills(_cwd?: string, _sessionId?: string): Promise<SkillCatalog> {
     this.assertConnected()
     return {
       hub: ['/fake/dshell-skills'],
@@ -209,7 +209,7 @@ export class FakeBackend implements DshellBackend {
     }
   }
 
-  async getSkill(name: string): Promise<string> {
+  async getSkill(name: string, _cwd?: string, _sessionId?: string): Promise<string> {
     this.assertConnected()
     if (name === 'release-checklist') return '# Release checklist\n\n1. pnpm typecheck\n2. pnpm test\n3. verify-pack.sh'
     if (name === 'triage-issues') return '# Triage\n\nSort by impact first.'

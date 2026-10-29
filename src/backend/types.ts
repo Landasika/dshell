@@ -200,8 +200,8 @@ export interface DshellBackend {
   saveDefaultModel(selection: ModelSelection): Promise<ModelSelection>
 
   /** Read the providers declared in the Host's patch file. */
-  listSkills(cwd?: string): Promise<SkillCatalog>
-  getSkill(name: string, cwd?: string): Promise<string>
+  listSkills(cwd?: string, sessionId?: string): Promise<SkillCatalog>
+  getSkill(name: string, cwd?: string, sessionId?: string): Promise<string>
   providerList(): Promise<ProviderList>
   /** Rewrite one provider field; takes effect after the Host restarts. */
   updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>

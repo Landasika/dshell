@@ -745,6 +745,21 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
   }
 
+  /** The agent whose scope owns this session's catalog, when it can be resumed. */
+  const skillScope = async (rawSessionId: unknown): Promise<object | undefined> => {
+    const sessionId = typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : undefined
+    if (sessionId === undefined) return undefined
+    try {
+      const agent = await liveAgent(sessionId)
+      return agent
+    } catch (error) {
+      console.error('[dshell-host] skill scope failed:', error)
+      // A catalog read must not fail because the session cannot resume; the
+      // global layer (hub and deployment providers) is still worth showing.
+      return undefined
+    }
+  }
+
   const listSkills = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
     const registry = skillRegistry()
     if (registry === undefined) {
@@ -757,10 +772,15 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     const cwd = typeof message.cwd === 'string' && message.cwd.length > 0 ? message.cwd : undefined
+    // Skill providers may live in the agent's own scope (the Web profile mounts
+    // local discovery behind the preset), so read the catalog the way the model
+    // does: through the session's agent. Resuming it is the same work opening
+    // the session in the Web UI does, and it is cached by the Host.
+    const scope = await skillScope(message.sessionId)
     let skills: SkillEntry[]
     try {
       invalidateSkillCatalog?.()
-      const summaries = await registry.list(cwd === undefined ? {} : { cwd })
+      const summaries = await registry.list({ ...(cwd === undefined ? {} : { cwd }), ...(scope === undefined ? {} : { scope }) })
       skills = summaries.map(toSkillEntry)
     } catch (error) {
       sendError(socket, {
@@ -771,7 +791,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    jsonLine(socket, { type: 'skills', ...(cwd === undefined ? {} : { cwd }), hub: hubDirs, skills })
+    jsonLine(socket, {
+      type: 'skills',
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(scope === undefined ? {} : { scoped: true }),
+      hub: hubDirs,
+      skills,
+    })
   }
 
   const getSkill = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
@@ -787,8 +813,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     const cwd = typeof message.cwd === 'string' && message.cwd.length > 0 ? message.cwd : undefined
+    const scope = await skillScope(message.sessionId)
     try {
-      const skill = await registry.get(name, cwd === undefined ? {} : { cwd })
+      const skill = await registry.get(name, { ...(cwd === undefined ? {} : { cwd }), ...(scope === undefined ? {} : { scope }) })
       if (skill === undefined) {
         sendError(socket, {
           type: 'error',

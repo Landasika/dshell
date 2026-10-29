@@ -1445,7 +1445,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.overlay = { kind: 'skills', index: 0, hub: [], entries: [] }
     schedule()
     try {
-      const catalog = await backend.listSkills(state.view?.header.cwd ?? options.cwd)
+      const catalog = await backend.listSkills(
+        state.view?.header.cwd ?? options.cwd,
+        state.view?.sessionId,
+      )
       const current = state.overlay
       if (current !== null && current.kind === 'skills') {
         state.overlay = { ...current, hub: catalog.hub, entries: catalog.skills, index: Math.min(current.index, Math.max(0, catalog.skills.length - 1)) }
@@ -1461,7 +1464,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.overlay = { kind: 'skillView', name, lines: [], scroll: 0, loading: true }
     schedule()
     try {
-      const content = await backend.getSkill(name, state.view?.header.cwd ?? options.cwd)
+      const content = await backend.getSkill(
+        name,
+        state.view?.header.cwd ?? options.cwd,
+        state.view?.sessionId,
+      )
       const width = Math.max(24, screen.size.columns - 6)
       const lines = renderMarkdown(content, width, theme)
       const current = state.overlay

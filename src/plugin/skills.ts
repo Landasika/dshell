@@ -55,8 +55,8 @@ export interface SkillCandidateLike {
 }
 
 export interface SkillsRegistryLike {
-  list(options?: { cwd?: string }): Promise<readonly SkillSummaryLike[]>
-  get(name: string, options?: { cwd?: string }): Promise<SkillDefinitionLike | undefined>
+  list(options?: { cwd?: string; scope?: object }): Promise<readonly SkillSummaryLike[]>
+  get(name: string, options?: { cwd?: string; scope?: object }): Promise<SkillDefinitionLike | undefined>
   registerProvider?(
     create: (control: SkillProviderControlLike) => {
       name: string
