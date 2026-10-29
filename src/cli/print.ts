@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { stdin } from 'node:process'
 
 import {
@@ -71,14 +72,48 @@ async function readPrompt(options: PrintOptions): Promise<string> {
   return text.replace(/\r\n/g, '\n').replace(/\n+$/, '')
 }
 
+function realPathOrNull(path: string): string | null {
+  try {
+    return realpathSync(path)
+  } catch {
+    return null
+  }
+}
+
+/** Same directory after symlink resolution; null never equals anything. */
+function sameDirectory(left: string | undefined, right: string | null): boolean {
+  if (left === undefined || right === null) return false
+  return realPathOrNull(left) === right
+}
+
+/**
+ * Pick the session a one-shot prompt belongs to.
+ *
+ * Contract: `--session` targets an explicit session, `--new` always creates,
+ * and without either, an existing session is reused only inside the current
+ * working directory's workspace — a prompt run in project B must never land
+ * in project A's agent just because A's session is live or newer.
+ */
 async function chooseSession(
   backend: SocketBackend,
   options: PrintOptions,
 ): Promise<{ handle: SessionHandle; created: boolean }> {
   if (options.sessionId !== undefined) {
+    if (options.create === true) {
+      throw new DshellError('BAD_REQUEST', '--session and --new are mutually exclusive')
+    }
+    if (options.cwd !== undefined || options.workspaceId !== undefined) {
+      throw new DshellError(
+        'BAD_REQUEST',
+        '--session targets one session; --cwd/--workspace cannot re-scope it (drop them, or use --new)',
+      )
+    }
     return { handle: await backend.openSession(options.sessionId), created: false }
   }
   if (options.create === true) {
+    if (options.cwd !== undefined && options.workspaceId !== undefined) {
+      throw new DshellError('BAD_REQUEST', '--new accepts --cwd or --workspace, not both')
+    }
     return {
       handle: await backend.createSession({
         ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
@@ -87,9 +122,23 @@ async function chooseSession(
       created: true,
     }
   }
+  if (options.cwd !== undefined && options.workspaceId !== undefined) {
+    throw new DshellError('BAD_REQUEST', 'choose --cwd or --workspace for the session scope, not both')
+  }
+
+  const scopePath = realPathOrNull(options.cwd ?? process.cwd())
+  if (options.workspaceId === undefined && scopePath === null) {
+    throw new DshellError('BAD_REQUEST', `cannot resolve the working directory: ${options.cwd ?? process.cwd()}`)
+  }
   const sessions: SessionSummary[] = await backend.listSessions()
-  const sorted = [...sessions].sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))
-  const preferred = sorted.find((session) => session.live === true) ?? sorted[0]
+  const scoped = sessions.filter((session) => (
+    options.workspaceId !== undefined
+      ? session.workspaceId === options.workspaceId
+      : sameDirectory(session.cwd, scopePath)
+  ))
+  const preferred = [...scoped].sort(
+    (left, right) => (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0),
+  )[0]
   if (preferred !== undefined) {
     return { handle: await backend.openSession(preferred.sessionId), created: false }
   }

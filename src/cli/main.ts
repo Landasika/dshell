@@ -59,6 +59,10 @@ Options:
   -h, --help          show this help
   -V, --version       show the version
 
+Session selection in print mode: --session targets one session, --new always
+creates; without either, the newest session of the current directory's
+workspace is reused and none is ever borrowed from another project.
+
 Environment:
   DSH_HOME            DSH home directory (default: ~/.dsh)
   DSHELL_SOCKET       control socket override
