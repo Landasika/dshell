@@ -16,22 +16,82 @@ const { apply } = await import('../dist/plugin/index.js')
 
 function createFakeCtx() {
   const agents = new Map()
+  const sessions = new Map() // sessionId -> { header, events, live, persisted }
+  const workspaces = new Map() // path -> workspace record
   const listeners = new Map()
   const disposers = []
+  let workspaceSeq = 0
+
+  const recordOf = (sessionId) => sessions.get(sessionId)
+  const units = new Map()
+  const makeHandle = (sessionId) => {
+    let agent = agents.get(sessionId)
+    if (agent === undefined) {
+      const unit = makeAgent(sessionId)
+      agents.set(sessionId, unit.agent)
+      units.set(sessionId, unit)
+      agent = unit.agent
+    }
+    return {
+      agent,
+      dispose: async () => {
+        handles.delete(sessionId)
+      },
+    }
+  }
+  const handles = new Map()
+
   const ctx = {
     agents: {
       get: (sessionId) => agents.get(sessionId),
       list: () => [...agents.values()],
-      resume: async () => {
-        throw new Error('resume is not part of these tests')
+      resume: async ({ resumeSessionId }) => {
+        const handle = makeHandle(resumeSessionId)
+        handles.set(resumeSessionId, handle)
+        return handle
       },
-      create: async () => {
-        throw new Error('create is not part of these tests')
+      create: async ({ sessionId, meta }) => {
+        sessions.set(sessionId, {
+          header: { id: sessionId, cwd: meta?.cwd ?? '/work', createdAt: Date.now() },
+          events: [],
+          live: true,
+          persisted: true,
+        })
+        const handle = makeHandle(sessionId)
+        handles.set(sessionId, handle)
+        return handle
       },
     },
     sessions: {},
     sessionQuery: {
-      listSessions: async () => [],
+      listSessions: async () => [...sessions.values()],
+      readSession: async (sessionId) => {
+        const record = sessions.get(sessionId)
+        if (record === undefined) throw Object.assign(new Error(`session ${sessionId} not found`), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+        return { session: record.header, events: [...record.events] }
+      },
+      observeSession: async () => ({
+        projections: { values: {} },
+        [Symbol.dispose]() {},
+      }),
+    },
+    workspaceRegistry: {
+      list: () => [...workspaces.values()],
+      get: (id) => [...workspaces.values()].find((workspace) => workspace.id === id),
+      create: async (path, title) => {
+        workspaceSeq += 1
+        const workspace = {
+          id: `workspace:${path}`,
+          path,
+          title: title ?? path,
+          sessionIds: [],
+          attachSession: async (sessionId) => {
+            workspace.sessionIds.push(sessionId)
+          },
+        }
+        workspaces.set(path, workspace)
+        return workspace
+      },
     },
     on: (event, listener) => {
       const list = listeners.get(event) ?? []
@@ -43,15 +103,21 @@ function createFakeCtx() {
     },
     effect: (setup) => {
       const off = setup()
-      if (typeof off === 'function' || (off && typeof off.then === 'function')) disposers.push(off)
+      if (off !== undefined) disposers.push(off)
     },
   }
-  return { ctx, agents, listeners, disposers }
+  /** Invoke the listeners the plugin registered, like DSH waterfalls would. */
+  const emit = (event, ...args) => Promise.all(
+    (listeners.get(event) ?? []).map((listener) => listener(...args)),
+  )
+  return { ctx, agents, sessions, workspaces, listeners, disposers, emit, handles, recordOf, units }
 }
 
 /** An agent with a real, manipulable inbox — enough for queue commands. */
 function makeAgent(sessionId) {
   const state = { cancelled: 0 }
+  const sent = []
+  const sentMessages = []
   const inbox = {
     nextTurn: [],
     nextStep: [],
@@ -65,17 +131,21 @@ function makeAgent(sessionId) {
       this.nextStep = swap(this.nextStep)
     },
   }
+  const record = (mode) => (message) => {
+    sent.push({ mode, text: message.content?.[0]?.text ?? '' })
+    sentMessages.push({ mode, message })
+  }
   const agent = {
     id: sessionId,
     session: { id: sessionId },
     inbox,
-    followup() {},
-    steer() {},
+    followup: record('followup'),
+    steer: record('steer'),
     cancel() {
       state.cancelled += 1
     },
   }
-  return { agent, state, inbox }
+  return { agent, state, inbox, sent, sentMessages }
 }
 
 class NdjClient {
@@ -149,16 +219,27 @@ class NdjClient {
   }
 }
 
-async function startHarness(t) {
+async function startHarness(t, config = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-plugin-'))
   const socketPath = join(directory, 'dshell.sock')
   const harness = createFakeCtx()
-  await apply(harness.ctx, { socketPath })
+  await apply(harness.ctx, { socketPath, ...config })
   t.after(async () => {
     for (const disposer of harness.disposers) await disposer?.()
     await rm(directory, { recursive: true, force: true })
   })
   return { ...harness, socketPath }
+}
+
+/** A persisted session with events, registered for list/read/attach. */
+function makeSession(harness, sessionId, events = [], header = {}) {
+  harness.sessions.set(sessionId, {
+    header: { id: sessionId, cwd: '/work', createdAt: 1_000, ...header },
+    events,
+    live: true,
+    persisted: true,
+  })
+  return harness.sessions.get(sessionId)
 }
 
 test('hello completes the handshake against the real plugin', async (t) => {
@@ -174,9 +255,6 @@ test('hello completes the handshake against the real plugin', async (t) => {
 
 test('queue/edit rewrites one prompt and leaves it queued (DS-001)', async (t) => {
   const { agents, socketPath } = await startHarness(t)
-  const { inbox } = makeAgent('s1')
-  agents.set('s1', makeAgent('s1').agent)
-  // Reuse one inbox instance so assertions can see the plugin's mutations.
   const unit = makeAgent('s1')
   agents.set('s1', unit.agent)
   unit.inbox.nextTurn.push({ id: 'r1', role: 'user', content: [{ type: 'text', text: 'old text' }], source: { kind: 'user' } })
@@ -274,4 +352,252 @@ test('queue commands reject unknown, empty, and consumed items with a single err
   replies = await client.burst()
   assert.equal(replies.length, 1)
   assert.equal(replies[0]?.code, 'QUEUE_ITEM_NOT_FOUND')
+})
+
+test('list returns persisted sessions and skips subagent children', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [], { title: 'one' })
+  makeSession(harness, 's2', [], { title: 'child', origin: 'subagent', parentSession: 's1' })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'list' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'sessions')
+  assert.deepEqual(reply.sessions.map((session) => session.sessionId), ['s1'])
+})
+
+test('session/create makes an agent, a workspace, and watches it', async (t) => {
+  const harness = await startHarness(t)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/create', cwd: '/work/project' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'session-created')
+  assert.match(reply.sessionId, /^session-/)
+  assert.equal(reply.workspaceId, 'workspace:/work/project')
+  assert.equal(reply.header.cwd, '/work/project')
+  assert.equal(harness.agents.has(reply.sessionId), true)
+  // The new session is watched, so broadcasts flow without another attach.
+  await harness.emit('session/event', { id: reply.sessionId }, { type: 'turn/start', seq: 1, data: {} })
+  const event = await client.next()
+  assert.equal(event.type, 'event')
+  assert.equal(event.sessionId, reply.sessionId)
+})
+
+test('attach replays history and reports a running turn', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [
+    { type: 'turn/start', seq: 1, data: {} },
+    { type: 'user/message', seq: 2, data: {} },
+  ])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  const attached = await client.next()
+  assert.equal(attached.type, 'attached')
+  assert.equal(attached.cursor, 2)
+  assert.equal(attached.events.length, 2)
+  const status = await client.next()
+  assert.equal(status.type, 'status')
+  assert.equal(status.status, 'running')
+
+  client.send({ type: 'attach', sessionId: 'ghost' })
+  const missing = await client.next()
+  assert.equal(missing.type, 'error')
+  assert.equal(missing.code, 'SESSION_NOT_FOUND')
+})
+
+test('session/history pages backwards with hasMore', async (t) => {
+  const harness = await startHarness(t)
+  const events = Array.from({ length: 8 }, (_, index) => ({ type: 'user/message', seq: index + 1, data: {} }))
+  makeSession(harness, 's1', events)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'session/history', sessionId: 's1', limit: 3 })
+  let page = await client.next()
+  assert.deepEqual(page.events.map((event) => event.seq), [6, 7, 8])
+  assert.equal(page.hasMore, true)
+
+  client.send({ type: 'session/history', sessionId: 's1', limit: 3, before: 6 })
+  page = await client.next()
+  assert.deepEqual(page.events.map((event) => event.seq), [3, 4, 5])
+  assert.equal(page.hasMore, true)
+
+  client.send({ type: 'session/history', sessionId: 's1', limit: 3, before: 3 })
+  page = await client.next()
+  assert.deepEqual(page.events.map((event) => event.seq), [1, 2])
+  assert.equal(page.hasMore, false)
+})
+
+test('prompt acks, queues or steers, and resumes a cold agent', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const unit = makeAgent('s1')
+  harness.agents.set('s1', unit.agent)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'prompt', sessionId: 's1', text: 'hello', mode: 'queue', requestId: 'req-1' })
+  const accepted = await client.next()
+  assert.equal(accepted.type, 'accepted')
+  assert.equal(accepted.requestId, 'req-1')
+  assert.equal(accepted.mode, 'queue')
+  assert.deepEqual(unit.sent, [{ mode: 'followup', text: 'hello' }])
+
+  client.send({ type: 'prompt', sessionId: 's1', text: 'steer me', mode: 'steer' })
+  const steered = await client.next()
+  assert.equal(steered.mode, 'steer')
+  assert.deepEqual(unit.sent, [
+    { mode: 'followup', text: 'hello' },
+    { mode: 'steer', text: 'steer me' },
+  ])
+
+  // A session without a live agent is resumed through the Host.
+  makeSession(harness, 's2', [])
+  client.send({ type: 'prompt', sessionId: 's2', text: 'wake up' })
+  const resumed = await client.next()
+  assert.equal(resumed.type, 'accepted')
+  assert.equal(harness.agents.has('s2'), true)
+  // The ack is written before the Agent is woken; give the followup a moment.
+  for (let index = 0; index < 50 && (harness.units.get('s2')?.sent.length ?? 0) === 0; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.deepEqual(harness.units.get('s2')?.sent, [{ mode: 'followup', text: 'wake up' }])
+})
+
+test('durable events, streams, and status fan out to every watcher', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const first = new NdjClient(harness.socketPath)
+  const second = new NdjClient(harness.socketPath)
+  t.after(() => first.destroy())
+  t.after(() => second.destroy())
+  for (const client of [first, second]) {
+    client.send({ type: 'hello', protocol: 2 })
+    await client.next()
+    client.send({ type: 'attach', sessionId: 's1' })
+    await client.next()
+    await client.next() // status after attach
+  }
+
+  await harness.emit('session/event', { id: 's1' }, { type: 'assistant/message', seq: 9, data: {} })
+  await harness.emit('agent/assistant-stream', { agent: { id: 's1', session: { id: 's1' } }, frame: { chunk: 'x' } })
+  await harness.emit('agent/status', { agent: { id: 's1', session: { id: 's1' } }, status: 'running' })
+
+  for (const client of [first, second]) {
+    assert.equal((await client.next()).type, 'event')
+    assert.equal((await client.next()).type, 'stream')
+    assert.equal((await client.next()).type, 'status')
+  }
+})
+
+test('approval waterfall: a CLI watcher can answer while next() waits', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  const never = new Promise(() => {})
+  const outcomes = harness.emit('approval/request', {
+    agent: { session: { id: 's1' } },
+    toolName: 'bash',
+    reason: 'test approval',
+    signal: new AbortController().signal,
+  }, () => never)
+
+  const request = await client.next()
+  assert.equal(request.type, 'approval-request')
+  assert.equal(request.toolName, 'bash')
+
+  client.send({ type: 'approval/answer', requestId: request.requestId, outcome: 'allowed-once' })
+  const resolved = await client.next()
+  assert.equal(resolved.type, 'approval-resolved')
+  assert.equal(resolved.outcome, 'allowed-once')
+  assert.equal(resolved.source, 'cli')
+  assert.equal((await outcomes)[0], 'allowed-once')
+
+  // A late second answer is rejected, not silently ignored.
+  client.send({ type: 'approval/answer', requestId: request.requestId, outcome: 'rejected' })
+  const late = await client.next()
+  assert.equal(late.type, 'error')
+  assert.equal(late.code, 'APPROVAL_NOT_PENDING')
+})
+
+test('approval without watchers defers straight to the Web answerer', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const outcomes = await harness.emit('approval/request', {
+    agent: { session: { id: 's1' } },
+    toolName: 'bash',
+  }, async () => 'rejected')
+  assert.equal(outcomes[0], 'rejected')
+})
+
+test('question/answer steers a user-question-reply message (plugin level)', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const unit = makeAgent('s1')
+  harness.agents.set('s1', unit.agent)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({
+    type: 'question/answer',
+    sessionId: 's1',
+    callId: 'q1',
+    answers: [{ id: 'pkg', selected: ['A'], custom: 'note' }],
+  })
+  const reply = await client.next()
+  assert.equal(reply.type, 'question-answered')
+  assert.equal(reply.callId, 'q1')
+  assert.equal(unit.sentMessages.length, 1)
+  const steered = unit.sentMessages[0]
+  assert.equal(steered.mode, 'steer')
+  const message = steered.message
+  assert.equal(message.source.kind, 'user-question-reply')
+  assert.equal(message.source.callId, 'q1')
+  const payload = JSON.parse(message.content[0].text)
+  assert.deepEqual(payload.answers, [{ id: 'pkg', selected: ['A'], custom: 'note' }])
+  assert.equal(payload.callId, 'q1')
+})
+
+test('dispose unlinks the socket and settles pending approvals unavailable', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 's1' })
+  await client.next()
+  await client.next()
+
+  const never = new Promise(() => {})
+  const outcomes = harness.emit('approval/request', {
+    agent: { session: { id: 's1' } },
+    toolName: 'bash',
+  }, () => never)
+  await client.next() // approval-request
+
+  for (const disposer of harness.disposers) await disposer?.()
+  assert.equal((await outcomes)[0], 'unavailable')
+  await client.closed
+  await assert.rejects(() => import('node:fs').then((fs) => fs.promises.access(harness.socketPath)))
 })
