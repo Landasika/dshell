@@ -2367,3 +2367,66 @@ test('enter opens the focused block even after scrolling up', async () => {
     await app
   }
 })
+
+test('git polling survives the activity tick stopping (DS-008)', async (t) => {
+  const { EventEmitter } = await import('node:events')
+  const { execFileSync } = await import('node:child_process')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  const repo = await mkdtemp(join(tmpdir(), 'dshell-git-'))
+  t.after(async () => {
+    await rm(repo, { recursive: true, force: true })
+  })
+  execFileSync('git', ['-C', repo, 'init', '-q', '-b', 'main'])
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: repo }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: repo, resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    throw new Error(`timed out; tail=${JSON.stringify(output.text.slice(-300))}`)
+  }
+
+  try {
+  // The boot refresh shows the initial branch.
+  await waitFor(() => output.text.includes('main'))
+
+  // Change the branch, then run one running→idle tick cycle: the buggy
+  // stop branch killed the Git interval here, freezing the footer.
+  execFileSync('git', ['-C', repo, 'checkout', '-q', '-b', 'feature-x'])
+  backend.emit('s1', { type: 'turn/start', seq: 2, data: { turn: 1 } })
+  await waitFor(() => output.text.includes('running'))
+  backend.emit('s1', { type: 'turn/end', seq: 3, data: { reason: { kind: 'completed' } } })
+  await waitFor(() => !output.text.slice(output.text.length - 4000).includes('running') || output.text.includes('idle'))
+
+  // The 4s poll must still fire and pick the new branch up.
+  await waitFor(() => output.text.includes('feature-x'))
+  assert.equal(output.text.includes('feature-x'), true)
+  } finally {
+    input.push('\u0004')
+    await app
+    await backend.disconnect()
+  }
+})

@@ -436,7 +436,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     tickTimer = setInterval(() => {
       if (!needsTick()) {
         if (tickTimer !== undefined) clearInterval(tickTimer)
-    if (gitTimer !== undefined) clearInterval(gitTimer)
+        // Only the activity tick ends here; the Git poll owns its own
+        // interval and must keep refreshing after an idle transition.
         tickTimer = undefined
         return
       }
