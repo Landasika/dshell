@@ -71,11 +71,19 @@ function connectSocket(socketPath: string, timeoutMs: number): Promise<Socket> {
 
 type MessageListener = (message: ServerMessage) => void
 
+/**
+ * Upper bound of stashed messages awaiting a `waitFor` claim. Replies only
+ * need to bridge the gap between arriving and being claimed, so anything
+ * beyond this is a runaway host; the oldest entries are dropped first.
+ */
+const STASH_LIMIT = 4096
+
 /** One attach connection to the local dshell-host plugin. */
 export class HostConnection {
   private readonly socket: Socket
   private readonly queue: ServerMessage[] = []
   private readonly listeners = new Set<MessageListener>()
+  private broadcastOnly = false
   private readonly waiters = new Set<{
     predicate: (message: ServerMessage) => boolean
     resolve: (message: ServerMessage) => void
@@ -154,6 +162,23 @@ export class HostConnection {
 
   get closedByPeer(): boolean {
     return this.closed
+  }
+
+  /** Stashed control replies waiting for a `waitFor` claim (diagnostics/tests). */
+  get stashSize(): number {
+    return this.queue.length
+  }
+
+  /**
+   * Declare that this connection will never `waitFor` messages again (a
+   * subscriber-driven session view). Broadcasts then bypass the stash, so a
+   * long streaming turn cannot accumulate unbounded history. A later
+   * `waitFor` still resolves on live arrival; only already-delivered
+   * messages are no longer replayed.
+   */
+  setBroadcastOnly(): void {
+    this.broadcastOnly = true
+    this.queue.length = 0
   }
 
   /** Called once when the connection is gone, however it went away. */
@@ -243,7 +268,10 @@ export class HostConnection {
       for (const waiter of [...this.waiters]) waiter.reject(error)
       return
     }
-    this.queue.push(message)
+    if (!this.broadcastOnly) {
+      this.queue.push(message)
+      if (this.queue.length > STASH_LIMIT) this.queue.shift()
+    }
     for (const listener of this.listeners) listener(message)
     for (const waiter of [...this.waiters]) {
       if (!waiter.predicate(message)) continue

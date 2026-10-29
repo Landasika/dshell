@@ -7,6 +7,8 @@ import { test } from 'node:test'
 
 import { DshellError, HostConnection } from '../dist/client/socket-client.js'
 
+const STASH_LIMIT = 4096
+
 async function socketServer(handler) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-test-'))
   const socketPath = join(directory, 'dshell.sock')
@@ -147,4 +149,82 @@ test('missing socket maps to HOST_NOT_RUNNING', async () => {
     HostConnection.connect('/tmp/dshell-does-not-exist.sock', 1_000),
     (error) => error instanceof DshellError && error.code === 'HOST_NOT_RUNNING',
   )
+})
+
+test('broadcast floods do not grow the stash and replies survive until claimed (DS-005)', async (t) => {
+  const sockets = new Set()
+  let broadcaster
+  const server = await socketServer((message, socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    if (message.type === 'hello') {
+      write(socket, {
+        type: 'welcome',
+        protocol: 2,
+        pluginVersion: 'test',
+        dshVersion: 'test',
+        capabilities: ['list', 'attach', 'event', 'stream', 'status'],
+        socketPath: 'test.sock',
+        sessions: [],
+      })
+      broadcaster = socket
+    }
+  })
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy()
+    await server.close()
+  })
+
+  // A subscriber-driven connection (the TUI's session view) never stashes.
+  const view = await HostConnection.connect(server.socketPath)
+  view.setBroadcastOnly()
+  const seen = []
+  view.onMessage((message) => seen.push(message.type))
+  for (let index = 0; index < 10_000; index += 1) {
+    write(broadcaster, { type: 'stream', sessionId: 's1', frame: { i: index } })
+    if (index % 100 === 0) write(broadcaster, { type: 'event', sessionId: 's1', event: { type: 'user/message', seq: index, data: {} } })
+    if (index % 250 === 0) write(broadcaster, { type: 'status', sessionId: 's1', status: 'running' })
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(seen.filter((type) => type === 'stream').length, 10_000)
+  assert.ok(seen.filter((type) => type === 'event').length >= 39)
+  assert.ok(seen.includes('status'))
+  assert.equal(view.stashSize, 0, 'broadcasts must not be stashed on a broadcast-only connection')
+  view.close()
+
+  // A reply-minded connection still stashes what lands before waitFor, and
+  // the stash is bounded even if a hostile host floods it.
+  const hoarder = await HostConnection.connect(server.socketPath)
+  for (let index = 0; index < STASH_LIMIT + 200; index += 1) {
+    write(broadcaster, { type: 'pong', time: index })
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(hoarder.stashSize, STASH_LIMIT)
+  const pong = await hoarder.waitFor((candidate) => candidate.type === 'pong', 500)
+  assert.equal(typeof pong.time, 'number')
+  hoarder.close()
+})
+
+test('waiters are released when the connection drops mid-flood', async (t) => {
+  let broadcaster
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') {
+      write(socket, {
+        type: 'welcome',
+        protocol: 2,
+        pluginVersion: 'test',
+        dshVersion: 'test',
+        capabilities: ['list'],
+        socketPath: 'test.sock',
+        sessions: [],
+      })
+      broadcaster = socket
+    }
+  })
+  t.after(server.close)
+  const connection = await HostConnection.connect(server.socketPath)
+  const pending = connection.waitFor((candidate) => candidate.type === 'sessions', 5_000)
+  broadcaster.destroy()
+  await assert.rejects(pending, /closed|HOST/i)
+  connection.close()
 })

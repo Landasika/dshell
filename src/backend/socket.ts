@@ -421,6 +421,10 @@ export class SocketSessionHandle implements SessionHandle {
     } catch (error) {
       throw mapError(error)
     }
+    // The handshake reply is the last thing this connection waits for; every
+    // later frame is fanout the handle consumes through its subscription, so
+    // stop stashing history it will never claim (DS-005).
+    this.connection.setBroadcastOnly()
   }
 
   subscribe(listener: (view: SessionView) => void): () => void {
