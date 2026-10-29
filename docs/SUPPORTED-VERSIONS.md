@@ -3,11 +3,52 @@
 `dshell` uses an independent SemVer. A dshell release is only advertised for the
 DSH versions and platforms in this table.
 
-## V1 (0.1.x)
+## V1 (0.1.x–0.2.x)
 
 | dshell | DSH | dshell protocol | Node | OS | Status |
 | --- | --- | --- | --- | --- | --- |
+| `0.2.0` | `0.2.1-rc.3` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Partially tested** (see below) |
+| `0.2.0` | `0.2.1-rc.2` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Tested** |
 | `0.1.0` | `0.2.1-rc.2` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Tested** |
+
+### 0.2.1-rc.3 verification record (2026-10-29)
+
+Protocol and command layer verified against a real rc.3 Host (dshell `b3f2d4c`,
+Ubuntu 24.04 / Linux 6.8, Node 24.21.0). The runtime was assembled from
+`@deepseek-ai/dsh@0.2.1-rc.3` on npm into an isolated tree — no mayfly bundle
+shipped an rc.3 pairing yet.
+
+Verified on the real rc.3 Host:
+
+- plugin load and handshake: welcome, protocol 2, every capability
+  (including `questions` and `models`);
+- `dshell doctor`, `workspaces`, `new` (correct cwd), `list`, `attach` with
+  history replay;
+- the `prompt` command end to end through the durable event stream, including
+  the fail-closed path: no API key produces a clear `turn error`, no hang;
+- `host/restart` handover on a live Host: the `host-restarting` frame is
+  delivered, the old process exits, and the replacement re-binds the socket
+  path (inode observed changing) and answers `doctor` again.
+
+Not yet verified against rc.3 (no credentials in the isolated home; verified
+on rc.2 instead): LLM generation, the approval bridge with real tool calls,
+interactive `ask_user_question`, and model selection taking effect.
+
+Reproduce:
+
+```bash
+mkdir /tmp/dsh-rc3-runtime && cd /tmp/dsh-rc3-runtime
+npm install @deepseek-ai/dsh@0.2.1-rc.3 --registry=<mirror>
+export DSH_HOME=/tmp/dsh-rc3-home
+node node_modules/@deepseek-ai/dsh/lib/bin.js rc3test --from-default-profile web --dump-config
+node node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile rc3test add <dshell-checkout>
+node node_modules/@deepseek-ai/dsh/lib/bin.js rc3test --no-open --port 0 &
+DSHELL_SOCKET=$DSH_HOME/run/dshell.sock dshell doctor
+```
+
+`0.2.1-rc.2` therefore remains the fully-tested reference;
+`dshell doctor` keeps warning on rc.3 until the credential-dependent paths
+above are exercised on a real rc.3 Host too.
 
 Verified environment:
 
