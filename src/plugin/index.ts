@@ -710,11 +710,27 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     dshHome: dshHome() ?? join(process.env.HOME ?? '.', '.dsh'),
   })
 
+  // The catalog cache is invalidated before every `/skills` read, so a hub
+  // edited while no watcher is attached (a directory created after boot, a
+  // network mount) still shows up without restarting the Host.
+  let invalidateSkillCatalog: (() => void) | undefined
+
   {
     const registry = skillRegistry()
     if (registry?.registerProvider !== undefined) {
+      // Create the shelves up front: `fs.watch` cannot watch a path that does
+      // not exist yet, and a hub that only starts watching after a restart is
+      // exactly the surprise this feature is meant to remove.
+      for (const dir of hubDirs) {
+        try {
+          mkdirSync(dir, { recursive: true })
+        } catch {
+          // A read-only or missing parent is reported by the empty catalog.
+        }
+      }
       try {
         registry.registerProvider((control) => {
+          invalidateSkillCatalog = () => control.invalidate()
           const provider = createHubProvider(hubDirs)
           const watchers = watchSkillDirs(hubDirs, () => control.invalidate())
           if (watchers.length > 0) ctx.on?.('dispose', () => watchers.forEach((watcher) => watcher.close()))
@@ -741,6 +757,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const cwd = typeof message.cwd === 'string' && message.cwd.length > 0 ? message.cwd : undefined
     let skills: SkillEntry[]
     try {
+      invalidateSkillCatalog?.()
       const summaries = await registry.list(cwd === undefined ? {} : { cwd })
       skills = summaries.map(toSkillEntry)
     } catch (error) {
