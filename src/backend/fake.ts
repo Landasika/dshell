@@ -466,7 +466,8 @@ class FakeSessionHandle implements SessionHandle {
     return {
       sessionId: this.id,
       header: { ...this.header },
-      events: this.session.events.map((event) => ({ ...event })),
+      // Shared like the socket backend: append-only history, immutable events.
+      events: this.session.events,
       cursor: this.session.cursor,
       status: this.session.status,
       streamText: this.session.streamText,

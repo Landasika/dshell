@@ -438,7 +438,10 @@ export class SocketSessionHandle implements SessionHandle {
     return {
       sessionId: this.id,
       header: { ...this.header },
-      events: this.events.map((event) => ({ ...event })),
+      // The events array is append/rebuild-only and every event object is
+      // treated as immutable downstream, so views can share it instead of
+      // copying the whole history on every notify (DS-007).
+      events: this.events,
       cursor: this.cursor,
       status: this.status,
       streamText: this.streamText,

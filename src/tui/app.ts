@@ -2334,23 +2334,36 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
+  /** Cached transcript layout for the durable prefix (DS-007). */
+  let transcriptCache: { key: string; lines: string[]; ranges: BlockRange[] } | undefined
+
   const transcript = (): { lines: string[]; live: boolean; ranges: BlockRange[] } => {
     const view = state.view
     const width = Math.max(20, screen.size.columns - 2)
     if (view === undefined) {
       return { lines: [paint(theme, 'muted', 'connecting to the dsh Host…')], live: false, ranges: [] }
     }
-    const events = view.events.filter((event) => event.seq > state.clearedAtSeq)
-    // Todos live in the footer strip and the session panel; keeping their
-    // historical snapshots inline would repeat the same list after every
-    // update.
-    const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
-    const rendered = renderBlocksWithRanges(blocks, width, theme, {
-      expandTools: state.verbose,
-      surfaceWidth: screen.size.columns,
-    })
-    const lines = rendered.lines
-    const ranges = rendered.ranges
+    // The durable layout only changes when a durable event lands, the view
+    // is cleared, folding changes, or the terminal resizes — never on a
+    // stream frame. Rebuilding it per frame made long sessions cost
+    // O(history) on every streamed token.
+    const cacheKey = `${view.sessionId}|${view.cursor}|${state.clearedAtSeq}|${state.verbose ? 1 : 0}|${width}|${screen.size.columns}`
+    if (transcriptCache?.key !== cacheKey) {
+      const events = view.events.filter((event) => event.seq > state.clearedAtSeq)
+      // Todos live in the footer strip and the session panel; keeping their
+      // historical snapshots inline would repeat the same list after every
+      // update.
+      const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
+      const rendered = renderBlocksWithRanges(blocks, width, theme, {
+        expandTools: state.verbose,
+        surfaceWidth: screen.size.columns,
+      })
+      transcriptCache = { key: cacheKey, lines: rendered.lines, ranges: rendered.ranges }
+    }
+    // The live tails below append to a shallow copy: the cached base stays
+    // untouched for the next frame.
+    const lines = [...transcriptCache.lines]
+    const ranges = transcriptCache.ranges
     if (view.streamReasoning.length > 0 && view.status === 'running') {
       const recent = view.streamReasoning
         .split('\n')
