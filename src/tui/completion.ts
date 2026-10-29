@@ -20,6 +20,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/history', description: 'search prompts sent in this session' },
   { name: '/panel', description: 'session panel: context, spend, speed, todos' },
   { name: '/agents', description: 'list subagents and open their transcripts' },
+  { name: '/skills', description: 'browse skills from the Host skill hub', needsArgument: false },
   { name: '/status', description: 'alias for /panel' },
   { name: '/verbose', description: 'toggle reasoning and lifecycle events' },
   { name: '/model', description: 'switch provider/model and reasoning level' },

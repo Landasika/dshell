@@ -21,6 +21,7 @@ import {
   CAPABILITIES,
   PROTOCOL_VERSION,
   type ProviderEntry,
+  type SkillEntry,
   type ApprovalRequestMessage,
   type Capability,
   type ErrorMessage,
@@ -35,6 +36,15 @@ import {
 } from '../protocol/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
 import { ApprovalCoordinator } from './approval.js'
+import {
+  HUB_PROVIDER,
+  createHubProvider,
+  readSkillFile,
+  resolveHubDirs,
+  toSkillEntry,
+  watchSkillDirs,
+  type SkillsRegistryLike,
+} from './skills.js'
 import {
   ProviderEditError,
   addProvider,
@@ -58,6 +68,11 @@ export interface Config {
   socketPath?: string
   /** Hard fail-closed deadline for an unanswered CLI approval. */
   approvalTimeoutMs?: number
+  /**
+   * Extra skill hubs (directories of `SKILL.md` bundles) served through
+   * `ctx.skills`; `/skills` lists them alongside project and user skills.
+   */
+  skillHub?: string | string[]
 }
 
 interface UserMessageLike {
@@ -685,6 +700,94 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (env !== undefined && env.length > 0) return env
     const home = process.env.HOME
     return home === undefined || home.length === 0 ? undefined : join(home, '.dsh')
+  }
+
+  const skillRegistry = (): SkillsRegistryLike | undefined => ctx.get?.('skills') as SkillsRegistryLike | undefined
+
+  const hubDirs = resolveHubDirs({
+    configured: config.skillHub,
+    env: process.env.DSHELL_SKILL_HUB,
+    dshHome: dshHome() ?? join(process.env.HOME ?? '.', '.dsh'),
+  })
+
+  {
+    const registry = skillRegistry()
+    if (registry?.registerProvider !== undefined) {
+      try {
+        registry.registerProvider((control) => {
+          const provider = createHubProvider(hubDirs)
+          const watchers = watchSkillDirs(hubDirs, () => control.invalidate())
+          if (watchers.length > 0) ctx.on?.('dispose', () => watchers.forEach((watcher) => watcher.close()))
+          return provider
+        })
+      } catch {
+        // An incompatible skills service must not stop the Host from booting;
+        // the welcome simply omits the capability and /skills explains why.
+      }
+    }
+  }
+
+  const listSkills = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const registry = skillRegistry()
+    if (registry === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'SKILLS_UNAVAILABLE',
+        message: 'this Host has no skills registry',
+        action: 'Load the bundled skill providers (dsh-skill / dsh-skill-filesystem) in the profile, then restart the Host.',
+      })
+      return
+    }
+    const cwd = typeof message.cwd === 'string' && message.cwd.length > 0 ? message.cwd : undefined
+    let skills: SkillEntry[]
+    try {
+      const summaries = await registry.list(cwd === undefined ? {} : { cwd })
+      skills = summaries.map(toSkillEntry)
+    } catch (error) {
+      sendError(socket, {
+        type: 'error',
+        code: 'SKILLS_FAILED',
+        message: errorText(error),
+        action: 'Run /skills again; if it keeps failing the skill providers are unhealthy.',
+      })
+      return
+    }
+    jsonLine(socket, { type: 'skills', ...(cwd === undefined ? {} : { cwd }), hub: hubDirs, skills })
+  }
+
+  const getSkill = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const registry = skillRegistry()
+    const name = typeof message.name === 'string' ? message.name.trim() : ''
+    if (registry === undefined || name.length === 0) {
+      sendError(socket, {
+        type: 'error',
+        code: 'SKILLS_UNAVAILABLE',
+        message: name.length === 0 ? 'skills/get needs a name' : 'this Host has no skills registry',
+        action: 'Run /skills to see the available skills.',
+      })
+      return
+    }
+    const cwd = typeof message.cwd === 'string' && message.cwd.length > 0 ? message.cwd : undefined
+    try {
+      const skill = await registry.get(name, cwd === undefined ? {} : { cwd })
+      if (skill === undefined) {
+        sendError(socket, {
+          type: 'error',
+          code: 'SKILL_MISSING',
+          message: `skill "${name}" is not loadable`,
+          action: 'It may have been removed since the catalog was read; run /skills again.',
+        })
+        return
+      }
+      jsonLine(socket, { type: 'skill', name: skill.name, content: skill.content })
+    } catch (error) {
+      sendError(socket, {
+        type: 'error',
+        code: 'SKILLS_FAILED',
+        message: errorText(error),
+        action: 'Run /skills again; if it keeps failing the skill providers are unhealthy.',
+      })
+    }
   }
 
   const providerFileCandidates = (): string[] => {
@@ -1399,6 +1502,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             capabilities: (CAPABILITIES as readonly Capability[]).filter((capability) => {
               if (capability === 'models') return sessionController() !== undefined
               if (capability === 'providers') return providerFile() !== undefined
+              if (capability === 'skills') return skillRegistry() !== undefined
               return true
             }),
             socketPath,
@@ -1475,6 +1579,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'model/default':
           await setDefaultModel(socket, message)
+          return
+        case 'skills/list':
+          await listSkills(socket, message)
+          return
+        case 'skills/get':
+          await getSkill(socket, message)
           return
         case 'provider/list':
           listProviders(socket)

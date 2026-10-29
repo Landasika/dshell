@@ -2468,3 +2468,60 @@ test('turn footers are not focusable blocks', async () => {
   const kinds = blocks(events).map((block) => block.kind)
   assert.deepEqual(kinds, ['turnend'])
 })
+
+test('TUI smoke: /skills lists the catalog and opens a skill', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 110
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+
+  await waitFor(() => stripAnsi(output.text).includes('idle'), 'the session to attach')
+  try {
+    input.push('/skills')
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('release-checklist'), 'the skill list')
+    assert.ok(stripAnsi(output.text).includes('triage-issues'), 'lists every source')
+    assert.ok(stripAnsi(output.text).includes('/fake/dshell-skills'), 'shows the hub root')
+
+    output.text = ''
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('Release checklist'), 'the skill body')
+
+    output.text = ''
+    input.push('\u001b')
+    await waitFor(() => !stripAnsi(output.text).includes('skill · release-checklist'), 'the skill panel to close')
+  } finally {
+    input.push('\u0004')
+    await app
+    await backend.disconnect()
+  }
+})

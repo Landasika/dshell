@@ -7,6 +7,18 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `/skills` browses the Host's `ctx.skills` catalog: every source, with the
+  hub roots, and `Enter` renders the skill body as Markdown.
+- A configurable **skill hub**: directories of `SKILL.md` bundles served
+  through `ctx.skills` (default `$DSH_HOME/dshell-skills`, override with
+  `DSHELL_SKILL_HUB` or the `skillHub` plugin config). Skills from the hub
+  show up in the Web UI and the `skill` tool too, and outrank user roots
+  without shadowing project skills.
+- Protocol capability `skills` plus `skills/list` and `skills/get`.
+
+
+### Added
+
 - A scripted promo/tutorial video: `docs/promo/` drives the real TUI with a
   fake backend, records every repaint, and renders a 1080p video
   (`record.sh` regenerates it in one command).

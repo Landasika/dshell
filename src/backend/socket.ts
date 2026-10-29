@@ -21,6 +21,8 @@ import type {
   SessionEvent,
   SessionHeader,
   SessionsMessage,
+  SkillMessage,
+  SkillsMessage,
 } from '../protocol/index.js'
 import { isStreamStart, streamChunkParts } from './stream.js'
 import {
@@ -31,6 +33,7 @@ import {
   type NewProviderSpec,
   type ProviderList,
   type SendOptions,
+  type SkillCatalog,
   type SendReceipt,
   type SessionHandle,
   type SessionSummary,
@@ -93,6 +96,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     questions: has('questions'),
     models: has('models'),
     providers: has('providers'),
+    skills: has('skills'),
   }
 }
 
@@ -145,6 +149,34 @@ export class SocketBackend implements DshellBackend {
         25_000,
       )
       return message.selected
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async listSkills(cwd?: string): Promise<SkillCatalog> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<SkillsMessage>(
+        { type: 'skills/list', ...(cwd === undefined ? {} : { cwd }) },
+        (candidate) => candidate.type === 'skills',
+        20_000,
+      )
+      return { hub: message.hub, skills: message.skills }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async getSkill(name: string, cwd?: string): Promise<string> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<SkillMessage>(
+        { type: 'skills/get', name, ...(cwd === undefined ? {} : { cwd }) },
+        (candidate) => candidate.type === 'skill',
+        20_000,
+      )
+      return message.content
     } catch (error) {
       throw mapError(error)
     }

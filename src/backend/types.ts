@@ -7,6 +7,7 @@ import type {
   QuestionAnswer,
   SessionEvent,
   SessionHeader,
+  SkillEntry,
 } from '../protocol/index.js'
 
 /** Errors surfaced by a backend, independent of the transport used underneath. */
@@ -59,6 +60,14 @@ export interface DshellCapabilities {
   models: boolean
   /** The Host can read and rewrite its provider patch file, and restart itself. */
   providers: boolean
+  /** The Host exposes its `ctx.skills` catalog for browsing. */
+  skills: boolean
+}
+
+/** A skill catalog plus the hub roots the Host serves. */
+export interface SkillCatalog {
+  hub: string[]
+  skills: SkillEntry[]
 }
 
 /** A provider row the TUI asks the Host to create. */
@@ -191,6 +200,8 @@ export interface DshellBackend {
   saveDefaultModel(selection: ModelSelection): Promise<ModelSelection>
 
   /** Read the providers declared in the Host's patch file. */
+  listSkills(cwd?: string): Promise<SkillCatalog>
+  getSkill(name: string, cwd?: string): Promise<string>
   providerList(): Promise<ProviderList>
   /** Rewrite one provider field; takes effect after the Host restarts. */
   updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>

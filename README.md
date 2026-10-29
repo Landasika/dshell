@@ -219,6 +219,9 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-C` | cancel the turn (or quit when idle) |
 | `Ctrl-D` | quit |
 
+In `/skills`: `↑/↓` move, `Enter` opens the skill body (rendered markdown),
+`Backspace` goes back to the list, `Esc` closes.
+
 In an `ask_user_question` card: `↑/↓` move, `Space` toggles a choice (multi-
 select), `c` types a custom answer, `Enter` submits, `Esc` leaves it pending
 for the Web UI.
@@ -239,6 +242,7 @@ for the Web UI.
 | `/history` | search prompts sent in this session |
 | `/panel` (`/status`) | context, spend, speed, todos |
 | `/agents` | list subagents, open their transcripts |
+| `/skills [name]` | browse the Host skill catalog, or open one skill |
 | `/verbose` | toggle reasoning and lifecycle events |
 | `/model` | switch provider/model and reasoning level |
 | `/provider` | edit provider rows in `cordis.patch.yml` |
@@ -334,7 +338,42 @@ and there is no token or cookie: run dshell as the user that started the Host.
 DSH_HOME              DSH home (default: ~/.dsh)
 DSHELL_SOCKET         control socket override
 DSHELL_NO_HERDR=1     disable the Herdr reporter
+DSHELL_SKILL_HUB      colon-separated extra skill roots (see below)
 ```
+
+### Skill hub
+
+`/skills` lists whatever the Host's `ctx.skills` registry serves: project
+skills (`<repo>/.dsh/skills`), user skills (`$DSH_HOME/skills`), bundled
+skills, and the **hub** — a shelf of skills shared by every project and
+profile. The hub defaults to `$DSH_HOME/dshell-skills` and is configurable
+without touching DSH:
+
+```text
+DSHELL_SKILL_HUB=/srv/skills:~/.dshell/skills     # environment
+```
+
+or, for a profile that ships its own shelf, in the patch file:
+
+```yaml
+- id: dshell-host
+  name: '@landasika/dshell'
+  config:
+    skillHub: ['/srv/skills']
+```
+
+Layout per root — a directory bundle keeps its resources next to `SKILL.md`,
+a flat file is enough for a one-pager:
+
+```text
+<root>/<name>/SKILL.md     <root>/<name>.md
+```
+
+`SKILL.md` follows the DSH skill format: YAML frontmatter with `name` (kebab
+case) and `description`, optional `whenToUse`, `user-invocable` and
+`disable-model-invocation`, then the Markdown body. The Hub registers as a
+normal skill provider, so hub skills are also available to the Web UI and the
+`skill` tool — and they outrank user roots but never project skills.
 
 Providers live in `$DSH_HOME/cordis.patch.yml` (else the active profile's).
 `/provider` edits them in place — `baseURL`, `apiKeyEnv`, `displayName`, model

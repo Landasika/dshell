@@ -16,6 +16,7 @@ import {
   type DshellCapabilities,
   type NewProviderSpec,
   type ProviderList,
+  type SkillCatalog,
   type SendOptions,
   type SendReceipt,
   type SessionHandle,
@@ -38,6 +39,7 @@ const CAPABILITIES: DshellCapabilities = {
   questions: true,
   models: true,
   providers: true,
+  skills: true,
 }
 
 interface FakeSession {
@@ -177,6 +179,41 @@ export class FakeBackend implements DshellBackend {
     this.sessionModels.set(sessionId, selected)
     this.defaultModel = selected
     return selected
+  }
+
+  async listSkills(): Promise<SkillCatalog> {
+    this.assertConnected()
+    return {
+      hub: ['/fake/dshell-skills'],
+      skills: [
+        {
+          name: 'release-checklist',
+          description: 'Walk a release from green tests to a published tarball.',
+          whenToUse: 'When preparing or verifying a release.',
+          source: 'dshell-hub',
+          provider: 'dshell-hub',
+          path: '/fake/dshell-skills/release-checklist/SKILL.md',
+          modelInvocable: true,
+          userInvocable: true,
+        },
+        {
+          name: 'triage-issues',
+          description: 'Turn a pile of bug reports into an ordered work queue.',
+          source: 'user-dsh',
+          provider: 'filesystem',
+          path: '/fake/.dsh/skills/triage-issues/SKILL.md',
+          modelInvocable: true,
+          userInvocable: true,
+        },
+      ],
+    }
+  }
+
+  async getSkill(name: string): Promise<string> {
+    this.assertConnected()
+    if (name === 'release-checklist') return '# Release checklist\n\n1. pnpm typecheck\n2. pnpm test\n3. verify-pack.sh'
+    if (name === 'triage-issues') return '# Triage\n\nSort by impact first.'
+    throw new BackendError('SKILL_MISSING', `skill "${name}" is not loadable`)
   }
 
   async providerList(): Promise<ProviderList> {

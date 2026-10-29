@@ -16,6 +16,7 @@ export const CAPABILITIES = [
   'steer',
   'approval',
   'questions',
+  'skills',
   'models',
   'providers',
 ] as const
@@ -34,6 +35,9 @@ export type DshellErrorCode =
   | 'SESSION_ALREADY_LIVE'
   | 'APPROVAL_NOT_PENDING'
   | 'QUEUE_ITEM_NOT_FOUND'
+  | 'SKILLS_UNAVAILABLE'
+  | 'SKILLS_FAILED'
+  | 'SKILL_MISSING'
   | 'BAD_REQUEST'
   | 'INTERNAL'
 
@@ -170,6 +174,35 @@ export interface HistoryMessage {
   /** Lowest seq in this page. Pass it as `before` to load the previous page. */
   cursor: number
   hasMore: boolean
+}
+
+/** One skill the Host's `ctx.skills` registry can serve. */
+export interface SkillEntry {
+  name: string
+  description: string
+  whenToUse?: string
+  /** Discovery bucket: project-dsh, user-dsh, custom, bundled, ... */
+  source: string
+  provider: string
+  /** Instruction file, when the provider has a real path. */
+  path?: string
+  modelInvocable: boolean
+  userInvocable: boolean
+}
+
+export interface SkillsMessage {
+  type: 'skills'
+  /** Workspace the catalog was read for (project roots are cwd sensitive). */
+  cwd?: string
+  /** Skill hub directories the Host is configured to serve. */
+  hub: string[]
+  skills: SkillEntry[]
+}
+
+export interface SkillMessage {
+  type: 'skill'
+  name: string
+  content: string
 }
 
 export interface DetachedMessage {
@@ -348,6 +381,8 @@ export type ClientMessage =
     }
   | { type: 'approval/answer'; requestId: string; outcome: ApprovalOutcome }
   | { type: 'question/answer'; sessionId: string; callId: string; answers: QuestionAnswer[] }
+  | { type: 'skills/list'; cwd?: string }
+  | { type: 'skills/get'; name: string; cwd?: string }
   | { type: 'model/catalog' }
   | { type: 'provider/list' }
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
@@ -382,6 +417,8 @@ export type ServerMessage =
   | ApprovalRequestMessage
   | ApprovalResolvedMessage
   | QuestionAnsweredMessage
+  | SkillsMessage
+  | SkillMessage
   | ModelCatalogMessage
   | ModelSelectedMessage
   | ProviderListMessage

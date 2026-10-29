@@ -20,6 +20,7 @@ import type {
   ModelSelection,
   ProviderEntry,
   ProviderField,
+  SkillEntry,
 } from '../protocol/index.js'
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
@@ -122,6 +123,8 @@ type Overlay =
   | { kind: 'rewind'; index: number }
   | { kind: 'dashboard' }
   | { kind: 'agents'; index: number }
+  | { kind: 'skills'; index: number; hub: string[]; entries: SkillEntry[] }
+  | { kind: 'skillView'; name: string; lines: string[]; scroll: number; loading: boolean; error?: string }
   | { kind: 'models'; index: number }
   | { kind: 'effort'; provider: string; model: string; index: number; back: number }
   | { kind: 'providers'; index: number }
@@ -1424,6 +1427,56 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  /**
+   * `/skills` without an argument lists the Host's catalog; with one it opens
+   * that skill directly. The catalog is the Host's own `ctx.skills`, so hub,
+   * project and bundled skills appear together with their source.
+   */
+  const openSkills = async (argument: string): Promise<void> => {
+    const wanted = argument.trim()
+    if (wanted.length > 0) {
+      await openSkillView(wanted)
+      return
+    }
+    if (!backend.capabilities().skills) {
+      toast('this Host has no skills registry; update the Host plugin and restart it')
+      return
+    }
+    state.overlay = { kind: 'skills', index: 0, hub: [], entries: [] }
+    schedule()
+    try {
+      const catalog = await backend.listSkills(state.view?.header.cwd ?? options.cwd)
+      const current = state.overlay
+      if (current !== null && current.kind === 'skills') {
+        state.overlay = { ...current, hub: catalog.hub, entries: catalog.skills, index: Math.min(current.index, Math.max(0, catalog.skills.length - 1)) }
+      }
+    } catch (error) {
+      if (state.overlay?.kind === 'skills') state.overlay = null
+      toast(`skills unavailable: ${errorText(error)}`)
+    }
+    schedule()
+  }
+
+  const openSkillView = async (name: string): Promise<void> => {
+    state.overlay = { kind: 'skillView', name, lines: [], scroll: 0, loading: true }
+    schedule()
+    try {
+      const content = await backend.getSkill(name, state.view?.header.cwd ?? options.cwd)
+      const width = Math.max(24, screen.size.columns - 6)
+      const lines = renderMarkdown(content, width, theme)
+      const current = state.overlay
+      if (current !== null && current.kind === 'skillView' && current.name === name) {
+        state.overlay = { ...current, lines, loading: false }
+      }
+    } catch (error) {
+      const current = state.overlay
+      if (current !== null && current.kind === 'skillView' && current.name === name) {
+        state.overlay = { ...current, loading: false, error: errorText(error) }
+      }
+    }
+    schedule()
+  }
+
   const runCommand = async (text: string): Promise<void> => {
     const [command, ...rest] = text.trim().split(/\s+/)
     const argument = rest.join(' ')
@@ -1500,6 +1553,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         return
       case '/agents':
         openAgents()
+        return
+      case '/skills':
+      case '/skill':
+        await openSkills(argument)
         return
       case '/model':
         await switchModel(argument)
@@ -1665,6 +1722,34 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       } else if (key.type === 'enter' || key.type === 'tab') {
         const chosen = agents[overlay.index]
         if (chosen !== undefined) void openAgentView(chosen)
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'skills') {
+      const delta = key.type === 'up' || key.type === 'ctrl-p' ? -1 : key.type === 'down' || key.type === 'ctrl-n' ? 1 : key.type === 'wheel' ? key.delta : 0
+      if (delta !== 0 && overlay.entries.length > 0) {
+        overlay.index = Math.max(0, Math.min(overlay.entries.length - 1, overlay.index + delta))
+      } else if (key.type === 'enter' || key.type === 'tab') {
+        const chosen = overlay.entries[overlay.index]
+        if (chosen !== undefined) void openSkillView(chosen.name)
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'skillView') {
+      const total = overlay.lines.length
+      const height = Math.max(4, lastBodyHeight)
+      const step = key.type === 'wheel' ? key.delta * 3 : 0
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.scroll = Math.max(0, overlay.scroll - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') overlay.scroll = Math.min(Math.max(0, total - 1), overlay.scroll + 1)
+      else if (key.type === 'page-up') overlay.scroll = Math.max(0, overlay.scroll - height)
+      else if (key.type === 'page-down') overlay.scroll = Math.min(Math.max(0, total - 1), overlay.scroll + height)
+      else if (key.type === 'wheel') overlay.scroll = Math.max(0, Math.min(Math.max(0, total - 1), overlay.scroll - step))
+      else if (key.type === 'backspace') {
+        void openSkills('')
         return
       }
       schedule()
@@ -2869,6 +2954,37 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
       return panelBox(theme, 'rewind', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter restore · esc cancel')],
+      })
+    }
+    if (overlay.kind === 'skills') {
+      const entries = overlay.entries
+      const body: string[] = [paint(theme, 'muted', `${entries.length} skill${entries.length === 1 ? '' : 's'}`), '']
+      if (entries.length === 0) {
+        body.push(paint(theme, 'muted', 'no skills found for this workspace'))
+        if (overlay.hub.length > 0) body.push('', paint(theme, 'dim', `hub: ${overlay.hub.join(':')}`))
+      }
+      for (const [index, entry] of entries.entries()) {
+        const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
+        const source = paint(theme, 'dim', entry.source)
+        const detail = entry.description.replace(/\s+/g, ' ')
+        body.push(`${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(entry.name, 32))} ${source} ${paint(theme, 'muted', truncate(detail, Math.max(10, inner - 46)))}`)
+      }
+      if (entries.length > 0 && overlay.hub.length > 0) {
+        body.push('', paint(theme, 'dim', `hub: ${truncate(overlay.hub.join(':'), inner)}`))
+      }
+      return panelBox(theme, 'skills', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ move · enter open · esc close')],
+      })
+    }
+    if (overlay.kind === 'skillView') {
+      const height = Math.max(4, rows - 12)
+      const body = overlay.loading
+        ? ['', paint(theme, 'muted', `loading ${overlay.name}…`)]
+        : overlay.error !== undefined
+          ? [paint(theme, 'error', overlay.error)]
+          : overlay.lines.slice(overlay.scroll, overlay.scroll + height)
+      return panelBox(theme, `skill · ${truncate(overlay.name, 40)}`, body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ scroll · backspace back · esc close')],
       })
     }
     if (overlay.kind === 'agents') {
