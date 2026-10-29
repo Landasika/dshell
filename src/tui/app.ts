@@ -14,6 +14,7 @@ import type {
 } from '../backend/index.js'
 import { BackendError } from '../backend/index.js'
 import type {
+  AskedQuestion,
   ModelCatalog,
   ModelOption,
   ModelSelection,
@@ -27,6 +28,7 @@ import { normalizePaste, pastePlaceholder, shouldFoldPaste } from './paste.js'
 import {
   buildBlocks,
   isInjectedContext,
+  pendingQuestions,
   renderBlocks,
   renderBlocksWithRanges,
   turnFailureMessage,
@@ -106,6 +108,16 @@ type Overlay =
   | { kind: 'workspaces'; index: number }
   | { kind: 'help' }
   | { kind: 'approval'; details: boolean }
+  | {
+      kind: 'questions'
+      callId: string
+      questions: AskedQuestion[]
+      /** Cursor into the flattened option/custom rows across all questions. */
+      cursor: number
+      selected: Record<string, string[]>
+      custom: Record<string, string>
+      customMode: boolean
+    }
   | { kind: 'history'; query: string; index: number }
   | { kind: 'rewind'; index: number }
   | { kind: 'dashboard' }
@@ -130,6 +142,38 @@ type Overlay =
   | { kind: 'confirm'; title: string; lines: string[]; index: number; onYes: () => void }
   | { kind: 'agentView'; childId: string; label: string; lines: string[]; scroll: number; loading: boolean; error?: string }
   | { kind: 'detail'; title: string; lines: string[]; scroll: number }
+
+/** One navigable row of the ask overlay: an option, or a question's custom entry. */
+interface QuestionRow {
+  qid: string
+  kind: 'option' | 'custom'
+  label?: string
+  description?: string
+  multi: boolean
+}
+
+function questionRows(questions: readonly AskedQuestion[]): QuestionRow[] {
+  const rows: QuestionRow[] = []
+  for (const question of questions) {
+    for (const option of question.options ?? []) {
+      rows.push({
+        qid: question.id,
+        kind: 'option',
+        label: option.label,
+        ...(option.description === undefined ? {} : { description: option.description }),
+        multi: question.multiSelect === true,
+      })
+    }
+    // Every question keeps one custom row so the cursor can always reach it,
+    // and option-less questions are still answerable by typing.
+    rows.push({ qid: question.id, kind: 'custom', multi: question.multiSelect === true })
+  }
+  return rows
+}
+
+function freshQuestionsOverlay(callId: string, questions: AskedQuestion[]): Overlay {
+  return { kind: 'questions', callId, questions, cursor: 0, selected: {}, custom: {}, customMode: false }
+}
 
 interface AppState {
   sessions: SessionSummary[]
@@ -179,6 +223,8 @@ interface AppState {
   attachments: Map<string, string>
   /** Monotonic counter for `[Pasted text #N …]` placeholders. */
   pasteSeq: number
+  /** Ask calls the user dismissed with Esc; they stay hidden until answered. */
+  dismissedAsks: Set<string>
 }
 
 /** One row under the transcript: a prompt waiting in the Host's inbox. */
@@ -330,6 +376,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     queueText: new Map(),
     attachments: new Map(),
     pasteSeq: 0,
+    dismissedAsks: new Set(),
   }
 
   let renderTimer: NodeJS.Timeout | undefined
@@ -578,6 +625,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (view.pendingApproval !== undefined) {
       if (state.overlay?.kind !== 'approval') state.overlay = { kind: 'approval', details: false }
     } else if (state.overlay?.kind === 'approval') {
+      state.overlay = null
+    }
+    const ask = backend.capabilities().questions ? pendingQuestions(view.events) : undefined
+    if (ask !== undefined && !state.dismissedAsks.has(ask.callId)) {
+      const current = state.overlay
+      if (current === null) {
+        state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
+      } else if (current.kind === 'questions' && current.callId !== ask.callId) {
+        state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
+      } else if (current.kind === 'questions') {
+        current.questions = ask.questions
+      }
+    } else if (state.overlay?.kind === 'questions') {
       state.overlay = null
     }
     ensureTick()
@@ -1505,6 +1565,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
       } else if (overlay.kind === 'providerCreate') {
         state.overlay = { kind: 'providers', index: Math.max(0, (state.providers?.providers.length ?? 1) - 1) }
+      } else if (overlay.kind === 'questions') {
+        // Hide this ask until it settles; a new call shows a fresh overlay.
+        state.dismissedAsks.add(overlay.callId)
+        state.overlay = null
       } else {
         if (overlay.kind === 'agentView') closeAgentView()
         state.overlay = null
@@ -1523,6 +1587,72 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.details = !overlay.details
         schedule()
       }
+      return
+    }
+    if (overlay.kind === 'questions') {
+      const rows = questionRows(overlay.questions)
+      const row = rows[overlay.cursor]
+      const currentQid = row?.qid ?? overlay.questions[0]?.id ?? ''
+      if (overlay.customMode) {
+        if (key.type === 'text') overlay.custom[currentQid] = (overlay.custom[currentQid] ?? '') + key.text
+        else if (key.type === 'backspace') {
+          const chars = Array.from(overlay.custom[currentQid] ?? '')
+          chars.pop()
+          overlay.custom[currentQid] = chars.join('')
+        } else if (key.type === 'ctrl-u' || key.type === 'ctrl-k') {
+          overlay.custom[currentQid] = ''
+        } else if (key.type === 'enter' || key.type === 'tab') {
+          overlay.customMode = false
+        }
+        schedule()
+        return
+      }
+      if (key.type === 'up' || key.type === 'ctrl-p') {
+        overlay.cursor = Math.max(0, overlay.cursor - 1)
+      } else if (key.type === 'down' || key.type === 'ctrl-n' || key.type === 'tab') {
+        overlay.cursor = Math.min(Math.max(0, rows.length - 1), overlay.cursor + 1)
+      } else if (key.type === 'text' && key.text === ' ' && row !== undefined) {
+        if (row.kind === 'custom') {
+          overlay.customMode = true
+        } else if (row.label !== undefined) {
+          const selected = overlay.selected[row.qid] ?? []
+          if (row.multi) {
+            overlay.selected[row.qid] = selected.includes(row.label)
+              ? selected.filter((label) => label !== row.label)
+              : [...selected, row.label]
+          } else {
+            overlay.selected[row.qid] = selected.includes(row.label) ? [] : [row.label]
+          }
+        }
+      } else if (key.type === 'text' && (key.text === 'c' || key.text === 'C')) {
+        overlay.customMode = true
+      } else if (key.type === 'enter') {
+        const answers = overlay.questions.map((question) => {
+          const selected = overlay.selected[question.id] ?? []
+          const custom = (overlay.custom[question.id] ?? '').trim()
+          return { id: question.id, selected, ...(custom.length > 0 ? { custom } : {}) }
+        })
+        if (answers.every((answer) => answer.selected.length === 0 && answer.custom === undefined)) {
+          toast('pick an option (space) or type an answer (c) first')
+        } else {
+          const callId = overlay.callId
+          state.overlay = null
+          const handle = state.handle
+          if (handle !== undefined) {
+            void (async () => {
+              try {
+                await handle.answerQuestion(callId, answers)
+                toast('answers sent')
+              } catch (error) {
+                state.error = errorText(error)
+                toast('answer failed; the ask stays open')
+              }
+              schedule()
+            })()
+          }
+        }
+      }
+      schedule()
       return
     }
     if (overlay.kind === 'help') return
@@ -2348,6 +2478,22 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     const block = item.block
     if (block === undefined) return
+    if (block.kind === 'reasoning') {
+      const width = Math.max(20, screen.size.columns - 10)
+      const full = block.full ?? block.body
+      const steps = block.steps ?? 1
+      const body = full.length > 0
+        ? wrapText(full, width).map((line) => paint(theme, 'dim', line))
+        : [paint(theme, 'muted', '(no reasoning was recorded for this turn)')]
+      state.overlay = {
+        kind: 'detail',
+        title: `thinking · ${String(steps)} step${steps === 1 ? '' : 's'}`,
+        lines: body,
+        scroll: 0,
+      }
+      schedule()
+      return
+    }
     if (block.kind === 'tool') {
       const width = Math.max(20, screen.size.columns - 10)
       const body: string[] = [
@@ -2367,7 +2513,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
-    toast('enter opens tool details, subagents (≈ /agents) and queued prompts')
+    toast('enter opens tool details, thinking, subagents (≈ /agents) and queued prompts')
   }
 
   /** Delete one queued prompt both locally and in the Host inbox. */
@@ -2825,6 +2971,53 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
       return panelBox(theme, 'session panel', body, width, {
         footer: [paint(theme, 'muted', 'ctrl+b / esc close · ctrl+r history · double esc rewind')],
+      })
+    }
+    if (overlay.kind === 'questions') {
+      const rows = questionRows(overlay.questions)
+      const body: string[] = []
+      for (const question of overlay.questions) {
+        const title = question.header !== undefined && question.header.length > 0 ? question.header : question.id
+        body.push(paint(theme, 'bold', paint(theme, 'accentSoft', truncate(title, Math.max(6, inner - 2)))))
+        for (const line of wrapText(question.question, Math.max(10, inner - 2))) {
+          body.push(paint(theme, 'text', line))
+        }
+        const selected = overlay.selected[question.id] ?? []
+        for (const option of question.options ?? []) {
+          const rowIndex = rows.findIndex(
+            (candidate) => candidate.qid === question.id && candidate.kind === 'option' && candidate.label === option.label,
+          )
+          const isCursor = overlay.customMode === false && rowIndex === overlay.cursor
+          const marker = question.multiSelect === true
+            ? selected.includes(option.label)
+              ? paint(theme, 'success', '☑')
+              : '☐'
+            : selected.includes(option.label)
+              ? paint(theme, 'accent', '●')
+              : '○'
+          const cursorMark = isCursor ? paint(theme, 'accent', '▸') : ' '
+          const label = paint(theme, isCursor ? 'text' : 'muted', option.label)
+          body.push(`${cursorMark}${marker} ${label}`)
+          if (isCursor && option.description !== undefined) {
+            body.push(paint(theme, 'dim', `    ${truncate(option.description, Math.max(10, inner - 4))}`))
+          }
+        }
+        const customRowIndex = rows.findIndex(
+          (candidate) => candidate.qid === question.id && candidate.kind === 'custom',
+        )
+        const custom = overlay.custom[question.id] ?? ''
+        if (overlay.customMode && rows[overlay.cursor]?.qid === question.id && customRowIndex === overlay.cursor) {
+          body.push(paint(theme, 'accent', `  ✎ ${custom}▏`))
+        } else if (custom.trim().length > 0) {
+          body.push(paint(theme, 'dim', `  ✎ ${truncate(custom, Math.max(10, inner - 4))}`))
+        } else {
+          body.push(paint(theme, 'dim', '  ✎ type a custom answer (c)'))
+        }
+        body.push('')
+      }
+      if (body.length > 0) body.pop()
+      return panelBox(theme, 'the model asks', body, width, {
+        footer: [paint(theme, 'muted', '↑↓ move · space toggle · c custom · enter submit · esc later')],
       })
     }
     if (overlay.kind !== 'approval') return []

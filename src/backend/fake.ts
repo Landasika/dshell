@@ -5,6 +5,7 @@ import type {
   ModelSelection,
   ProviderEntry,
   ProviderField,
+  QuestionAnswer,
   SessionEvent,
   SessionHeader,
 } from '../protocol/index.js'
@@ -34,6 +35,7 @@ const CAPABILITIES: DshellCapabilities = {
   steer: true,
   paging: true,
   approvals: true,
+  questions: true,
   models: true,
   providers: true,
 }
@@ -374,6 +376,18 @@ export class FakeBackend implements DshellBackend {
     for (const handle of this.handles) handle.notify()
   }
 
+  /** Test helper: raise a pending `ask_user_question` through the event flow. */
+  askQuestion(sessionId: string, callId: string, questions: unknown[]): void {
+    this.emit(sessionId, {
+      type: 'tool/call',
+      seq: this.requireSession(sessionId).cursor + 1,
+      data: { name: 'ask_user_question', callId, arguments: JSON.stringify({ questions }) },
+    })
+  }
+
+  /** Answers submitted through `SessionHandle.answerQuestion`, for assertions. */
+  readonly answeredQuestions: { sessionId: string; callId: string; answers: QuestionAnswer[] }[] = []
+
   requireSession(sessionId: string): FakeSession {
     const session = this.sessions.get(sessionId)
     if (session === undefined) {
@@ -559,6 +573,25 @@ class FakeSessionHandle implements SessionHandle {
       type: 'approval/decided',
       seq: this.session.cursor + 1,
       data: { id: requestId, outcome },
+    })
+  }
+
+  async answerQuestion(callId: string, answers: QuestionAnswer[]): Promise<void> {
+    this.assertOpen()
+    this.backend.answeredQuestions.push({ sessionId: this.id, callId, answers })
+    // The Host settles the waiting tool call with the answer batch as its
+    // result; mirror that so the pending-question detector clears.
+    this.append({
+      type: 'tool/result',
+      seq: this.session.cursor + 1,
+      data: {
+        message: {
+          role: 'tool',
+          toolCallId: callId,
+          content: [{ type: 'text', text: JSON.stringify({ answers }) }],
+          isError: false,
+        },
+      },
     })
   }
 

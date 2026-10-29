@@ -1,4 +1,4 @@
-import type { SessionEvent } from '../protocol/index.js'
+import type { AskedQuestion, SessionEvent } from '../protocol/index.js'
 import { renderDiff, renderMarkdown } from './markdown.js'
 import { BRAND_ICON, BRAND_NAME } from './brand.js'
 import { paint, paintBand, type Theme } from './theme.js'
@@ -174,6 +174,10 @@ function primaryArgument(name: string, args: Record<string, unknown>): string {
     case 'task':
     case 'skill':
       return pick(['description', 'name', 'prompt'])
+    case 'ask_user_question': {
+      const first = Array.isArray(args.questions) ? (args.questions[0] as { question?: unknown }) : undefined
+      return typeof first?.question === 'string' ? first.question : ''
+    }
     case 'todo':
       return ''
     default: {
@@ -219,6 +223,95 @@ function todoBlock(data: Json): Block {
  * the same history always renders the same transcript, which keeps a reconnect
  * from duplicating settled output.
  */
+/** One `ask_user_question` call that is still waiting for answers. */
+export interface PendingAsk {
+  callId: string
+  questions: AskedQuestion[]
+}
+
+function askedQuestions(argumentsJson: unknown): AskedQuestion[] {
+  let args: Json
+  try {
+    args = typeof argumentsJson === 'string' ? (JSON.parse(argumentsJson) as Json) : (argumentsJson as Json)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(args.questions)) return []
+  const out: AskedQuestion[] = []
+  for (const raw of args.questions) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const question = raw as Json
+    if (typeof question.id !== 'string' || typeof question.question !== 'string') continue
+    const options = Array.isArray(question.options)
+      ? question.options.flatMap((option): { label: string; description?: string }[] => {
+          if (typeof option !== 'object' || option === null) return []
+          const label = (option as Json).label
+          if (typeof label !== 'string' || label.length === 0) return []
+          const description = (option as Json).description
+          return [{ label, ...(typeof description === 'string' ? { description } : {}) }]
+        })
+      : undefined
+    const header = question.header
+    const multi = question.multi_select ?? question.multiSelect
+    out.push({
+      id: question.id,
+      question: question.question,
+      ...(typeof header === 'string' && header.length > 0 ? { header } : {}),
+      ...(multi === true ? { multiSelect: true } : {}),
+      ...(options !== undefined && options.length > 0 ? { options } : {}),
+    })
+  }
+  return out
+}
+
+/**
+ * The newest `ask_user_question` call that is still answerable: the call has
+ * no result yet, or its timed wait settled as `{pending: true}` (the question
+ * stays open for a late answer). Aborted, answered, and already-replied calls
+ * are skipped.
+ */
+export function pendingQuestions(events: readonly SessionEvent[]): PendingAsk | undefined {
+  const open = new Map<string, AskedQuestion[]>()
+  let newest = ''
+  for (const event of events) {
+    const data = dataOf(event) as Json
+    if (event.type === 'tool/call' && String(data.name ?? '') === 'ask_user_question') {
+      const callId = String(data.callId ?? data.toolCallId ?? '')
+      if (callId.length === 0) continue
+      open.set(callId, askedQuestions(data.arguments ?? data.input))
+      newest = callId
+      continue
+    }
+    if (event.type === 'tool/result') {
+      const message = (data.message ?? data) as Json
+      const callId = String(message.toolCallId ?? data.callId ?? data.toolCallId ?? '')
+      if (callId.length === 0 || !open.has(callId)) continue
+      if (message.isError === true || data.isError === true) {
+        open.delete(callId)
+        continue
+      }
+      // A timed wait that expired keeps the question answerable.
+      const text = toolResultText(data)
+      let pending = false
+      try {
+        pending = (JSON.parse(text) as Json).pending === true
+      } catch {
+        pending = false
+      }
+      if (!pending) open.delete(callId)
+      continue
+    }
+    if (event.type === 'user/message') {
+      const source = ((data.message ?? data) as Json).source as Json | undefined
+      if (source?.kind === 'user-question-reply' && typeof source.callId === 'string') {
+        open.delete(source.callId)
+      }
+    }
+  }
+  if (newest.length === 0 || !open.has(newest)) return undefined
+  return { callId: newest, questions: open.get(newest) ?? [] }
+}
+
 export function buildBlocks(events: readonly SessionEvent[], verbose = false): Block[] {
   const blocks: Block[] = []
   const callBlocks = new Map<string, Block>()

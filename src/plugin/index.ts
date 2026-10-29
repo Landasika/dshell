@@ -63,7 +63,7 @@ interface UserMessageLike {
   id: string
   role: 'user'
   content: Array<{ type: 'text'; text: string }>
-  source: { kind: 'user' }
+  source: { kind: 'user' } | { kind: 'user-question-reply'; callId: string; outcome: 'answered' }
 }
 
 interface InboxLike {
@@ -1305,6 +1305,70 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     settleApproval(message.requestId, message.outcome, 'cli')
   }
 
+  /**
+   * Answer a pending `ask_user_question`. The Host's UserQuestionService
+   * settles the waiting tool call when it sees a steered user message whose
+   * source kind is `user-question-reply`, so the plugin uses exactly that
+   * channel — the same one the Web UI's late answers take.
+   */
+  const answerQuestion = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires a sessionId' })
+      return
+    }
+    if (typeof message.callId !== 'string' || message.callId.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires a callId' })
+      return
+    }
+    if (!Array.isArray(message.answers)) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires an answers array' })
+      return
+    }
+    const answers: { id: string; selected: string[]; custom?: string }[] = []
+    for (const raw of message.answers) {
+      if (typeof raw !== 'object' || raw === null) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'each answer must be an object' })
+        return
+      }
+      const answer = raw as Record<string, unknown>
+      if (typeof answer.id !== 'string' || !Array.isArray(answer.selected)) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'each answer requires id and selected' })
+        return
+      }
+      const selected = answer.selected.filter((item): item is string => typeof item === 'string')
+      const custom = typeof answer.custom === 'string' && answer.custom.trim().length > 0 ? answer.custom : undefined
+      answers.push({ id: answer.id, selected, ...(custom === undefined ? {} : { custom }) })
+    }
+
+    if (socket.destroyed) return
+    const agent = await liveAgent(message.sessionId)
+    if (socket.destroyed) return
+    watch(socket, message.sessionId)
+
+    const reply: UserMessageLike = {
+      id: `dshell-answer-${randomUUID()}`,
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            kind: 'answer_to_pending_question',
+            tool: 'ask_user_question',
+            callId: message.callId,
+            answers,
+          }),
+        },
+      ],
+      source: { kind: 'user-question-reply', callId: message.callId, outcome: 'answered' },
+    }
+    agent.steer(reply)
+    jsonLine(socket, {
+      type: 'question-answered',
+      sessionId: message.sessionId,
+      callId: message.callId,
+    })
+  }
+
   const handleLine = async (socket: Socket, line: string): Promise<void> => {
     let message: Record<string, unknown>
     try {
@@ -1400,6 +1464,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'approval/answer':
           answerApproval(socket, message)
+          return
+        case 'question/answer':
+          await answerQuestion(socket, message)
           return
         case 'model/catalog':
           await forwardModelCatalog(socket)

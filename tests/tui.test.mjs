@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import { createTheme } from '../dist/tui/theme.js'
 import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from '../dist/tui/width.js'
 import { renderMarkdown, renderDiff } from '../dist/tui/markdown.js'
-import { buildBlocks, renderBlocks, renderTranscript, summarizeTool, turnFailureMessage } from '../dist/tui/events.js'
+import { buildBlocks, pendingQuestions, renderBlocks, renderTranscript, summarizeTool, turnFailureMessage } from '../dist/tui/events.js'
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
 import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
@@ -50,6 +50,167 @@ test('markdown renderer handles headings, bullets, fences, and diffs', () => {
   assert.equal(diff.length, 6)
   assert.equal(diff.some((line) => line.includes('-old')), true)
   assert.equal(diff.some((line) => line.includes('+new')), true)
+})
+
+test('pendingQuestions tracks open, timed, answered, and aborted asks', () => {
+  const call = (seq) => ({
+    type: 'tool/call',
+    seq,
+    data: {
+      name: 'ask_user_question',
+      callId: 'q1',
+      arguments: JSON.stringify({
+        questions: [
+          { id: 'pkg', question: 'which name?', multi_select: false, options: [{ label: 'A', description: 'first' }, { label: 'B' }] },
+          { id: 'note', question: 'anything else?', multiSelect: true },
+        ],
+      }),
+    },
+  })
+  const result = (seq, payload, isError = false) => ({
+    type: 'tool/result',
+    seq,
+    data: { message: { toolCallId: 'q1', content: [{ type: 'text', text: payload }], isError } },
+  })
+  const reply = (seq) => ({
+    type: 'user/message',
+    seq,
+    data: {
+      message: {
+        content: [{ type: 'text', text: '{"answers":[]}' }],
+        source: { kind: 'user-question-reply', callId: 'q1', outcome: 'answered' },
+      },
+    },
+  })
+
+  const open = pendingQuestions([call(1)])
+  assert.equal(open?.callId, 'q1')
+  assert.equal(open?.questions[0]?.question, 'which name?')
+  assert.equal(open?.questions[0]?.options?.[0]?.label, 'A')
+  assert.equal(open?.questions[0]?.multiSelect, undefined)
+  assert.equal(open?.questions[1]?.multiSelect, true)
+  assert.equal(open?.questions[1]?.options, undefined)
+
+  assert.equal(pendingQuestions([call(1), result(2, JSON.stringify({ answers: [{ id: 'pkg', selected: ['A'] }] }))]), undefined)
+  assert.equal(pendingQuestions([call(1), result(2, 'Error: ask_user_question was aborted before the user answered', true)]), undefined)
+  assert.equal(pendingQuestions([call(1), reply(3)]), undefined)
+  // A timed wait that expired keeps the question open for a late answer.
+  assert.equal(pendingQuestions([call(1), result(2, JSON.stringify({ pending: true, callId: 'q1' }))])?.callId, 'q1')
+
+  // The folded tool row names the question instead of raw JSON.
+  const lines = renderBlocks(buildBlocks([call(1)], false), 64, theme)
+  assert.equal(lines.some((line) => line.includes('which name?')), true)
+})
+
+test('the model can ask questions and the TUI answers from an overlay', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 200; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-500))}`)
+  }
+
+  await waitFor(() => output.text.includes('dshell'))
+  backend.askQuestion('s1', 'q1', [
+    { id: 'pkg', question: '包名用哪个？', header: '包名', options: [{ label: 'A', description: 'first choice' }, { label: 'B' }] },
+  ])
+  await waitFor(() => output.text.includes('the model asks'))
+  await waitFor(() => output.text.includes('包名用哪个？'))
+
+  // Space selects the option under the cursor (single-select radio).
+  const beforeSelection = output.text.length
+  input.push(' ')
+  await waitFor(() => output.text.slice(beforeSelection).includes('● A'))
+
+  // Enter submits the batch; the overlay closes and the answer is recorded.
+  input.push('\r')
+  await waitFor(() => output.text.includes('answers sent'))
+  assert.deepEqual(backend.answeredQuestions, [
+    { sessionId: 's1', callId: 'q1', answers: [{ id: 'pkg', selected: ['A'] }] },
+  ])
+
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
+test('escape hides the ask overlay until that call settles', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 200; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-500))}`)
+  }
+
+  await waitFor(() => output.text.includes('dshell'))
+  backend.askQuestion('s1', 'q1', [{ id: 'pkg', question: 'which?', options: [{ label: 'A' }] }])
+  await waitFor(() => output.text.includes('the model asks'))
+
+  const beforeEscape = output.text.length
+  input.push('\u001b')
+  await waitFor(() => !output.text.slice(beforeEscape).includes('the model asks'))
+  // A view change must not bring the dismissed ask back.
+  const beforeRefresh = output.text.length
+  backend.emit('s1', { type: 'turn/start', seq: 2, data: { turn: 1 } })
+  backend.stream('s1', 'still typing')
+  await waitFor(() => output.text.slice(beforeRefresh).includes('still typing'))
+  assert.equal(output.text.slice(beforeEscape).includes('the model asks'), false)
+
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
 })
 
 test('durable events become stable blocks and pair tool results by callId', () => {

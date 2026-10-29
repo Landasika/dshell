@@ -71,6 +71,70 @@ test('FakeBackend exposes workspaces, sessions, streaming, and approval', async 
   await backend.disconnect()
 })
 
+test('SocketBackend answers pending questions', async (t) => {
+  let answered = null
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') {
+      write(socket, {
+        type: 'welcome',
+        protocol: 2,
+        pluginVersion: 'test',
+        dshVersion: 'test',
+        capabilities: ['list', 'attach', 'event', 'status', 'questions'],
+        socketPath: 'test.sock',
+        sessions: [],
+      })
+    } else if (message.type === 'attach') {
+      write(socket, {
+        type: 'attached',
+        sessionId: message.sessionId,
+        header: { id: message.sessionId, cwd: '/work' },
+        cursor: 0,
+        events: [],
+      })
+    } else if (message.type === 'question/answer') {
+      answered = message
+      write(socket, { type: 'question-answered', sessionId: message.sessionId, callId: message.callId })
+    }
+  })
+  t.after(server.close)
+
+  const backend = new SocketBackend(server.socketPath)
+  await backend.connect()
+  assert.equal(backend.capabilities().questions, true)
+  const handle = await backend.openSession('s1')
+  await handle.answerQuestion('q1', [{ id: 'pkg', selected: ['A'], custom: 'note' }])
+  // answerQuestion resolves once the batch is written; the fake host sees it
+  // on its next read tick, so wait for the round-trip before asserting.
+  for (let index = 0; index < 100 && answered === null; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(answered?.callId, 'q1')
+  assert.deepEqual(answered?.answers, [{ id: 'pkg', selected: ['A'], custom: 'note' }])
+  handle.dispose()
+  await backend.disconnect()
+})
+
+test('FakeBackend raises and settles pending questions', async () => {
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const handle = await backend.openSession('s1')
+  const views = []
+  const off = handle.subscribe((view) => views.push(view))
+  backend.askQuestion('s1', 'q1', [{ id: 'a', question: 'pick one', options: [{ label: 'One' }] }])
+  await handle.answerQuestion('q1', [{ id: 'a', selected: ['One'] }])
+  assert.deepEqual(backend.answeredQuestions, [
+    { sessionId: 's1', callId: 'q1', answers: [{ id: 'a', selected: ['One'] }] },
+  ])
+  assert.equal(
+    views.some((view) => view.events.some((event) => event.type === 'tool/result' && event.data.message.toolCallId === 'q1')),
+    true,
+  )
+  off()
+  handle.dispose()
+  await backend.disconnect()
+})
+
 test('SocketBackend maps list, attach, prompt, and stream over a Unix socket', async (t) => {
   const server = await socketServer((message, socket) => {
     if (message.type === 'hello') {

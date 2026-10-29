@@ -4,6 +4,7 @@ import type {
   ModelSelection,
   ProviderEntry,
   ProviderField,
+  QuestionAnswer,
   SessionEvent,
   SessionHeader,
 } from '../protocol/index.js'
@@ -52,6 +53,8 @@ export interface DshellCapabilities {
   paging: boolean
   /** Approval requests can be answered from this frontend. */
   approvals: boolean
+  /** Pending `ask_user_question` calls can be answered from this frontend. */
+  questions: boolean
   /** Provider/model catalog and live model switching are available. */
   models: boolean
   /** The Host can read and rewrite its provider patch file, and restart itself. */
@@ -146,6 +149,8 @@ export interface SessionHandle {
   /** Load one older page. Returns false when the beginning is reached. */
   loadOlder(limit?: number): Promise<boolean>
   answerApproval(requestId: string, outcome: 'allowed-once' | 'rejected'): Promise<void>
+  /** Answer a pending `ask_user_question` call with a batch of structured answers. */
+  answerQuestion(callId: string, answers: QuestionAnswer[]): Promise<void>
 
   /** Drop local subscriptions and transport resources. Never disposes the Host Agent. */
   dispose(): void

@@ -14,6 +14,7 @@ import type {
   ProviderField,
   ProviderListMessage,
   ProviderUpdatedMessage,
+  QuestionAnswer,
   QueueUpdatedMessage,
   ServerMessage,
   SessionCreatedMessage,
@@ -89,6 +90,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     steer: has('steer'),
     paging: has('history'),
     approvals: has('approval'),
+    questions: has('questions'),
     models: has('models'),
     providers: has('providers'),
   }
@@ -389,6 +391,7 @@ export class SocketSessionHandle implements SessionHandle {
     reject: (error: Error) => void
   } | null = null
   private pendingApprovalAnswer: string | null = null
+  private pendingQuestionAnswer: string | null = null
   private hasMoreHistory = true
   private ready = false
   private disposed = false
@@ -526,6 +529,15 @@ export class SocketSessionHandle implements SessionHandle {
     this.connection.send({ type: 'approval/answer', requestId, outcome })
   }
 
+  async answerQuestion(callId: string, answers: QuestionAnswer[]): Promise<void> {
+    this.assertOpen()
+    if (this.pendingQuestionAnswer !== null) {
+      throw new BackendError('BAD_REQUEST', 'a question answer is already pending')
+    }
+    this.pendingQuestionAnswer = callId
+    this.connection.send({ type: 'question/answer', sessionId: this.id, callId, answers })
+  }
+
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
@@ -629,11 +641,19 @@ export class SocketSessionHandle implements SessionHandle {
       this.emit()
       return
     }
+    if (message.type === 'question-answered' && message.sessionId === this.id) {
+      this.pendingQuestionAnswer = null
+      this.emit()
+      return
+    }
     if (message.type === 'error') {
       const error = new BackendError(message.code, message.message, message.action)
       if (this.pendingAccepted !== null) {
         this.pendingAccepted.reject(error)
         this.pendingAccepted = null
+      }
+      if (this.pendingQuestionAnswer !== null) {
+        this.pendingQuestionAnswer = null
       }
     }
   }

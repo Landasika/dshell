@@ -15,6 +15,7 @@ export const CAPABILITIES = [
   'cancel',
   'steer',
   'approval',
+  'questions',
   'models',
   'providers',
 ] as const
@@ -293,6 +294,28 @@ export interface ApprovalResolvedMessage {
   source: 'cli' | 'other' | 'timeout' | 'disconnect'
 }
 
+/** One question the model asked through `ask_user_question`. */
+export interface AskedQuestion {
+  id: string
+  question: string
+  header?: string
+  multiSelect?: boolean
+  options?: { label: string; description?: string }[]
+}
+
+/** One structured answer sent back for an `ask_user_question` call. */
+export interface QuestionAnswer {
+  id: string
+  selected: string[]
+  custom?: string
+}
+
+export interface QuestionAnsweredMessage {
+  type: 'question-answered'
+  sessionId: string
+  callId: string
+}
+
 export interface ErrorMessage {
   type: 'error'
   code: DshellErrorCode
@@ -324,6 +347,7 @@ export type ClientMessage =
       requestId?: string
     }
   | { type: 'approval/answer'; requestId: string; outcome: ApprovalOutcome }
+  | { type: 'question/answer'; sessionId: string; callId: string; answers: QuestionAnswer[] }
   | { type: 'model/catalog' }
   | { type: 'provider/list' }
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
@@ -357,6 +381,7 @@ export type ServerMessage =
   | StatusMessage
   | ApprovalRequestMessage
   | ApprovalResolvedMessage
+  | QuestionAnsweredMessage
   | ModelCatalogMessage
   | ModelSelectedMessage
   | ProviderListMessage

@@ -21,6 +21,19 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- The TUI can answer `ask_user_question` calls. A pending ask (or one whose
+  timed wait expired) opens an interactive overlay — `↑↓` move, `space`
+  toggles options (radio or checkbox per `multi_select`), `c` types a custom
+  answer, `enter` submits. Answers travel a new `question/answer` protocol
+  command; the Host plugin steers a `user-question-reply` user message into
+  the session, which is the same channel the Web UI's late answers use, so
+  CLI and Web can answer each other's questions. `Esc` hides the overlay
+  until that call settles; dismissed asks reopen only for a new call.
+
+- Thinking blocks open in the detail panel: `Alt+↑/↓` to a `⚓ thinking`
+  row, then `Enter` shows the full reasoning trace of that turn with its
+  step count.
+
 - Large pastes fold into a `[Pasted text #N +20 lines]` placeholder in the
   composer (more than 4 lines or 200 cells); the full content is substituted
   back when the prompt is sent. Pasted text is normalized on insert: CRLF
