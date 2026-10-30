@@ -1080,6 +1080,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
   }
 
+  /** The Host's LLM surface; `discoverModels` interrogates an upstream listing. */
+  const llmDiscovery = (): {
+    discoverModels(ns: string, request: { baseURL: string; api?: string; apiKey?: string }): Promise<
+      { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]
+    >
+  } | undefined => {
+    const service = ctx.get?.('llm') as
+      | { discoverModels?: (ns: string, request: { baseURL: string; api?: string; apiKey?: string }) => Promise<unknown> }
+      | undefined
+    if (typeof service?.discoverModels !== 'function') return undefined
+    return { discoverModels: (ns, request) => service.discoverModels?.(ns, request) as Promise<never[]> }
+  }
+
   /**
    * Store a raw API key (`sk-…`) for one provider: the secret goes to the
    * Host's credential store and `apiKeyEnv` in the patch file is pointed at
@@ -1147,11 +1160,53 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
   }
 
+  /**
+   * Ask an upstream which models it serves (`GET {baseURL}/models`, or the
+   * Anthropic spelling). Discovery is adoption, not sync: the reply is
+   * candidate ids for the draft — `cordis.patch.yml` stays authoritative.
+   */
+  const discoverProviderModels = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const baseURL = typeof message.baseURL === 'string' ? message.baseURL.trim() : ''
+    const api = typeof message.api === 'string' && message.api.length > 0 ? message.api : undefined
+    const apiKey = typeof message.apiKey === 'string' && message.apiKey.length > 0 ? message.apiKey : undefined
+    const llm = llmDiscovery()
+    if (baseURL.length === 0 || !/^https?:\/\/[^\s]+$/.test(baseURL)) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/discover needs an absolute http(s) baseURL' })
+      return
+    }
+    if (llm === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host exposes no model discovery',
+        action: 'Enter model ids by hand.',
+      })
+      return
+    }
+    try {
+      const discovered = await llm.discoverModels('llm-pi-ai', { baseURL, ...(api === undefined ? {} : { api }), ...(apiKey === undefined ? {} : { apiKey }) })
+      const models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[] = []
+      for (const model of discovered) {
+        if (typeof model?.id !== 'string' || model.id.length === 0) continue
+        models.push({
+          id: model.id,
+          ...(typeof model.name === 'string' && model.name.length > 0 ? { name: model.name } : {}),
+          ...(typeof model.contextWindow === 'number' ? { contextWindow: model.contextWindow } : {}),
+          ...(typeof model.maxTokens === 'number' ? { maxTokens: model.maxTokens } : {}),
+        })
+      }
+      jsonLine(socket, { type: 'provider-discovered', models })
+    } catch (error) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
   const createProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     const baseURL = typeof message.baseURL === 'string' ? message.baseURL.trim() : ''
     const apiKeyEnv = typeof message.apiKeyEnv === 'string' ? message.apiKeyEnv.trim() : ''
     const displayName = typeof message.displayName === 'string' ? message.displayName.trim() : ''
+    const api = typeof message.api === 'string' ? message.api.trim() : ''
     const models = Array.isArray(message.models)
       ? message.models
           .filter((model): model is string => typeof model === 'string')
@@ -1191,6 +1246,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         id: providerId,
         baseURL,
         models,
+        ...(api.length === 0 ? {} : { api }),
         ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
         ...(displayName.length === 0 ? {} : { displayName }),
       })
@@ -1886,6 +1942,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
               if (capability === 'models') return sessionController() !== undefined
               if (capability === 'providers') return providerFile() !== undefined
               if (capability === 'provider-key') return credentialStore() !== undefined && providerFile() !== undefined
+              if (capability === 'provider-discover') return llmDiscovery() !== undefined
               if (capability === 'agents') return configEditor() !== undefined
               if (capability === 'skills') return skillRegistry() !== undefined
               return true
@@ -1982,6 +2039,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'provider/api-key':
           await storeProviderKey(socket, message)
+          return
+        case 'provider/discover':
+          await discoverProviderModels(socket, message)
           return
         case 'provider/create':
           await createProvider(socket, message)

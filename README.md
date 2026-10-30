@@ -224,7 +224,9 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 
 In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
 `apiKeyEnv` is stored in `~/.dsh/.credentials.yaml` and the field keeps only its
-reference), `s` saves, `r` restarts the Host.
+reference), `s` saves, `r` restarts the Host. In the add panel, `f` lists the
+upstream's model ids into the draft (`GET {baseURL}/models`) — the listing
+carries no sizes, so they still come from the catalog or hand entry.
 
 A mouse selection is copied on release (OSC 52) and stays highlighted. It is
 tracked in transcript coordinates, not screen rows: wheel scrolling carries it

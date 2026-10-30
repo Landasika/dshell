@@ -42,6 +42,7 @@ const CAPABILITIES: DshellCapabilities = {
   models: true,
   providers: true,
     providerKey: true,
+    providerDiscover: true,
   skills: true,
   agents: true,
 }
@@ -277,6 +278,19 @@ export class FakeBackend implements DshellBackend {
     if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
     row[field] = value
     return this.providerList()
+  }
+
+  /** Two canned ids so the TUI flow can be tested without a network. */
+  async discoverProviderModels(
+    _baseURL: string,
+    _api?: string,
+    _apiKey?: string,
+  ): Promise<{ id: string; name?: string; contextWindow?: number; maxTokens?: number }[]> {
+    this.assertConnected()
+    return [
+      { id: 'fake-v4-pro', contextWindow: 1048576, maxTokens: 32768 },
+      { id: 'fake-v4-flash', contextWindow: 262144, maxTokens: 32768 },
+    ]
   }
 
   async storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }> {

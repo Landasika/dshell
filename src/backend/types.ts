@@ -64,6 +64,8 @@ export interface DshellCapabilities {
   providers: boolean
   /** The Host credential store can hold pasted keys (`sk-…`). */
   providerKey: boolean
+  /** The Host can list an upstream's models for the provider draft. */
+  providerDiscover: boolean
   /** The Host exposes its `ctx.skills` catalog for browsing. */
   skills: boolean
   /** The Host can read the agent presets it composes sessions from. */
@@ -80,6 +82,8 @@ export interface SkillCatalog {
 export interface NewProviderSpec {
   id: string
   baseURL: string
+  /** Wire protocol; required when a model is not in the installed catalog. */
+  api?: string
   apiKeyEnv?: string
   displayName?: string
   models: string[]
@@ -238,6 +242,8 @@ export interface DshellBackend {
   updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>
   /** Store a raw key in the Host credential store; returns the ref it now answers to. */
   storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }>
+  /** Interrogate an upstream's model listing; candidate ids, nothing stored. */
+  discoverProviderModels(baseURL: string, api?: string, apiKey?: string): Promise<{ id: string; name?: string; contextWindow?: number; maxTokens?: number }[]>
   /** Append a new provider block; takes effect after the Host restarts. */
   createProvider(spec: NewProviderSpec): Promise<ProviderList>
   /** Remove a provider block; takes effect after the Host restarts. */

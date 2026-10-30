@@ -112,6 +112,13 @@ The secret itself:
 `llm-pi-ai` in a stronger layer, because `config` replaces wholesale. Prefer
 editing the existing block in place over adding a second override.
 
+**Getting the ids**: `curl -s H 'Authorization: Bearer …' {baseURL}/models` (or
+the Anthropic spelling `/v1/models`) lists what an upstream serves. The Web
+Models page's "fetch available models" action and the TUI provider panel's `f`
+key do the same through the Host — but discovery is **adoption, not sync**: a
+listing carries no capacities or compat, so the ids land in a draft and
+`contextWindow`/`maxTokens` still come from the catalog or hand entry.
+
 ## 4. Add a model to an existing provider
 
 A model is an entry in the provider's `models` list; the route id is

@@ -12,6 +12,7 @@ import type {
   ModelSelection,
   ProviderCreatedMessage,
   ProviderKeyStoredMessage,
+  ProviderDiscoveredMessage,
   ProviderDeletedMessage,
   ProviderField,
   ProviderListMessage,
@@ -100,6 +101,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     models: has('models'),
     providers: has('providers'),
     providerKey: has('provider-key'),
+    providerDiscover: has('provider-discover'),
     agents: has('agents'),
     skills: has('skills'),
   }
@@ -255,6 +257,24 @@ export class SocketBackend implements DshellBackend {
     }
   }
 
+  async discoverProviderModels(
+    baseURL: string,
+    api?: string,
+    apiKey?: string,
+  ): Promise<{ id: string; name?: string; contextWindow?: number; maxTokens?: number }[]> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<ProviderDiscoveredMessage>(
+        { type: 'provider/discover', baseURL, ...(api === undefined ? {} : { api }), ...(apiKey === undefined ? {} : { apiKey }) },
+        (candidate) => candidate.type === 'provider-discovered',
+        30_000,
+      )
+      return message.models
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
   async createProvider(spec: NewProviderSpec): Promise<ProviderList> {
     const connection = this.requireControl()
     try {
@@ -264,6 +284,7 @@ export class SocketBackend implements DshellBackend {
       providerId: spec.id,
       baseURL: spec.baseURL,
       models: spec.models,
+      ...(spec.api === undefined ? {} : { api: spec.api }),
       ...(spec.apiKeyEnv === undefined ? {} : { apiKeyEnv: spec.apiKeyEnv }),
       ...(spec.displayName === undefined ? {} : { displayName: spec.displayName }),
     },

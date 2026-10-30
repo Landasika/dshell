@@ -220,6 +220,8 @@ export function clearProviderField(text: string, providerId: string, field: Prov
 export interface NewProviderSpec {
   id: string
   baseURL: string
+  /** Wire protocol; required when a model is not in the installed catalog. */
+  api?: string
   apiKeyEnv?: string
   displayName?: string
   models: string[]
@@ -248,7 +250,15 @@ export function addProvider(text: string, spec: NewProviderSpec): string {
   if (block.end === block.start + 1) {
     throw new ProviderEditError('EMPTY_PROVIDERS', 'the providers block is empty; add the first provider by hand')
   }
+  const api = spec.api?.trim() ?? ''
+  const API_VALUES = new Set(['openai-completions', 'openai-responses', 'anthropic-messages'])
+  if (api.length > 0 && !API_VALUES.has(api)) {
+    throw new ProviderEditError('BAD_FIELD', `api "${api}" is not a wire protocol this build knows`)
+  }
   const row: string[] = [`      ${id}:`]
+  if (api.length > 0) {
+    row.push(`        api: ${encodeScalar(api)}`)
+  }
   if (spec.apiKeyEnv !== undefined && spec.apiKeyEnv.trim().length > 0) {
     row.push(`        apiKeyEnv: ${encodeScalar(spec.apiKeyEnv.trim())}`)
   }

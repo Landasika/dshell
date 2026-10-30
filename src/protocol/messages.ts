@@ -20,6 +20,7 @@ export const CAPABILITIES = [
   'models',
   'providers',
   'provider-key',
+  'provider-discover',
   'agents',
 ] as const
 
@@ -264,6 +265,12 @@ export interface ProviderKeyStoredMessage {
   providers: ProviderEntry[]
 }
 
+export interface ProviderDiscoveredMessage {
+  type: 'provider-discovered'
+  /** Candidate ids the upstream listed; adoption into the patch file is manual. */
+  models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]
+}
+
 export interface ProviderCreatedMessage {
   type: 'provider-created'
   file: string
@@ -462,6 +469,7 @@ export type ClientMessage =
   | { type: 'provider/list' }
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
   | { type: 'provider/api-key'; providerId: string; value: string }
+  | { type: 'provider/discover'; baseURL: string; api?: string; apiKey?: string }
   | {
       type: 'provider/create'
       providerId: string
@@ -503,6 +511,7 @@ export type ServerMessage =
   | ProviderListMessage
   | ProviderUpdatedMessage
   | ProviderKeyStoredMessage
+  | ProviderDiscoveredMessage
   | ProviderCreatedMessage
   | ProviderDeletedMessage
   | AgentRosterMessage

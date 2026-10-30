@@ -250,13 +250,14 @@ interface QueueEntry {
 
 const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 'displayName']
 
-const PROVIDER_CREATE_FIELDS = ['id', 'displayName', 'baseURL', 'apiKeyEnv', 'models'] as const
+const PROVIDER_CREATE_FIELDS = ['id', 'displayName', 'baseURL', 'api', 'apiKeyEnv', 'models'] as const
 type ProviderCreateField = (typeof PROVIDER_CREATE_FIELDS)[number]
 
 const PROVIDER_CREATE_HINTS: Record<ProviderCreateField, string> = {
   id: 'provider id, e.g. my-relay',
   displayName: 'shown in the picker (optional)',
   baseURL: 'https://gateway.example/v1',
+  api: 'anthropic-messages',
   apiKeyEnv: 'env var name, or paste sk-… to store it',
   models: 'model ids, comma or space separated',
 }
@@ -1318,9 +1319,51 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
+  /**
+   * `f` on the create panel asks the upstream which models it serves and
+   * fills the models draft with the ids. Discovery is adoption, not sync: the
+   * listing carries no capacities, so sizes still come from the catalog or
+   * hand entry — but the ids no longer have to be typed one by one.
+   */
+  const fetchUpstreamModels = async (overlay: Extract<Overlay, { kind: 'providerCreate' }>): Promise<void> => {
+    const baseURL = overlay.draft.baseURL.trim()
+    if (!/^https?:\/\/[^\s]+$/.test(baseURL)) {
+      toast('set the baseURL first')
+      schedule()
+      return
+    }
+    if (!backend.capabilities().providerDiscover) {
+      toast('this Host cannot list upstream models')
+      schedule()
+      return
+    }
+    const apiKey = overlay.draft.apiKeyEnv.trim()
+    state.status = 'listing models'
+    schedule()
+    try {
+      const models = await backend.discoverProviderModels(
+        baseURL,
+        overlay.draft.api.trim().length === 0 ? undefined : overlay.draft.api.trim(),
+        /^[A-Z][A-Z0-9_]*$/.test(apiKey) || apiKey.length === 0 ? undefined : apiKey,
+      )
+      if (models.length === 0) {
+        toast('the upstream listed no models')
+      } else {
+        overlay.draft.models = models.map((model) => model.id).join(', ')
+        toast(`fetched ${String(models.length)} model ids — sizes still need hand entry`)
+      }
+    } catch (error) {
+      toast(`model listing failed: ${errorText(error)}`)
+    } finally {
+      state.status = 'idle'
+      schedule()
+    }
+  }
+
   const submitNewProvider = async (overlay: Extract<Overlay, { kind: 'providerCreate' }>): Promise<void> => {
     const id = overlay.draft.id.trim()
     const baseURL = overlay.draft.baseURL.trim()
+    const api = overlay.draft.api.trim()
     const displayName = overlay.draft.displayName.trim()
     const apiKeyEnv = overlay.draft.apiKeyEnv.trim()
     const models = overlay.draft.models.split(/[\s,]+/).map((model) => model.trim()).filter((model) => model.length > 0)
@@ -1346,6 +1389,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         id,
         baseURL,
         models,
+        ...(api.trim().length === 0 ? {} : { api: api.trim() }),
         ...(displayName.length === 0 ? {} : { displayName }),
         ...(rawKey !== undefined || apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
       })
@@ -2423,7 +2467,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.overlay = {
           kind: 'providerCreate',
           index: 0,
-          draft: { id: '', displayName: '', baseURL: '', apiKeyEnv: '', models: '' },
+          draft: { id: '', displayName: '', baseURL: '', api: 'anthropic-messages', apiKeyEnv: '', models: '' },
         }
         schedule()
         return
@@ -2482,6 +2526,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         if (field !== undefined) overlay.editing = { field, value: overlay.draft[field] }
       } else if (key.type === 'text' && key.text.toLowerCase() === 's') {
         void submitNewProvider(overlay)
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'f') {
+        void fetchUpstreamModels(overlay)
         return
       }
       schedule()
@@ -3558,7 +3605,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(paint(theme, 'muted', 'apiKeyEnv: a NAME like MY_RELAY_KEY, or paste sk-… to store it'))
       return panelRule(theme, 'add provider', body, width, {
         footer: [paint(theme, 'muted', overlay.editing === undefined
-          ? 'enter edit · s add · esc back'
+          ? 'enter edit · f fetch models · s add · esc back'
           : 'type to edit · enter commit · esc cancel')],
       })
     }

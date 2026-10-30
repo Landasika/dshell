@@ -125,6 +125,22 @@ test('addProvider appends a well-formed block with models', () => {
   assert.equal(next.slice(0, next.indexOf('      my-relay:')), PATCH.slice(0, PATCH.indexOf('- id: other-plugin')))
 })
 
+test('addProvider writes the wire protocol ahead of the credential reference', () => {
+  const next = addProvider(PATCH, {
+    id: 'gw',
+    baseURL: 'https://gw.example/v1',
+    api: 'anthropic-messages',
+    models: ['m1'],
+  })
+  assert.match(next, /      gw:\n {8}api: anthropic-messages\n {8}baseURL: https:\/\/gw\.example\/v1\n {8}models:\n {10}- id: m1/)
+  // A gateway model the catalog does not know is invalid without an api; a
+  // bogus protocol name must be refused rather than silently written.
+  assert.throws(
+    () => addProvider(PATCH, { id: 'gw', baseURL: 'https://a', api: 'carrier-pigeon', models: ['m'] }),
+    /not a wire protocol/,
+  )
+})
+
 test('addProvider refuses unsafe ids, duplicates and empty model lists', () => {
   assert.throws(
     () => addProvider(PATCH, { id: 'bad id', baseURL: 'https://a', models: ['m'] }),

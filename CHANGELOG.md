@@ -24,6 +24,13 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `/provider`'s add panel can fetch model ids from the upstream (`f`): the Host
+  interrogates `GET {baseURL}/models` through its own discovery seam and fills
+  the draft — adoption, not sync, because a listing carries no capacities. The
+  panel also gains an `api` field (default `anthropic-messages`) that
+  `provider/create` now writes; a model outside the installed catalog is
+  invalid without it.
+
 - The provider editor accepts pasted values (`ctrl-v`/middle-click from a
   password manager, bracketed paste) in every field, and the ask panel's custom
   answer box does too.
