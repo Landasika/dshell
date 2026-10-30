@@ -730,6 +730,27 @@ test('completion finds slash commands and @ files', () => {
   assert.equal(completionFor('look at @src/ma', ['src/main.ts']).items[0].label, '@src/main.ts')
 })
 
+test('a leading $ completes user-invocable skills into the /name gesture', () => {
+  const skills = [
+    { name: 'dsh-config', description: 'edit the harness config', userInvocable: true },
+    { name: 'blackboard', description: 'multi-agent board', userInvocable: true },
+    { name: 'internal-only', description: 'not offered to users', userInvocable: false },
+  ]
+  assert.deepEqual(completionContext('$ds'), { kind: 'skill', query: 'ds', start: 0, end: 3 })
+  assert.equal(completionContext('$ds '), null)
+  assert.equal(completionContext('costs $5'), null, 'only a leading $ opens the menu')
+
+  const items = completionFor('$ds', [], skills).items
+  assert.deepEqual(items.map((item) => item.label), ['$dsh-config'])
+  assert.equal(items[0].insert, '/dsh-config ')
+  assert.equal(items[0].kind, 'skill')
+  assert.deepEqual(
+    completionFor('$', [], skills).items.map((item) => item.label),
+    ['$dsh-config', '$blackboard'],
+    'non-user-invocable skills stay out of the menu',
+  )
+})
+
 test('session titles come from the latest session/title event', () => {
   assert.equal(
     latestSessionTitle([
@@ -2132,6 +2153,59 @@ test('TUI provider screen edits a field and asks before restarting the Host', as
   input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
+})
+
+test('typing $ opens the skill menu and expands to the slash gesture', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(output.text.slice(-600))}`)
+  }
+  try {
+    await waitFor(() => output.text.includes('idle'), 'the first attach')
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    input.push('$rel')
+    // The catalog is fetched on the first `$`, so the menu appears a tick later.
+    // The menu pads labels to a fixed column, so long names are clipped.
+    await waitFor(() => output.text.includes('skills') && output.text.includes('$release-checkl'), 'the skill menu')
+
+    output.text = ''
+    input.push('\t')
+    await waitFor(() => output.text.includes('/release-checklist'), 'the expanded gesture')
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
 })
 
 test('TUI lists the agent presets a session would compose', async () => {

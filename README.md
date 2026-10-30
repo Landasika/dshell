@@ -195,7 +195,7 @@ Inside a session you get the transcript, the composer and the footer rail:
 ────────────────────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps
 ❯ ask anything
 ──────────────────────────────────────────────────────────────────────
-  enter send · / commands · @ files · ctrl+r history · ? help
+  enter send · / commands · $ skills · @ files · ctrl+r history · ? help
 deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑12.4k ↓840
 ```
 
@@ -206,7 +206,8 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Enter` | send — steers the running turn, otherwise starts one |
 | `Alt-Q` | queue the prompt for the next turn |
 | `Ctrl-Enter` / `Shift-Enter` | newline in the composer |
-| `Tab` | complete `/` commands and `@` files |
+| `Tab` | complete `/` commands, `$` skills and `@` files |
+| `$` at line start | skill menu — picking one inserts the `/name` gesture |
 | `↑` / `↓` | prompt history |
 | `PgUp` / `PgDn`, wheel | scroll the transcript |
 | `Alt-↑` / `Alt-↓` | select blocks, then `Enter` to open or `Esc` to clear |
@@ -224,6 +225,11 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 In `/skills`: `↑/↓` move, `Enter` opens the skill body (rendered markdown),
 `i` puts `/name ` into the editor to invoke it, `Backspace` goes back to the
 list, `Esc` closes.
+
+A skill is invoked by sending its `/name` gesture: the Host parses the token
+anywhere in the prompt and injects the skill body for that turn. `$` is the
+shortcut — `$dsh` lists user-invocable skills, `Tab` turns it into
+`/dsh-config ` so you can add the request after it.
 
 In an `ask_user_question` card: `↑/↓` move, `Space` toggles a choice (multi-
 select), `c` types a custom answer, `Enter` submits, `Esc` leaves it pending

@@ -30,7 +30,14 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/quit', description: 'leave the TUI (does not cancel the Host turn)' },
 ]
 
-export type CompletionKind = 'command' | 'file'
+export type CompletionKind = 'command' | 'file' | 'skill'
+
+/** The slice of a skill the `$` menu needs. */
+export interface SkillCandidate {
+  name: string
+  description: string
+  userInvocable: boolean
+}
 
 export interface CompletionContext {
   kind: CompletionKind
@@ -66,6 +73,12 @@ export function completionContext(text: string): CompletionContext | null {
     if (/\s/.test(text)) return null
     return { kind: 'command', query: text.slice(1), start: 0, end: text.length }
   }
+  // `$` is the skill shortcut: it expands to the `/name` gesture the Host
+  // already parses, so the composer never invents a second invocation syntax.
+  if (text.startsWith('$')) {
+    if (/\s/.test(text)) return null
+    return { kind: 'skill', query: text.slice(1), start: 0, end: text.length }
+  }
   const at = text.lastIndexOf('@')
   if (at === -1) return null
   if (at > 0 && !/\s/.test(text[at - 1] ?? '')) return null
@@ -87,6 +100,19 @@ export function commandItems(query: string): CompletionItem[] {
     }))
 }
 
+/** Skills the user may invoke by name, filtered by the `$` query. */
+export function skillItems(query: string, skills: readonly SkillCandidate[]): CompletionItem[] {
+  const normalized = query.toLowerCase()
+  return skills
+    .filter((skill) => skill.userInvocable && skill.name.toLowerCase().startsWith(normalized))
+    .map((skill) => ({
+      kind: 'skill' as const,
+      label: `$${skill.name}`,
+      description: skill.description,
+      insert: `/${skill.name} `,
+    }))
+}
+
 export function fileItems(query: string, candidates: readonly string[]): CompletionItem[] {
   return candidates
     .filter((candidate) => candidate.startsWith(query))
@@ -98,15 +124,18 @@ export function fileItems(query: string, candidates: readonly string[]): Complet
     }))
 }
 
-/** Build the menu for the current composer text and cwd file candidates. */
+/** Build the menu for the current composer text and its candidate sources. */
 export function completionFor(
   text: string,
   files: readonly string[],
+  skills: readonly SkillCandidate[] = [],
 ): CompletionState | null {
   const context = completionContext(text)
   if (context === null) return null
   const items = context.kind === 'command'
     ? commandItems(context.query)
-    : fileItems(context.query, files)
+    : context.kind === 'skill'
+      ? skillItems(context.query, skills)
+      : fileItems(context.query, files)
   return { context, items, index: 0 }
 }

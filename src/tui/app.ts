@@ -1664,11 +1664,37 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
+  /** Skills for the `$` menu; the first `$` fetches the catalog lazily. */
+  let skillLoad: Promise<void> | undefined
+  const skillCandidates = () => {
+    const cached = state.skillCatalog
+    if (cached !== undefined && cached.sessionId === state.view?.sessionId) return cached.entries
+    if (skillLoad === undefined) {
+      skillLoad = (async () => {
+        try {
+          const catalog = await backend.listSkills(
+            state.view?.header.cwd ?? options.cwd,
+            state.view?.sessionId,
+          )
+          state.skillCatalog = { sessionId: state.view?.sessionId, entries: catalog.skills }
+        } catch {
+          // A Host without a skills registry simply has no `$` suggestions.
+        } finally {
+          skillLoad = undefined
+          refreshCompletion()
+          schedule()
+        }
+      })()
+    }
+    return []
+  }
+
   const refreshCompletion = (): void => {
     const text = state.editor.text
     const context = completionContext(text)
     const files = context?.kind === 'file' ? fileCandidates(options.cwd, context.query) : []
-    state.completion = completionFor(text, files) ?? undefined
+    const skills = context?.kind === 'skill' ? skillCandidates() : []
+    state.completion = completionFor(text, files, skills) ?? undefined
   }
 
   const acceptCompletion = (execute: boolean): void => {
@@ -3593,7 +3619,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const columns = screen.size.columns
     const width = Math.max(30, Math.min(columns - 4, 80))
     const inner = width
-    const title = completion.context.kind === 'command' ? 'commands' : 'files'
+    const title = completion.context.kind === 'command'
+      ? 'commands'
+      : completion.context.kind === 'skill'
+        ? 'skills'
+        : 'files'
     const body: string[] = []
     const visibleCount = Math.max(1, Math.min(8, screen.size.rows - 14))
     const start = Math.max(
@@ -3609,10 +3639,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       )
     }
     if (completion.items.length === 0) {
-      body.push(paint(theme, 'muted', completion.context.kind === 'command' ? 'no matching command' : 'no matching file'))
+      body.push(paint(theme, 'muted', completion.context.kind === 'command'
+        ? 'no matching command'
+        : completion.context.kind === 'skill'
+          ? skillLoad !== undefined ? 'loading skills…' : 'no matching skill'
+          : 'no matching file'))
     }
+    const hint = completion.context.kind === 'skill'
+      ? '↑/↓ select · tab/enter insert · esc close'
+      : '↑/↓ select · tab insert · enter run/select · esc close'
     return panelRule(theme, title, body, width, {
-      footer: [paint(theme, 'muted', '↑/↓ select · tab insert · enter run/select · esc close')],
+      footer: [paint(theme, 'muted', hint)],
     })
   }
 

@@ -7,6 +7,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `$` at the start of the composer opens the skill menu; picking a row inserts
+  the `/name ` gesture the Host already parses, so invocation is two keys away
+  instead of remembering the name or opening `/skills`.
+
 - `skills/dsh-config`: a skill that documents the layer order, the
   patch-row semantics (per-key replacement, `name` matching, `insert`), the
   provider and model schemas, preset structure (persona, tools, skills), the
