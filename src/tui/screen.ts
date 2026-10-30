@@ -99,6 +99,28 @@ export class TerminalScreen {
     return text
   }
 
+  /**
+   * Move an existing selection by `delta` rows, so a highlight stays on the text
+   * it was drawn over while the viewport scrolls. A selection scrolled fully
+   * out of the frame is dropped.
+   */
+  shiftSelection(delta: number, minRow = 1, maxRow = this.size.rows): void {
+    const selection = this.selection
+    if (selection === null || delta === 0) return
+    const startRow = selection.startRow + delta
+    const endRow = selection.endRow + delta
+    if (endRow < minRow || startRow > maxRow) {
+      this.selection = null
+      return
+    }
+    this.selection = {
+      startRow: Math.max(minRow, startRow),
+      startColumn: selection.startColumn,
+      endRow: Math.min(maxRow, endRow),
+      endColumn: selection.endColumn,
+    }
+  }
+
   /** Copy the current selection through the terminal's clipboard (OSC 52). */
   copySelection(): string {
     if (this.selection === null) return ''

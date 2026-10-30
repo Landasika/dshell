@@ -5,6 +5,13 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
+### Changed
+
+- Mouse selections survive wheel scrolling: the highlight moves with the text it
+  covers (clipped at the transcript band) instead of the wheel throwing the
+  selection away. Scrolling inside a panel still clears it, because panels
+  repaint their own rows.
+
 ### Added
 
 - `$` at the start of the composer opens the skill menu; picking a row inserts

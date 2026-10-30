@@ -3395,6 +3395,79 @@ test('panel viewers copy their body with y and with a mouse drag', async () => {
   }
 })
 
+test('a copied selection follows the text it covers when the wheel scrolls', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = []
+  for (let turn = 1; turn <= 40; turn += 1) {
+    events.push({
+      type: 'assistant/message',
+      seq: turn,
+      time: Date.now(),
+      data: { message: { role: 'assistant', content: [{ type: 'text', text: `message number ${String(turn)}` }] } },
+    })
+  }
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', title: 't', events }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-700))}`)
+  }
+  const highlights = () => [...output.text.matchAll(/\u001b\[7m([^\u001b]*)\u001b\[27m/g)]
+    .map((match) => match[1])
+    .filter((text) => text.includes('message number'))
+
+  try {
+    await waitFor(() => stripAnsi(output.text).includes('idle'), 'the session to attach')
+    // Drag across a few transcript lines and copy them.
+    input.push('\u001b[<0;2;10M')
+    input.push('\u001b[<32;24;18M')
+    input.push('\u001b[<0;24;18m')
+    await waitFor(() => stripAnsi(output.text).includes('copied'), 'the copy toast')
+    const before = highlights()
+    assert.ok(before.length > 0, `expected highlighted lines, got ${JSON.stringify(stripAnsi(output.text).slice(-400))}`)
+
+    // Scrolling must keep the highlight on the same text, not drop it.
+    output.text = ''
+    input.push('\u001b[<64;10;10M')
+    input.push('\u001b[<64;10;10M')
+    input.push('\u001b[<64;10;10M')
+    await waitFor(() => highlights().length > 0, 'the highlight after scrolling')
+    // The selection moves with the text; the part scrolled past the last
+    // transcript row is clipped rather than smeared over the composer.
+    assert.ok(highlights().every((text) => before.includes(text)), `unexpected rows highlighted: ${JSON.stringify(highlights())}`)
+  } finally {
+    input.push('\u0004')
+    await app
+    await backend.disconnect()
+  }
+})
+
 test('a user-invocable skill reaches the model as a /name gesture', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')

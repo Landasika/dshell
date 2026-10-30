@@ -402,6 +402,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let herdrResume: { id: string; argv: string[] | undefined } | undefined
   let metricsCache: { key: string; value: SessionMetrics } | undefined
   let lastBodyHeight = 3
+  /** First screen row of the transcript body, so a selection can be clamped. */
+  let lastBodyTop = 3
   let reattaching = false
   let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
   /** Call id already announced as waiting behind another panel. */
@@ -2411,6 +2413,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     // copies the panel, not the transcript under it.
     if ((key.type === 'click' || key.type === 'drag' || key.type === 'release') && handleSelectionKey(key)) return
     if (state.overlay !== null) {
+      // Panels repaint their own rows on scroll, so a screen-space highlight
+      // cannot follow the text: drop it rather than smear it over new content.
+      if (key.type === 'wheel' && screen.hasSelection) screen.setSelection(null)
       handleOverlayKey(key)
       // A panel that just closed may have been covering a waiting question.
       if (state.overlay === null) {
@@ -2421,8 +2426,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'wheel') {
       selectAnchor = null
-      screen.setSelection(null)
+      // A copy stays highlighted: wheel scrolling moves the highlight with the
+      // text it covers instead of throwing the selection away.
+      const before = viewport.scrollOffset
       viewport.scroll(-key.delta * 3, transcriptLineCount(), transcriptHeight())
+      screen.shiftSelection(viewport.scrollOffset - before, lastBodyTop, lastBodyTop + lastBodyHeight - 1)
       schedule()
       return
     }
@@ -3756,6 +3764,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         1,
     )
     lastBodyHeight = bodyHeight
+    lastBodyTop = header.length + 1
     const visible = viewport.visible(transcriptData.lines, bodyHeight)
     const body = visible.lines.slice()
     if (mergeStrip && body.length > 0) {
