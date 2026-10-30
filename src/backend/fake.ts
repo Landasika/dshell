@@ -41,6 +41,7 @@ const CAPABILITIES: DshellCapabilities = {
   questions: true,
   models: true,
   providers: true,
+    providerKey: true,
   skills: true,
   agents: true,
 }
@@ -79,6 +80,8 @@ export class FakeBackend implements DshellBackend {
   private nextId = 1
   private defaultModel: ModelSelection = { provider: 'fake', model: 'fake-flash' }
   private readonly sessionModels = new Map<string, ModelSelection>()
+  /** Secrets stored through `storeProviderKey`, so tests can assert on them. */
+  readonly storedKeys = new Map<string, string>()
   /** Providers the fake patch file declares; `updateProvider` mutates this. */
   private readonly providerRows: ProviderEntry[] = [
     { id: 'fake', displayName: 'Fake Provider', baseURL: 'https://api.example/v1', apiKeyEnv: 'FAKE_API_KEY', models: 2 },
@@ -274,6 +277,17 @@ export class FakeBackend implements DshellBackend {
     if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
     row[field] = value
     return this.providerList()
+  }
+
+  async storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }> {
+    this.assertConnected()
+    const row = this.providerRows.find((candidate) => candidate.id === providerId)
+    if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
+    const ref = `${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`
+    row.apiKeyEnv = ref
+    this.storedKeys.set(ref, value)
+    const list = await this.providerList()
+    return { file: list.file, writable: list.writable, providers: list.providers, ref }
   }
 
   async createProvider(spec: NewProviderSpec): Promise<ProviderList> {

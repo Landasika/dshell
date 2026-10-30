@@ -112,7 +112,35 @@ The secret itself:
 `llm-pi-ai` in a stronger layer, because `config` replaces wholesale. Prefer
 editing the existing block in place over adding a second override.
 
-## 4. Change the default model
+## 4. Add a model to an existing provider
+
+A model is an entry in the provider's `models` list; the route id is
+`<provider>:<model-id>`. Two cases:
+
+**The installed pi-ai catalog already knows the model** (most first-party
+models do): tweak it with `modelOverrides`, which only needs the fields you
+change — no restating the list:
+
+```yaml
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      deepseek-relay:
+        modelOverrides:
+          deepseek-v4.1: { contextWindow: 262144, maxTokens: 65536 }
+```
+
+**A model the catalog does not know** (anything behind a relay/gateway): add it
+to `models`. A non-empty `models` **replaces** the served catalog for that
+provider, so the list must contain every model the route should serve — old
+entries disappear if you omit them. `modelOverrides` may not sit beside a
+`models` list; declare the fields on the entries directly.
+
+Then pick it per session (`/model`) or make it the default — next section.
+Verify the route resolves: `dsh --dump-config --profile web | grep -A3 the-model-id`.
+
+## 5. Change the default model
 
 `~/.dsh/profiles/<profile>/cordis.patch.yml`:
 
@@ -127,7 +155,7 @@ editing the existing block in place over adding a second override.
 This is the default for **new** agents; existing sessions keep their own
 selection (stored in the session log).
 
-## 5. Agent presets = the harness
+## 6. Agent presets = the harness
 
 A preset declares one agent: `{id, name?, description?, order?, plugins: [...]}`.
 Each plugin row is `{id, name, disabled?, config?}`.
@@ -184,7 +212,7 @@ Each plugin row is `{id, name, disabled?, config?}`.
   `<project>/.agents/skills`; extra roots go in that preset's plugin row:
   `config: { customSkillDirs: ['/abs/path'] }`.
 
-## 6. Verify before you walk away
+## 7. Verify before you walk away
 
 ```bash
 # Effective composition, after all layers are applied:
@@ -211,7 +239,7 @@ by default"), so a save applies without a restart:
 - preset rows: **new** sessions compose the new preset; running agents keep the
   composition they mounted. Restart the session (or the Host) to remount.
 
-## 7. Safety
+## 8. Safety
 
 - Back up before editing: `cp cordis.patch.yml cordis.patch.yml.bak`.
 - A YAML syntax error in a patch stops the Host from booting. Keep the edit

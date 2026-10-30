@@ -24,6 +24,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- The provider editor accepts pasted values (`ctrl-v`/middle-click from a
+  password manager, bracketed paste) in every field, and the ask panel's custom
+  answer box does too.
+- Pasting a raw key (`sk-…`) into `apiKeyEnv` stores it in the Host credential
+  store (`~/.dsh/.credentials.yaml`) and points the field at the reference it
+  resolves through — the secret never lands in the patch file. New
+  `provider/api-key` message and `provider-key` capability back it.
+
 - `$` at the start of the composer opens the skill menu; picking a row inserts
   the `/name ` gesture the Host already parses, so invocation is two keys away
   instead of remembering the name or opening `/skills`.

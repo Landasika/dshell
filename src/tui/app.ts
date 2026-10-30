@@ -257,7 +257,7 @@ const PROVIDER_CREATE_HINTS: Record<ProviderCreateField, string> = {
   id: 'provider id, e.g. my-relay',
   displayName: 'shown in the picker (optional)',
   baseURL: 'https://gateway.example/v1',
-  apiKeyEnv: 'env var name (optional)',
+  apiKeyEnv: 'env var name, or paste sk-… to store it',
   models: 'model ids, comma or space separated',
 }
 
@@ -1241,6 +1241,24 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  /**
+   * A key the user pasted (`sk-…`) is a value, not a name: store it in the
+   * Host's credential store and let `apiKeyEnv` carry the reference that
+   * reads it back. Returns the ref, or undefined when the value already is a
+   * reference (or the Host cannot store secrets).
+   */
+  const storeRawKey = async (providerId: string, value: string): Promise<string | undefined> => {
+    const key = value.trim()
+    if (key.length === 0 || /^[A-Z][A-Z0-9_]*$/.test(key)) return undefined
+    if (!backend.capabilities().providerKey) {
+      toast('this Host cannot store keys; enter an environment variable name instead')
+      return undefined
+    }
+    const list = await backend.storeProviderKey(providerId, key)
+    state.providers = list
+    return list.ref
+  }
+
   const saveProvider = async (overlay: Extract<Overlay, { kind: 'providerEdit' }>): Promise<void> => {
     const fields = PROVIDER_FIELD_ORDER.filter((field) => overlay.dirty.has(field))
     if (fields.length === 0) {
@@ -1252,6 +1270,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.status = 'saving provider'
     schedule()
     try {
+      if (fields.includes('apiKeyEnv')) {
+        const ref = await storeRawKey(overlay.providerId, overlay.draft.apiKeyEnv)
+        if (ref !== undefined) {
+          toast(`key stored in ~/.dsh/.credentials.yaml as ${ref}`)
+          fields.splice(fields.indexOf('apiKeyEnv'), 1)
+        }
+      }
       for (const field of fields) {
         state.providers = await backend.updateProvider(overlay.providerId, field, overlay.draft[field])
       }
@@ -1298,6 +1323,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       toast('add at least one model id')
       return
     }
+    // `sk-…` is a value: create the provider first, then store the secret and
+    // point apiKeyEnv at the reference that resolves it.
+    const rawKey = /^[A-Z][A-Z0-9_]*$/.test(apiKeyEnv) || apiKeyEnv.length === 0 ? undefined : apiKeyEnv
     state.status = 'adding provider'
     schedule()
     try {
@@ -1306,8 +1334,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         baseURL,
         models,
         ...(displayName.length === 0 ? {} : { displayName }),
-        ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
+        ...(rawKey !== undefined || apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
       })
+      if (rawKey !== undefined) {
+        const stored = await storeRawKey(id, rawKey)
+        if (stored !== undefined) toast(`key stored in ~/.dsh/.credentials.yaml as ${stored}`)
+      }
     } catch (error) {
       state.status = 'idle'
       toast(`provider add failed: ${errorText(error)}`)
@@ -2060,6 +2092,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
       if (overlay.customMode) {
         if (key.type === 'text') overlay.custom[qid] = (overlay.custom[qid] ?? '') + key.text
+        else if (key.type === 'paste') overlay.custom[qid] = (overlay.custom[qid] ?? '') + key.text.replace(/\s+/g, ' ').trim()
         else if (key.type === 'backspace') {
           const chars = Array.from(overlay.custom[qid] ?? '')
           chars.pop()
@@ -2418,6 +2451,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           editing.value = ''
         } else if (key.type === 'text') {
           editing.value += key.text
+        } else if (key.type === 'paste') {
+          // Keys and URLs arrive from a password manager with a trailing
+          // newline; displayName is the only field where a space is data.
+          editing.value += editing.field === 'displayName'
+            ? key.text.replace(/\s+/g, ' ').trim()
+            : key.text.replace(/\s+/g, '')
         }
         schedule()
         return
@@ -2448,6 +2487,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           editing.value = ''
         } else if (key.type === 'text') {
           editing.value += key.text
+        } else if (key.type === 'paste') {
+          editing.value += editing.field === 'displayName'
+            ? key.text.replace(/\s+/g, ' ').trim()
+            : key.text.replace(/\s+/g, '')
         }
         schedule()
         return
@@ -3499,7 +3542,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       }
       body.push('')
       body.push(paint(theme, 'muted', 'the new block is appended to the providers map'))
-      body.push(paint(theme, 'muted', 'the API key itself stays in the environment'))
+      body.push(paint(theme, 'muted', 'apiKeyEnv: a NAME like MY_RELAY_KEY, or paste sk-… to store it'))
       return panelRule(theme, 'add provider', body, width, {
         footer: [paint(theme, 'muted', overlay.editing === undefined
           ? 'enter edit · s add · esc back'

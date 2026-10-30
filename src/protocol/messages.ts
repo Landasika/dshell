@@ -19,6 +19,7 @@ export const CAPABILITIES = [
   'skills',
   'models',
   'providers',
+  'provider-key',
   'agents',
 ] as const
 
@@ -252,6 +253,17 @@ export interface ProviderUpdatedMessage {
   providers: ProviderEntry[]
 }
 
+export interface ProviderKeyStoredMessage {
+  type: 'provider-key-stored'
+  /** Credentials file the secret landed in. */
+  credentialsFile: string
+  /** The reference `apiKeyEnv` now carries. */
+  ref: string
+  file: string
+  providerId: string
+  providers: ProviderEntry[]
+}
+
 export interface ProviderCreatedMessage {
   type: 'provider-created'
   file: string
@@ -449,6 +461,7 @@ export type ClientMessage =
   | { type: 'model/catalog' }
   | { type: 'provider/list' }
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
+  | { type: 'provider/api-key'; providerId: string; value: string }
   | {
       type: 'provider/create'
       providerId: string
@@ -489,6 +502,7 @@ export type ServerMessage =
   | ModelSelectedMessage
   | ProviderListMessage
   | ProviderUpdatedMessage
+  | ProviderKeyStoredMessage
   | ProviderCreatedMessage
   | ProviderDeletedMessage
   | AgentRosterMessage

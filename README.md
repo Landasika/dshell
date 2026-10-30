@@ -222,6 +222,10 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-C` | cancel the turn (or quit when idle) |
 | `Ctrl-D` | quit |
 
+In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
+`apiKeyEnv` is stored in `~/.dsh/.credentials.yaml` and the field keeps only its
+reference), `s` saves, `r` restarts the Host.
+
 A mouse selection is copied on release (OSC 52) and stays highlighted. It is
 tracked in transcript coordinates, not screen rows: wheel scrolling carries it
 with the text it covers, and dragging past the top or bottom edge keeps

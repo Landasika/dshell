@@ -62,6 +62,8 @@ export interface DshellCapabilities {
   models: boolean
   /** The Host can read and rewrite its provider patch file, and restart itself. */
   providers: boolean
+  /** The Host credential store can hold pasted keys (`sk-…`). */
+  providerKey: boolean
   /** The Host exposes its `ctx.skills` catalog for browsing. */
   skills: boolean
   /** The Host can read the agent presets it composes sessions from. */
@@ -234,6 +236,8 @@ export interface DshellBackend {
   agentRoster(): Promise<AgentRoster>
   /** Rewrite one provider field; takes effect after the Host restarts. */
   updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>
+  /** Store a raw key in the Host credential store; returns the ref it now answers to. */
+  storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }>
   /** Append a new provider block; takes effect after the Host restarts. */
   createProvider(spec: NewProviderSpec): Promise<ProviderList>
   /** Remove a provider block; takes effect after the Host restarts. */

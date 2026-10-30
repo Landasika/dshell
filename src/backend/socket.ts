@@ -11,6 +11,7 @@ import type {
   ModelSelectedMessage,
   ModelSelection,
   ProviderCreatedMessage,
+  ProviderKeyStoredMessage,
   ProviderDeletedMessage,
   ProviderField,
   ProviderListMessage,
@@ -98,6 +99,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     questions: has('questions'),
     models: has('models'),
     providers: has('providers'),
+    providerKey: has('provider-key'),
     agents: has('agents'),
     skills: has('skills'),
   }
@@ -234,6 +236,20 @@ export class SocketBackend implements DshellBackend {
         15_000,
       )
       return { file: message.file, writable: true, providers: message.providers }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<ProviderKeyStoredMessage>(
+        { type: 'provider/api-key', providerId, value },
+        (candidate) => candidate.type === 'provider-key-stored',
+        15_000,
+      )
+      return { file: message.file, writable: true, providers: message.providers, ref: message.ref }
     } catch (error) {
       throw mapError(error)
     }

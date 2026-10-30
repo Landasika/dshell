@@ -792,6 +792,14 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   }
 
   const skillRegistry = (): SkillsRegistryLike | undefined => ctx.get?.('skills') as SkillsRegistryLike | undefined
+  /** The Host's credential store: `set` writes ~/.dsh/.credentials.yaml. */
+  const credentialStore = (): { set(ref: string, value: string): Promise<void> } | undefined => {
+    const service = ctx.get?.('credentials') as
+      | { set?: (ref: string, value: string) => Promise<void> }
+      | undefined
+    if (typeof service?.set !== 'function') return undefined
+    return { set: (ref: string, value: string) => service.set?.(ref, value) ?? Promise.resolve() }
+  }
 
   const hubDirs = resolveHubDirs({
     configured: config.skillHub,
@@ -1068,6 +1076,73 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       providerId,
       field,
       value: value.trim(),
+      providers: providerRows(),
+    })
+  }
+
+  /**
+   * Store a raw API key (`sk-…`) for one provider: the secret goes to the
+   * Host's credential store and `apiKeyEnv` in the patch file is pointed at
+   * the reference that reads it back. The secret itself never lands in YAML.
+   */
+  const storeProviderKey = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
+    const value = typeof message.value === 'string' ? message.value.trim() : ''
+    const store = credentialStore()
+    if (providerId.length === 0 || value.length === 0) {
+      sendError(socket, {
+        type: 'error',
+        code: 'BAD_REQUEST',
+        message: 'provider/api-key needs providerId and the key value',
+      })
+      return
+    }
+    if (store === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host has no credential store',
+        action: 'Set apiKeyEnv to a name resolved from the launch environment instead.',
+      })
+      return
+    }
+    const file = providerFile()
+    if (file === undefined || !providerWritable(file)) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: file === undefined
+          ? 'this Host found no cordis.patch.yml to write providers to'
+          : `${file} is not writable`,
+      })
+      return
+    }
+    const ref = `${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')}_API_KEY`
+    await store.set(ref, value)
+    const before = safeRead(file)
+    let after: string
+    try {
+      after = setProviderField(before, providerId, 'apiKeyEnv', ref)
+    } catch (error) {
+      if (error instanceof ProviderEditError) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        return
+      }
+      throw error
+    }
+    if (after !== before) {
+      const expected = providerRows().map((row) => {
+        if (row.id !== providerId) return row
+        return { ...row, apiKeyEnv: ref }
+      })
+      if (!persistProviders(socket, file, after, expected)) return
+    }
+    jsonLine(socket, {
+      type: 'provider-key-stored',
+      credentialsFile: '~/.dsh/.credentials.yaml',
+      ref,
+      file,
+      providerId,
       providers: providerRows(),
     })
   }
@@ -1810,6 +1885,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             capabilities: (CAPABILITIES as readonly Capability[]).filter((capability) => {
               if (capability === 'models') return sessionController() !== undefined
               if (capability === 'providers') return providerFile() !== undefined
+              if (capability === 'provider-key') return credentialStore() !== undefined && providerFile() !== undefined
               if (capability === 'agents') return configEditor() !== undefined
               if (capability === 'skills') return skillRegistry() !== undefined
               return true
@@ -1903,6 +1979,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'provider/update':
           await updateProvider(socket, message)
+          return
+        case 'provider/api-key':
+          await storeProviderKey(socket, message)
           return
         case 'provider/create':
           await createProvider(socket, message)

@@ -2171,6 +2171,78 @@ test('TUI provider screen edits a field and asks before restarting the Host', as
   await backend.disconnect()
 })
 
+test('provider editor pastes a field value and stores a raw sk- key', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+
+  await waitFor(() => output.text.includes('idle'))
+  input.push('/provider')
+  input.push('\r')
+  await waitFor(() => output.text.includes('/fake/cordis.patch.yml'))
+
+  // Relay row -> editor -> apiKeyEnv (second field).
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\r')
+  await waitFor(() => output.text.includes('provider · relay'))
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('\r')
+  await waitFor(() => output.text.includes('apiKeyEnv'))
+
+  // A paste from a password manager carries a trailing newline; the field
+  // must accept it, and a sk- value is a secret, not an env name.
+  input.push('\u001b[200~sk-relay-secret-123\n\u001b[201~')
+  await waitFor(() => output.text.includes('sk-relay-secret-123'))
+  input.push('\r')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  input.push('s')
+  await waitFor(() => output.text.includes('key stored in ~/.dsh/.credentials.yaml as RELAY_API_KEY'))
+  await waitFor(() => output.text.includes('Restart it now to load this change?'))
+  input.push('n')
+
+  const row = (await backend.providerList()).providers.find((entry) => entry.id === 'relay')
+  assert.equal(row.apiKeyEnv, 'RELAY_API_KEY', 'the patch file carries the reference, not the secret')
+  assert.equal(backend.storedKeys.get('RELAY_API_KEY'), 'sk-relay-secret-123')
+  assert.equal(output.text.includes('sk-relay-secret-123'), true, 'the paste landed in the field')
+
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('typing $ opens the skill menu and expands to the slash gesture', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
