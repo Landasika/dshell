@@ -1,4 +1,5 @@
 import type {
+  AgentPresetSummary,
   AskedQuestion,
   DshellErrorCode,
   ModelCatalog,
@@ -63,6 +64,8 @@ export interface DshellCapabilities {
   providers: boolean
   /** The Host exposes its `ctx.skills` catalog for browsing. */
   skills: boolean
+  /** The Host can read the agent presets it composes sessions from. */
+  agents: boolean
 }
 
 /** A skill catalog plus the hub roots the Host serves. */
@@ -78,6 +81,13 @@ export interface NewProviderSpec {
   apiKeyEnv?: string
   displayName?: string
   models: string[]
+}
+
+/** The agent presets the Host composes sessions from. */
+export interface AgentRoster {
+  presets: AgentPresetSummary[]
+  /** The preset a session created now would compose. */
+  defaultId?: string
 }
 
 /** The provider rows of the Host's active patch file. */
@@ -220,6 +230,8 @@ export interface DshellBackend {
   listSkills(cwd?: string, sessionId?: string): Promise<SkillCatalog>
   getSkill(name: string, cwd?: string, sessionId?: string): Promise<string>
   providerList(): Promise<ProviderList>
+  /** Read the agent presets the Host would compose a session from. */
+  agentRoster(): Promise<AgentRoster>
   /** Rewrite one provider field; takes effect after the Host restarts. */
   updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>
   /** Append a new provider block; takes effect after the Host restarts. */

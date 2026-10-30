@@ -3,6 +3,16 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [Unreleased]
+
+### Added
+
+- `/harness` lists the agent presets the Host composes sessions from: each
+  preset's id, enabled/total plugin rows, whether the profile patch owns it,
+  which one is the default, and the selected preset's first rows with the
+  persona prompt and disabled tools called out. Read-only for now; it is the
+  surface a preset editor will grow on.
+
 ## [0.3.0] — 2026-10-29
 
 ### Changed

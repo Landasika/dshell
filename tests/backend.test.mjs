@@ -71,6 +71,25 @@ test('FakeBackend exposes workspaces, sessions, streaming, and approval', async 
   await backend.disconnect()
 })
 
+test('FakeBackend exposes the agent presets a session would compose', async () => {
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  assert.equal(backend.capabilities().agents, true)
+
+  const roster = await backend.agentRoster()
+  assert.equal(roster.defaultId, 'standard')
+  assert.deepEqual(roster.presets.map((preset) => preset.id), ['standard', 'minimal'])
+  assert.equal(roster.presets[0].plugins.some((plugin) => plugin.id === 'persona'), true)
+  assert.equal(roster.presets[0].plugins.find((plugin) => plugin.id === 'tool-pwsh').disabled, true)
+  assert.equal(roster.presets[0].overridden, true)
+  assert.equal(roster.presets[1].overridden, false)
+
+  // The roster is a detached copy: mutating it must not reach the backend.
+  roster.presets[0].plugins.length = 0
+  assert.equal((await backend.agentRoster()).presets[0].plugins.length, 4)
+  await backend.disconnect()
+})
+
 test('SocketBackend answers pending questions', async (t) => {
   let answered = null
   let host = null

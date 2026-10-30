@@ -2134,6 +2134,68 @@ test('TUI provider screen edits a field and asks before restarting the Host', as
   await backend.disconnect()
 })
 
+test('TUI lists the agent presets a session would compose', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 34
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+  try {
+    await waitFor(() => output.text.includes('idle'))
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    input.push('/harness')
+    input.push('\r')
+    await waitFor(() => output.text.includes('agent presets'))
+
+    // The selected preset leads with its prompt layer and its badging.
+    assert.ok(output.text.includes('standard'))
+    assert.ok(output.text.includes('● default'))
+    assert.ok(output.text.includes('✎ your patch'))
+    assert.ok(output.text.includes('You are a coding agent.'))
+
+    // ↓ moves to the second preset and swaps the detail block.
+    output.text = ''
+    input.push('\u001b[B')
+    await waitFor(() => output.text.includes('Answer questions about the code.'))
+    assert.ok(output.text.includes('minimal'))
+
+    input.push('\u001b')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  } finally {
+    input.push('\u0003')
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+  }
+})
+
 test('TUI adds and removes providers like the Web UI models page', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')

@@ -20,6 +20,8 @@ import { createInterface } from 'node:readline'
 import {
   CAPABILITIES,
   PROTOCOL_VERSION,
+  type AgentPresetSummary,
+  type AgentRosterMessage,
   type ProviderEntry,
   type QuestionAnswer,
   type QuestionClosedMessage,
@@ -187,7 +189,25 @@ interface AgentPresetLike {
 interface AgentPresetRegistryLike {
   resolve(id?: string): Promise<AgentPresetLike>
   mount(agentCtx: unknown, id?: string): Promise<unknown>
+  /** Live registry config: the selected default and its fallback. */
+  config?: {
+    selectedDefault?: { get?(): unknown }
+    default?: { get?(): unknown }
+  }
 }
+
+/** One addressable row of the profile composition, as the config editor sees it. */
+interface ConfigRowLike {
+  entry: { options: { id: string; name?: string; config?: unknown } }
+  override: Record<string, unknown>
+}
+
+interface ConfigEditorLike {
+  configuration?(): readonly ConfigRowLike[]
+}
+
+/** The plugin package a row must mount to declare an agent preset. */
+const AGENT_PRESET_PLUGIN = '@deepseek-ai/dsh-agent-preset'
 
 interface AgentDefaultModelLike {
   currentSelection(): Record<string, unknown>
@@ -621,6 +641,69 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const sessionController = (): SessionControllerLike | undefined => {
     const lookup = ctx.get?.('sessionController')
     return lookup as SessionControllerLike | undefined
+  }
+
+  const configEditor = (): ConfigEditorLike | undefined => {
+    const lookup = ctx.get?.('configEditor') as ConfigEditorLike | undefined
+    return typeof lookup?.configuration === 'function' ? lookup : undefined
+  }
+
+  const presetRows = (): readonly ConfigRowLike[] =>
+    (configEditor()?.configuration?.() ?? []).filter((row) => row.entry.options.name === AGENT_PRESET_PLUGIN)
+
+  const presetField = (config: unknown, field: string): string | undefined => {
+    if (config === null || typeof config !== 'object') return undefined
+    const value = (config as Record<string, unknown>)[field]
+    return typeof value === 'string' && value.length > 0 ? value : undefined
+  }
+
+  const presetPlugins = (config: unknown): AgentPresetSummary['plugins'] => {
+    if (config === null || typeof config !== 'object') return []
+    const rows = (config as { plugins?: unknown }).plugins
+    if (!Array.isArray(rows)) return []
+    const plugins: AgentPresetSummary['plugins'] = []
+    for (const row of rows) {
+      if (row === null || typeof row !== 'object') continue
+      const record = row as { id?: unknown; name?: unknown; disabled?: unknown; config?: unknown }
+      if (typeof record.name !== 'string' || record.name.length === 0) continue
+      plugins.push({
+        ...(typeof record.id === 'string' ? { id: record.id } : {}),
+        name: record.name,
+        ...(record.disabled === true ? { disabled: true } : {}),
+        ...(record.config !== null && typeof record.config === 'object'
+          ? { config: record.config as Record<string, unknown> }
+          : {}),
+      })
+    }
+    return plugins
+  }
+
+  const selectedPresetId = (): string | undefined => {
+    const read = (field?: { get?(): unknown }): string | undefined => {
+      const value = field?.get?.()
+      return typeof value === 'string' && value.length > 0 ? value : undefined
+    }
+    return read(ctx.agentPresets?.config?.selectedDefault) ?? read(ctx.agentPresets?.config?.default)
+  }
+
+  const agentRoster = (): AgentRosterMessage => {
+    const presets: AgentPresetSummary[] = presetRows().map((row) => {
+      const config = row.entry.options.config
+      const name = presetField(config, 'name')
+      const description = presetField(config, 'description')
+      const order = (config as { order?: unknown } | undefined)?.order
+      return {
+        id: presetField(config, 'id') ?? row.entry.options.id,
+        ...(name === undefined ? {} : { name }),
+        ...(description === undefined ? {} : { description }),
+        ...(typeof order === 'number' ? { order } : {}),
+        plugins: presetPlugins(config),
+        overridden: Object.keys(row.override ?? {}).length > 0,
+      }
+    })
+    presets.sort((left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id))
+    const defaultId = selectedPresetId()
+    return { type: 'agents/roster', presets, ...(defaultId === undefined ? {} : { defaultId }) }
   }
 
   const forwardModelCatalog = async (socket: Socket): Promise<void> => {
@@ -1727,6 +1810,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             capabilities: (CAPABILITIES as readonly Capability[]).filter((capability) => {
               if (capability === 'models') return sessionController() !== undefined
               if (capability === 'providers') return providerFile() !== undefined
+              if (capability === 'agents') return configEditor() !== undefined
               if (capability === 'skills') return skillRegistry() !== undefined
               return true
             }),
@@ -1813,6 +1897,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'provider/list':
           listProviders(socket)
+          return
+        case 'agents/list':
+          jsonLine(socket, agentRoster())
           return
         case 'provider/update':
           await updateProvider(socket, message)

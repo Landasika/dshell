@@ -199,6 +199,30 @@ which package manager?
 Once answered, the same viewer ends with an `answers` section of `id → answer`
 rows instead of the raw `{"answers":[…]}` result.
 
+`/harness` reads the agent presets the Host composes sessions from — the row
+list is the harness: prompt layers, tools, skills, permission policy. It marks
+the default, distinguishes built-in rows from ones the profile patch owns, and
+prints the selected preset's leading rows so a disabled tool or an edited
+persona is visible at a glance:
+
+```
+harness · agent presets
+────────────────────────────────────────────────────
+▸ standard      3/4 rows  ● default  ✎ your patch
+  Coding agent with the full toolset
+  minimal       2/2 rows  built-in
+
+  persona          dsh-persona
+    You are a coding agent.
+  tool-pwsh        dsh-tool-pwsh disabled
+
+↑/↓ select · r reload · esc close
+```
+
+Writes (editing the persona, toggling a tool) are not wired yet; when they are,
+they must go through the Host's config editor so the profile patch keeps its
+comments and the loader reconciles the change.
+
 The ask is driven by the Host, not by scanning the log. `ask_user_question`
 blocks inside the `user-questions/request` waterfall; a browser is the
 answerer in the Web UI, and in a terminal the Host plugin is: it answers that

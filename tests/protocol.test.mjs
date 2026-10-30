@@ -25,6 +25,7 @@ test('protocol v2 advertises the P3 capabilities', () => {
       'skills',
       'models',
       'providers',
+      'agents',
     ],
   )
 })

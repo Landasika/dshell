@@ -5,6 +5,7 @@ import { stdin, stdout } from 'node:process'
 import type { ReadStream, WriteStream } from 'node:tty'
 
 import type {
+  AgentRoster,
   DshellBackend,
   ProviderList,
   SessionHandle,
@@ -133,6 +134,7 @@ type Overlay =
   | { kind: 'models'; index: number }
   | { kind: 'effort'; provider: string; model: string; index: number; back: number }
   | { kind: 'providers'; index: number }
+  | { kind: 'harness'; index: number; roster: AgentRoster }
   | {
       kind: 'providerEdit'
       providerId: string
@@ -1193,6 +1195,25 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  const openHarness = async (): Promise<void> => {
+    if (!backend.capabilities().agents) {
+      toast('this Host cannot read agent presets (restart a fresh dshell-host)')
+      schedule()
+      return
+    }
+    state.status = 'loading agent presets'
+    schedule()
+    try {
+      const roster = await backend.agentRoster()
+      state.overlay = { kind: 'harness', index: 0, roster }
+    } catch (error) {
+      toast(`agent presets failed: ${errorText(error)}`)
+    } finally {
+      state.status = 'idle'
+      schedule()
+    }
+  }
+
   const openProviderEditor = (entry: ProviderEntry): void => {
     state.overlay = {
       kind: 'providerEdit',
@@ -1631,6 +1652,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       case '/provider':
       case '/providers':
         await openProviderList()
+        return
+      case '/harness':
+      case '/preset':
+      case '/presets':
+        await openHarness()
         return
       default:
         if (await invokeSkill(text, command.slice(1))) return
@@ -2129,6 +2155,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         // Positional shortcut: 1 = first level, 2 = second, … commits directly.
         const effort = efforts[Number(key.text) - 1]
         if (row !== undefined && effort !== undefined) void applyModel(row, effort.id)
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'harness') {
+      const count = overlay.roster.presets.length
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.index = Math.max(0, overlay.index - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') {
+        overlay.index = Math.min(Math.max(0, count - 1), overlay.index + 1)
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'r') {
+        void openHarness()
         return
       }
       schedule()
@@ -3165,6 +3203,55 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       )
       return panelRule(theme, 'reasoning level', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ or 1-9 pick · enter switch · d default · ← back · esc close')],
+      })
+    }
+    if (overlay.kind === 'harness') {
+      const presets = overlay.roster.presets
+      const body: string[] = []
+      const inner = Math.max(20, width - 4)
+      for (const [index, preset] of presets.entries()) {
+        const selected = index === overlay.index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        const enabled = preset.plugins.filter((plugin) => plugin.disabled !== true).length
+        const badges: string[] = []
+        if (preset.id === overlay.roster.defaultId) badges.push(paint(theme, 'success', '● default'))
+        badges.push(
+          preset.overridden
+            ? paint(theme, 'accent', '✎ your patch')
+            : paint(theme, 'muted', 'built-in'),
+        )
+        body.push(
+          `${marker} ${paint(theme, selected ? 'text' : 'muted', pad(truncate(preset.id, 18), 18))}` +
+            ` ${paint(theme, 'muted', `${String(enabled)}/${String(preset.plugins.length)} rows`)}  ${badges.join('  ')}`,
+        )
+        if (selected && preset.description !== undefined) {
+          body.push(`  ${paint(theme, 'dim', truncate(preset.description, inner - 2))}`)
+        }
+      }
+      if (presets.length === 0) body.push(paint(theme, 'muted', 'no agent presets declared'))
+
+      const preset = presets[overlay.index]
+      if (preset !== undefined) {
+        body.push('')
+        const shown = preset.plugins.slice(0, 5)
+        for (const plugin of shown) {
+          const disabled = plugin.disabled === true
+          const row = [
+            paint(theme, 'dim', pad(truncate(plugin.id ?? '-', 18), 18)),
+            paint(theme, disabled ? 'muted' : 'text', plugin.name.replace('@deepseek-ai/', '')),
+            disabled ? paint(theme, 'muted', 'disabled') : '',
+          ].join(' ')
+          body.push(`  ${row}`)
+          const prefix = plugin.config?.prefix
+          if (plugin.id === 'persona' && typeof prefix === 'string' && prefix.length > 0) {
+            body.push(`    ${paint(theme, 'muted', truncate(prefix, inner - 6))}`)
+          }
+        }
+        const hidden = preset.plugins.length - shown.length
+        if (hidden > 0) body.push(paint(theme, 'dim', `  … ${String(hidden)} more rows`))
+      }
+      return panelRule(theme, 'harness · agent presets', body, width, {
+        footer: [paint(theme, 'muted', '↑/↓ select · r reload · esc close')],
       })
     }
     if (overlay.kind === 'providers') {

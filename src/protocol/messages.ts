@@ -19,6 +19,7 @@ export const CAPABILITIES = [
   'skills',
   'models',
   'providers',
+  'agents',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
@@ -265,6 +266,39 @@ export interface ProviderDeletedMessage {
   providers: ProviderEntry[]
 }
 
+/**
+ * One plugin row inside an agent preset. A preset is the composition a session
+ * runs: its prompt layers, tools, skills and permission policy are all rows
+ * here, so showing them is showing the whole harness.
+ */
+export interface AgentPresetPlugin {
+  /** Row id inside the preset (`persona`, `tool-bash`, …). */
+  id?: string
+  /** Plugin package the row mounts. */
+  name: string
+  disabled?: boolean
+  /** Row config as the preset declares it (prompt prefix, tool options, …). */
+  config?: Record<string, unknown>
+}
+
+/** One agent preset from the Host's composition. */
+export interface AgentPresetSummary {
+  id: string
+  name?: string
+  description?: string
+  order?: number
+  plugins: AgentPresetPlugin[]
+  /** The profile patch overrides this preset's rows, so it is user-owned. */
+  overridden: boolean
+}
+
+export interface AgentRosterMessage {
+  type: 'agents/roster'
+  presets: AgentPresetSummary[]
+  /** The preset a session created now would compose. */
+  defaultId?: string
+}
+
 export interface HostRestartingMessage {
   type: 'host-restarting'
   pid: number
@@ -424,6 +458,7 @@ export type ClientMessage =
       displayName?: string
     }
   | { type: 'provider/delete'; providerId: string }
+  | { type: 'agents/list' }
   | { type: 'host/restart' }
   | { type: 'model/select'; sessionId: string; provider: string; model: string; reasoningEffort?: string }
   | { type: 'model/default'; provider: string; model: string; reasoningEffort?: string }
@@ -456,5 +491,6 @@ export type ServerMessage =
   | ProviderUpdatedMessage
   | ProviderCreatedMessage
   | ProviderDeletedMessage
+  | AgentRosterMessage
   | HostRestartingMessage
   | ErrorMessage

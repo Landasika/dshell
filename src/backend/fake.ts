@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import type {
+  AgentPresetSummary,
   ModelCatalog,
   ModelSelection,
   ProviderEntry,
@@ -11,6 +12,7 @@ import type {
 } from '../protocol/index.js'
 import {
   BackendError,
+  type AgentRoster,
   type CreateSessionOptions,
   type DshellBackend,
   type DshellCapabilities,
@@ -40,6 +42,7 @@ const CAPABILITIES: DshellCapabilities = {
   models: true,
   providers: true,
   skills: true,
+  agents: true,
 }
 
 interface FakeSession {
@@ -81,6 +84,34 @@ export class FakeBackend implements DshellBackend {
     { id: 'fake', displayName: 'Fake Provider', baseURL: 'https://api.example/v1', apiKeyEnv: 'FAKE_API_KEY', models: 2 },
     { id: 'relay', displayName: 'Relay', baseURL: 'http://relay.example:8180', models: 1 },
   ]
+  /** Presets the fake Host composes sessions from. */
+  private readonly presetRows: AgentPresetSummary[] = [
+    {
+      id: 'standard',
+      name: 'Standard',
+      description: 'Coding agent with the full toolset',
+      order: 1,
+      overridden: true,
+      plugins: [
+        { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: 'You are a coding agent.' } },
+        { id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash' },
+        { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' },
+        { id: 'tool-pwsh', name: '@deepseek-ai/dsh-tool-pwsh', disabled: true },
+      ],
+    },
+    {
+      id: 'minimal',
+      name: 'Minimal',
+      description: 'Read-only shell and files',
+      order: 2,
+      overridden: false,
+      plugins: [
+        { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: 'Answer questions about the code.' } },
+        { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' },
+      ],
+    },
+  ]
+  private presetDefault = 'standard'
   private readonly catalog: ModelCatalog = {
     default: { provider: 'fake', model: 'fake-flash' },
     routableProviders: ['fake', 'relay'],
@@ -215,6 +246,17 @@ export class FakeBackend implements DshellBackend {
     if (name === 'release-checklist') return '# Release checklist\n\n1. pnpm typecheck\n2. pnpm test\n3. verify-pack.sh'
     if (name === 'triage-issues') return '# Triage\n\nSort by impact first.'
     throw new BackendError('SKILL_MISSING', `skill "${name}" is not loadable`)
+  }
+
+  async agentRoster(): Promise<AgentRoster> {
+    this.assertConnected()
+    return {
+      presets: this.presetRows.map((preset) => ({
+        ...preset,
+        plugins: preset.plugins.map((plugin) => ({ ...plugin })),
+      })),
+      defaultId: this.presetDefault,
+    }
   }
 
   async providerList(): Promise<ProviderList> {

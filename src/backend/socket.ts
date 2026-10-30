@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import { DshellError, HostConnection } from '../client/socket-client.js'
 import type {
+  AgentRosterMessage,
   AttachedMessage,
   ErrorMessage,
   HostRestartingMessage,
@@ -32,6 +33,7 @@ import {
   type DshellCapabilities,
   type NewProviderSpec,
   type ProviderList,
+  type AgentRoster,
   type SendOptions,
   type SkillCatalog,
   type SendReceipt,
@@ -96,6 +98,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     questions: has('questions'),
     models: has('models'),
     providers: has('providers'),
+    agents: has('agents'),
     skills: has('skills'),
   }
 }
@@ -186,6 +189,23 @@ export class SocketBackend implements DshellBackend {
         20_000,
       )
       return message.content
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async agentRoster(): Promise<AgentRoster> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<AgentRosterMessage>(
+        { type: 'agents/list' },
+        (candidate) => candidate.type === 'agents/roster',
+        15_000,
+      )
+      return {
+        presets: message.presets,
+        ...(message.defaultId === undefined ? {} : { defaultId: message.defaultId }),
+      }
     } catch (error) {
       throw mapError(error)
     }

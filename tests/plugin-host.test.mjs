@@ -14,7 +14,7 @@ import { test } from 'node:test'
 
 const { apply } = await import('../dist/plugin/index.js')
 
-function createFakeCtx() {
+function createFakeCtx(services = {}) {
   const agents = new Map()
   const sessions = new Map() // sessionId -> { header, events, live, persisted }
   const workspaces = new Map() // path -> workspace record
@@ -105,12 +105,14 @@ function createFakeCtx() {
       const off = setup()
       if (off !== undefined) disposers.push(off)
     },
+    get: (name) => services[name],
+    ...services,
   }
   /** Invoke the listeners the plugin registered, like DSH waterfalls would. */
   const emit = (event, ...args) => Promise.all(
     (listeners.get(event) ?? []).map((listener) => listener(...args)),
   )
-  return { ctx, agents, sessions, workspaces, listeners, disposers, emit, handles, recordOf, units }
+  return { ctx, agents, sessions, workspaces, listeners, disposers, emit, handles, recordOf, units, services }
 }
 
 /** An agent with a real, manipulable inbox — enough for queue commands. */
@@ -219,10 +221,10 @@ class NdjClient {
   }
 }
 
-async function startHarness(t, config = {}) {
+async function startHarness(t, config = {}, services = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-plugin-'))
   const socketPath = join(directory, 'dshell.sock')
-  const harness = createFakeCtx()
+  const harness = createFakeCtx(services)
   await apply(harness.ctx, { socketPath, ...config })
   t.after(async () => {
     for (const disposer of harness.disposers) await disposer?.()
@@ -241,6 +243,67 @@ function makeSession(harness, sessionId, events = [], header = {}) {
   })
   return harness.sessions.get(sessionId)
 }
+
+test('agents/list reports the presets the Host composes sessions from', async (t) => {
+  const configEditor = {
+    configuration: () => [
+      {
+        entry: {
+          options: {
+            id: 'preset-standard',
+            name: '@deepseek-ai/dsh-agent-preset',
+            config: {
+              id: 'standard',
+              name: 'Standard',
+              order: 1,
+              plugins: [
+                { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: 'You are a coding agent.' } },
+                { id: 'tool-pwsh', name: '@deepseek-ai/dsh-tool-pwsh', disabled: true },
+              ],
+            },
+          },
+        },
+        override: { plugins: [] },
+      },
+      {
+        entry: {
+          options: {
+            id: 'preset-minimal',
+            name: '@deepseek-ai/dsh-agent-preset',
+            config: { id: 'minimal', order: 2, plugins: [{ id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs' }] },
+          },
+        },
+        override: {},
+      },
+      {
+        entry: { options: { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: {} } },
+        override: {},
+      },
+    ],
+  }
+  const agentPresets = {
+    resolve: async () => ({ id: 'standard' }),
+    mount: async () => undefined,
+    config: { selectedDefault: { get: () => 'standard' }, default: { get: () => 'minimal' } },
+  }
+  const harness = await startHarness(t, {}, { configEditor, agentPresets })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  const welcome = await client.next()
+  assert.equal(welcome.capabilities.includes('agents'), true)
+
+  client.send({ type: 'agents/list' })
+  const roster = await client.next()
+  assert.equal(roster.type, 'agents/roster')
+  assert.deepEqual(roster.presets.map((preset) => preset.id), ['standard', 'minimal'])
+  assert.equal(roster.defaultId, 'standard')
+  assert.equal(roster.presets[0].overridden, true)
+  assert.equal(roster.presets[0].plugins[1].disabled, true)
+  assert.equal(roster.presets[0].plugins[0].config.prefix, 'You are a coding agent.')
+  assert.equal(roster.presets[1].overridden, false)
+  assert.equal(roster.presets[1].plugins.length, 1)
+})
 
 test('hello completes the handshake against the real plugin', async (t) => {
   const { socketPath } = await startHarness(t)

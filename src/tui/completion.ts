@@ -25,6 +25,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/verbose', description: 'toggle reasoning and lifecycle events' },
   { name: '/model', description: 'switch provider/model and reasoning level' },
   { name: '/provider', description: 'edit provider rows in cordis.patch.yml' },
+  { name: '/harness', description: 'agent presets: prompts and tools a session composes' },
   { name: '/resume', description: 'alias for /sessions' },
   { name: '/quit', description: 'leave the TUI (does not cancel the Host turn)' },
 ]
