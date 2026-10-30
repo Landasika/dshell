@@ -9,7 +9,7 @@ import { createTheme } from '../dist/tui/theme.js'
 import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from '../dist/tui/width.js'
 import { renderMarkdown, renderDiff } from '../dist/tui/markdown.js'
 import { centerBlock, panelRule } from '../dist/tui/chrome.js'
-import { askAnswerLines, askQuestionLines, buildBlocks, pendingQuestions, renderBlocks, renderTranscript, summarizeTool, toolLabel, turnFailureMessage } from '../dist/tui/events.js'
+import { askAnswerLines, askQuestionLines, buildBlocks, pendingQuestions, prettyFailureMessage, renderBlocks, renderTranscript, summarizeTool, toolLabel, turnFailureMessage } from '../dist/tui/events.js'
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
 import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
@@ -1529,6 +1529,22 @@ test('a failed turn is always visible in the transcript', () => {
   ]
   assert.equal(renderBlocks(buildBlocks(completed), 80, theme).some((line) => stripAnsi(line).includes('turn failed')), false)
   assert.equal(turnFailureMessage(completed), undefined)
+})
+
+test('provider JSON error payloads are unwrapped for display', () => {
+  const blob = '429 {"error":{"message":"Upstream rate limit exceeded, please retry later","type":"rate_limit_error"},"type":"error"}'
+  assert.equal(prettyFailureMessage(blob), '429 · Upstream rate limit exceeded, please retry later')
+  assert.equal(prettyFailureMessage('Insufficient Balance (request_id: abc)'), 'Insufficient Balance (request_id: abc)')
+  assert.equal(prettyFailureMessage('{"error":{"message":"no status prefix"}}'), 'no status prefix')
+  assert.equal(prettyFailureMessage('503 {not json'), '503 {not json')
+
+  const failed = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'go' }] } } },
+    { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'error', error: { message: blob, code: 'RATE_LIMIT' } } } },
+  ]
+  assert.equal(turnFailureMessage(failed), '429 · Upstream rate limit exceeded, please retry later')
+  const lines = renderBlocks(buildBlocks(failed), 80, theme).map(stripAnsi)
+  assert.ok(lines.some((line) => line.includes('Upstream rate limit exceeded') && !line.includes('{"error"')), 'the transcript shows the message, not the JSON')
 })
 
 test('subagent roster follows catalog and settlement events', () => {

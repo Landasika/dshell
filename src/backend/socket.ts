@@ -761,6 +761,13 @@ export class SocketSessionHandle implements SessionHandle {
       this.streamText = ''
       this.streamReasoning = ''
     }
+    // A scheduled retry discards the failed attempt's partial output: the
+    // preview must not keep claiming the model is writing through the whole
+    // backoff ladder while nothing is streaming.
+    if (event.type === 'llm/retry') {
+      this.streamText = ''
+      this.streamReasoning = ''
+    }
     // Only the Host's `approval-request` message carries an answerable id.
     // The durable `approval/asked` event has its own id and may be replayed
     // from history; using it would send an answer for an already-dead request.

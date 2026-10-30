@@ -247,7 +247,16 @@ test('SocketBackend maps list, attach, prompt, and stream over a Unix socket', a
       write(socket, {
         type: 'event',
         sessionId: message.sessionId,
-        event: { type: 'turn/end', seq: 3, data: { reason: { kind: 'completed' } } },
+        event: {
+          type: 'llm/retry',
+          seq: 3,
+          data: { retry: 2, maxRetries: 5, delayMs: 4_000, failure: { code: 'RATE_LIMIT' } },
+        },
+      })
+      write(socket, {
+        type: 'event',
+        sessionId: message.sessionId,
+        event: { type: 'turn/end', seq: 4, data: { reason: { kind: 'completed' } } },
       })
     }
   })
@@ -261,16 +270,26 @@ test('SocketBackend maps list, attach, prompt, and stream over a Unix socket', a
 
   const handle = await backend.openSession('s1')
   const seen = []
-  const off = handle.subscribe((view) => seen.push(view))
-  const receipt = await handle.send('hello')
-  assert.equal(receipt.requestId, 'r1')
-  const last = seen.at(-1)
-  assert.equal(last.events.at(-1).type, 'turn/end')
-  assert.equal(last.events.find((event) => event.type === 'assistant/message').seq, 2)
-  assert.equal(seen.some((view) => view.streamText === 'hi'), true)
-  off()
-  handle.dispose()
-  await backend.disconnect()
+  // A failed assertion below must not leak the connection: server.close()
+  // waits for open sockets, so an undisposed handle hangs the whole file.
+  try {
+    const off = handle.subscribe((view) => seen.push(view))
+    const receipt = await handle.send('hello')
+    assert.equal(receipt.requestId, 'r1')
+    const last = seen.at(-1)
+    assert.equal(last.events.at(-1).type, 'turn/end')
+    assert.equal(last.events.find((event) => event.type === 'assistant/message').seq, 2)
+    assert.equal(seen.some((view) => view.streamText === 'hi'), true)
+    // A scheduled retry drops the failed attempt's stream preview: the spinner
+    // must report the backoff, not keep claiming the model is writing. Views
+    // share one append-only events array, so assert on the cursor the snapshot
+    // carried (llm/retry is seq 3), not on `events.at(-1)` of an older view.
+    assert.equal(seen.some((view) => view.cursor === 3 && view.streamText === ''), true)
+    off()
+  } finally {
+    handle.dispose()
+    await backend.disconnect()
+  }
 })
 
 

@@ -7,6 +7,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- Provider failures that arrive as `<status> {json}` (a relay forwarding its
+  upstream's body) are unwrapped for display: `429 · Upstream rate limit
+  exceeded, please retry later` replaces a truncated JSON blob in the notice
+  row, the toast and the transcript's failure block.
+- The activity spinner reports the retry ladder while the host backs off —
+  `Retrying · attempt 4/5 · RATE_LIMIT · 4s` — and a scheduled retry clears the
+  dead attempt's stream preview, so a 429 ladder no longer reads as `Writing`.
+
 - Mouse selections are tracked in transcript coordinates instead of screen
   rows, so the highlight follows the text through wheel scrolling (clipped at
   the transcript band) and a drag held past the top or bottom edge keeps

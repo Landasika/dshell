@@ -72,6 +72,31 @@ function reasoningText(content: unknown): string {
     .join('\n')
 }
 
+/**
+ * Provider failures arrive as `<status> {json}` — for a relay that is the
+ * upstream's body verbatim. Unwrap it for display: the status plus the nested
+ * human message beats a truncated JSON blob in a one-line notice.
+ */
+export function prettyFailureMessage(raw: string): string {
+  const match = /^(\s*(\d{3})\s+)?(\{.*\})\s*$/s.exec(raw)
+  if (match === null) return raw
+  try {
+    const body = JSON.parse(match[3] ?? '') as {
+      error?: { message?: unknown; code?: unknown }
+      message?: unknown
+    }
+    const detail = typeof body.error?.message === 'string'
+      ? body.error.message
+      : typeof body.message === 'string'
+        ? body.message
+        : ''
+    if (detail.length === 0) return raw
+    return match[2] === undefined ? detail : `${match[2]} · ${detail}`
+  } catch {
+    return raw
+  }
+}
+
 /** The latest turn's failure message, if the transcript ends in a failed turn. */
 export function turnFailureMessage(events: readonly SessionEvent[]): string | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -82,7 +107,7 @@ export function turnFailureMessage(events: readonly SessionEvent[]): string | un
       const kind = String(reason.kind ?? '')
       if (event.type === 'turn/failed' || kind === 'error' || kind === 'failed') {
         const failure = (reason.error ?? reason.failure ?? {}) as Json
-        return String(failure.message ?? failure.code ?? 'the turn failed')
+        return prettyFailureMessage(String(failure.message ?? failure.code ?? 'the turn failed'))
       }
       return undefined
     }
@@ -575,7 +600,7 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
           // A failed turn otherwise leaves the transcript silent: the user
           // sees the prompt and then nothing. Always surface the reason.
           const failure = (reason.error ?? reason.failure ?? {}) as Json
-          const message = String(failure.message ?? failure.code ?? 'the Host ended the turn with an error')
+          const message = prettyFailureMessage(String(failure.message ?? failure.code ?? 'the Host ended the turn with an error'))
           blocks.push({ kind: 'error', title: 'turn failed', body: truncate(message, 400) })
         }
         const endedAt = eventTime(event)
@@ -595,7 +620,10 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
         break
       }
       case 'error': {
-        blocks.push({ kind: 'error', title: 'error', body: String(data.message ?? data.error ?? 'unknown error') })
+        const body = typeof data.error === 'string'
+          ? prettyFailureMessage(data.error)
+          : prettyFailureMessage(String(data.message ?? 'unknown error'))
+        blocks.push({ kind: 'error', title: 'error', body })
         break
       }
       default:

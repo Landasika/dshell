@@ -329,7 +329,7 @@ function unmatchedToolCall(events: readonly SessionEvent[]): { name: string; det
 }
 
 /** Latest LLM retry in the current step, if no answer has landed since. */
-function retryActivity(events: readonly SessionEvent[]): { retry: number; max: number; code: string } | undefined {
+function retryActivity(events: readonly SessionEvent[]): { retry: number; max: number; code: string; delayMs: number } | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]
     if (event === undefined) continue
@@ -341,6 +341,7 @@ function retryActivity(events: readonly SessionEvent[]): { retry: number; max: n
       retry: Math.max(0, Number(data.retry ?? 0)),
       max: Math.max(0, Number(data.maxRetries ?? 0)),
       code: String(failure.code ?? 'ERROR'),
+      delayMs: Math.max(0, Number(data.delayMs ?? 0)),
     }
   }
   return undefined
@@ -362,7 +363,8 @@ function deriveActivity(view: SessionView): Activity {
     const retry = retryActivity(view.events)
     if (retry !== undefined) {
       const attempt = retry.max > 0 ? `${retry.retry}/${retry.max}` : String(retry.retry)
-      return { phase: 'thinking', verb: 'Retrying', detail: `attempt ${attempt} · ${retry.code}` }
+      const wait = retry.delayMs > 0 ? ` · ${String(Math.max(1, Math.round(retry.delayMs / 1000)))}s` : ''
+      return { phase: 'thinking', verb: 'Retrying', detail: `attempt ${attempt} · ${retry.code}${wait}` }
     }
     return { phase: 'thinking', verb: 'Thinking' }
   }
