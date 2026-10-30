@@ -7,6 +7,13 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `skills/dsh-config`: a skill that documents the layer order, the
+  patch-row semantics (per-key replacement, `name` matching, `insert`), the
+  provider and model schemas, preset structure (persona, tools, skills), the
+  verification commands, and the hot-reload rules — so "add a provider" or
+  "change the agent prompt" is a config edit the model can do, not a UI to
+  maintain.
+
 - `/harness` lists the agent presets the Host composes sessions from: each
   preset's id, enabled/total plugin rows, whether the profile patch owns it,
   which one is the default, and the selected preset's first rows with the

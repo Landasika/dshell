@@ -359,6 +359,19 @@ same work opening the session in the Web UI does, and the Host caches it — the
 session row then shows `● live`. When a session cannot be resumed (another
 frontend owns it), `/skills` still lists the hub and host-wide providers.
 
+This repository also ships one skill of its own: `skills/dsh-config`. It is the
+manual for editing DSH's composition — adding a provider or model, changing the
+default model, and rewriting an agent preset's prompt and tool rows in the
+profile patch files. Point a user skill root at it so the model can invoke it:
+
+```bash
+ln -s /home/landasika/dshell/skills/dsh-config ~/.agents/skills/dsh-config
+```
+
+Then `/skills dsh-config` renders it in the TUI, and the model loads it when a
+request matches its description ("add a model", "change the system prompt",
+"create an agent preset").
+
 The hub defaults to `$DSH_HOME/dshell-skills` and is configurable without
 touching DSH:
 
