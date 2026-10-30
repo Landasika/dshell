@@ -7,10 +7,12 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
-- Mouse selections survive wheel scrolling: the highlight moves with the text it
-  covers (clipped at the transcript band) instead of the wheel throwing the
-  selection away. Scrolling inside a panel still clears it, because panels
-  repaint their own rows.
+- Mouse selections are tracked in transcript coordinates instead of screen
+  rows, so the highlight follows the text through wheel scrolling (clipped at
+  the transcript band) and a drag held past the top or bottom edge keeps
+  scrolling one line per tick — a range can span more than one screen and is
+  copied in full, not just its visible part. Scrolling inside a panel still
+  clears the highlight, because panels repaint their own rows.
 
 ### Added
 

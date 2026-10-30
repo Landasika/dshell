@@ -45,7 +45,7 @@ import { renderMarkdown } from './markdown.js'
 import { TerminalScreen, Viewport } from './screen.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
 import { createTheme } from './theme.js'
-import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from './width.js'
+import { displayWidth, pad, sanitizeText, selectionText, stripAnsi, truncate, wrapText } from './width.js'
 import {
   averageTps,
   collectMetrics,
@@ -362,7 +362,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   // 1-based terminal row of the "jump to bottom" pill, for click hit-testing.
   let pillRow: number | null = null
   let agentHandle: SessionHandle | null = null
-  let selectAnchor: { row: number; column: number } | null = null
+  // A transcript selection is kept in content space (a line index into
+  // transcript().lines), so dragging past the top or bottom edge can scroll and
+  // keep growing the range instead of being pinned to screen rows.
+  let selectAnchor: { line: number; column: number } | null = null
+  let selectFocus: { line: number; column: number } | null = null
+  /** Screen-space anchor for a drag that started inside a panel (no scrolling). */
+  let panelAnchor: { row: number; column: number } | null = null
+  let dragPointer: { row: number; column: number } | null = null
+  let autoScrollTimer: ReturnType<typeof setInterval> | undefined
+  let autoScrollDirection = 0
+  let lastVisibleStart = 0
   let lastTranscriptTotal = 0
   let seenTranscriptTotal = 0
   const state: AppState = {
@@ -1728,10 +1738,112 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     schedule()
   }
 
+  const bodyTopRow = (): number => lastBodyTop
+  const bodyBottomRow = (): number => lastBodyTop + lastBodyHeight - 1
+  const inTranscript = (row: number): boolean => row >= bodyTopRow() && row <= bodyBottomRow()
+  const contentLineAt = (row: number): number => lastVisibleStart + (row - bodyTopRow())
+
+  /** Ordered endpoints of the transcript selection, top-left first. */
+  const orderedSelection = (): { a: { line: number; column: number }; b: { line: number; column: number } } | null => {
+    if (selectAnchor === null || selectFocus === null) return null
+    const forward = selectFocus.line > selectAnchor.line
+      || (selectFocus.line === selectAnchor.line && selectFocus.column >= selectAnchor.column)
+    return forward ? { a: selectAnchor, b: selectFocus } : { a: selectFocus, b: selectAnchor }
+  }
+
+  /** Paint the content-space selection into the body, clipping to what is visible. */
+  const paintSelection = (): void => {
+    const range = orderedSelection()
+    if (range === null) return
+    const top = bodyTopRow()
+    const bottom = bodyBottomRow()
+    let startRow = top + (range.a.line - lastVisibleStart)
+    let endRow = top + (range.b.line - lastVisibleStart)
+    let startColumn = range.a.column
+    let endColumn = range.b.column
+    if (endRow < top || startRow > bottom) {
+      screen.setSelection(null)
+      return
+    }
+    if (startRow < top) {
+      startRow = top
+      startColumn = 1
+    }
+    if (endRow > bottom) {
+      endRow = bottom
+      endColumn = screen.size.columns
+    }
+    screen.setSelection({ startRow, startColumn, endRow, endColumn })
+  }
+
+  /** The selected transcript text, independent of what is on screen right now. */
+  const contentSelectionText = (): string => {
+    const range = orderedSelection()
+    if (range === null) return ''
+    const lines = transcript().lines.slice(range.a.line, range.b.line + 1)
+    if (lines.length === 0) return ''
+    return selectionText(lines, {
+      startRow: 1,
+      startColumn: range.a.column,
+      endRow: lines.length,
+      endColumn: range.b.column,
+    })
+  }
+
+  const stopAutoScroll = (): void => {
+    if (autoScrollTimer !== undefined) {
+      clearInterval(autoScrollTimer)
+      autoScrollTimer = undefined
+    }
+    autoScrollDirection = 0
+  }
+
+  /**
+   * One line per tick while the pointer rests past an edge — the same shape
+   * pi-tui uses, so dragging keeps revealing lines instead of stopping at the
+   * frame boundary. The focus follows the edge the pointer is pinned to.
+   */
+  const autoScrollTick = (): void => {
+    if (selectAnchor === null || dragPointer === null || autoScrollDirection === 0) {
+      stopAutoScroll()
+      return
+    }
+    const before = viewport.scrollOffset
+    viewport.scroll(autoScrollDirection === -1 ? 1 : -1, transcriptLineCount(), transcriptHeight())
+    if (viewport.scrollOffset === before) {
+      stopAutoScroll()
+      return
+    }
+    const height = transcriptHeight()
+    const total = transcriptLineCount()
+    const start = Math.max(0, total - height - viewport.scrollOffset)
+    const row = autoScrollDirection === -1 ? bodyTopRow() : bodyTopRow() + height - 1
+    selectFocus = {
+      line: Math.max(0, Math.min(total - 1, start + (row - bodyTopRow()))),
+      column: dragPointer.column,
+    }
+    schedule()
+  }
+
+  const updateAutoScroll = (row: number): void => {
+    const direction = row <= bodyTopRow() ? -1 : row >= bodyBottomRow() ? 1 : 0
+    if (direction === 0) {
+      stopAutoScroll()
+      return
+    }
+    if (autoScrollTimer !== undefined && autoScrollDirection === direction) return
+    stopAutoScroll()
+    autoScrollDirection = direction
+    autoScrollTimer = setInterval(autoScrollTick, 40)
+    autoScrollTimer.unref?.()
+  }
+
   /**
    * Mouse selection is shell-level, not transcript-level: the Screen buffer
    * holds the overlay rows too, so dragging inside a detail panel copies what
-   * the user can see. Returns whether the key was a mouse event.
+   * the user can see. A drag in the transcript is tracked in content space
+   * instead, which is what lets it survive scrolling. Returns whether the key
+   * was a mouse event.
    */
   const handleSelectionKey = (key: Key): boolean => {
     if (key.type === 'click') {
@@ -1740,17 +1852,38 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         schedule()
         return true
       }
-      // Start a selection anchor; a plain click (no drag) copies nothing.
-      selectAnchor = { row: key.row, column: key.column }
+      stopAutoScroll()
+      panelAnchor = null
+      selectAnchor = null
+      selectFocus = null
+      dragPointer = null
       screen.setSelection(null)
+      if (inTranscript(key.row) && transcriptLineCount() > 0) {
+        // Start a selection anchor; a plain click (no drag) copies nothing.
+        const line = Math.max(0, Math.min(transcriptLineCount() - 1, contentLineAt(key.row)))
+        selectAnchor = { line, column: key.column }
+        selectFocus = { line, column: key.column }
+      } else {
+        panelAnchor = { row: key.row, column: key.column }
+      }
       schedule()
       return true
     }
     if (key.type === 'drag') {
+      dragPointer = { row: key.row, column: key.column }
       if (selectAnchor !== null) {
+        selectFocus = {
+          line: Math.max(0, Math.min(Math.max(0, transcriptLineCount() - 1), contentLineAt(key.row))),
+          column: key.column,
+        }
+        updateAutoScroll(key.row)
+        schedule()
+        return true
+      }
+      if (panelAnchor !== null) {
         screen.setSelection({
-          startRow: selectAnchor.row,
-          startColumn: selectAnchor.column,
+          startRow: panelAnchor.row,
+          startColumn: panelAnchor.column,
           endRow: key.row,
           endColumn: key.column,
         })
@@ -1759,19 +1892,39 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return true
     }
     if (key.type === 'release') {
-      if (selectAnchor === null) return true
-      const moved = key.row !== selectAnchor.row || key.column !== selectAnchor.column
-      selectAnchor = null
-      if (moved) {
-        const text = screen.copySelection()
-        if (text.length > 0) {
-          const lines = text.split('\n').length
-          toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
+      stopAutoScroll()
+      dragPointer = null
+      if (selectAnchor !== null && selectFocus !== null) {
+        const moved = selectAnchor.line !== selectFocus.line || selectAnchor.column !== selectFocus.column
+        if (moved) {
+          const text = contentSelectionText()
+          if (text.length > 0) {
+            screen.copyText(text)
+            const lines = text.split('\n').length
+            toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
+          }
+        } else {
+          selectAnchor = null
+          selectFocus = null
+          screen.setSelection(null)
         }
-      } else {
-        screen.setSelection(null)
+        schedule()
+        return true
       }
-      schedule()
+      if (panelAnchor !== null) {
+        const moved = key.row !== panelAnchor.row || key.column !== panelAnchor.column
+        panelAnchor = null
+        if (moved) {
+          const text = screen.copySelection()
+          if (text.length > 0) {
+            const lines = text.split('\n').length
+            toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
+          }
+        } else {
+          screen.setSelection(null)
+        }
+        schedule()
+      }
       return true
     }
     return false
@@ -2406,7 +2559,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     // Any non-mouse key ends a text selection, wherever it was started.
     if (key.type !== 'click' && key.type !== 'drag' && key.type !== 'release' && key.type !== 'wheel') {
+      stopAutoScroll()
+      panelAnchor = null
       selectAnchor = null
+      selectFocus = null
+      dragPointer = null
       screen.setSelection(null)
     }
     // Text selection runs before the overlay branch so a drag inside a panel
@@ -2415,7 +2572,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (state.overlay !== null) {
       // Panels repaint their own rows on scroll, so a screen-space highlight
       // cannot follow the text: drop it rather than smear it over new content.
-      if (key.type === 'wheel' && screen.hasSelection) screen.setSelection(null)
+      if (key.type === 'wheel' && panelAnchor === null) screen.setSelection(null)
       handleOverlayKey(key)
       // A panel that just closed may have been covering a waiting question.
       if (state.overlay === null) {
@@ -2425,12 +2582,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (key.type === 'wheel') {
-      selectAnchor = null
-      // A copy stays highlighted: wheel scrolling moves the highlight with the
-      // text it covers instead of throwing the selection away.
-      const before = viewport.scrollOffset
+      // A copy stays highlighted: the range lives in content space, so a render
+      // puts it back over the same text after any scroll.
       viewport.scroll(-key.delta * 3, transcriptLineCount(), transcriptHeight())
-      screen.shiftSelection(viewport.scrollOffset - before, lastBodyTop, lastBodyTop + lastBodyHeight - 1)
       schedule()
       return
     }
@@ -3766,6 +3920,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     lastBodyHeight = bodyHeight
     lastBodyTop = header.length + 1
     const visible = viewport.visible(transcriptData.lines, bodyHeight)
+    lastVisibleStart = visible.start
+    paintSelection()
     const body = visible.lines.slice()
     if (mergeStrip && body.length > 0) {
       const left = body.at(-1) ?? ''

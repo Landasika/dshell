@@ -222,9 +222,11 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-C` | cancel the turn (or quit when idle) |
 | `Ctrl-D` | quit |
 
-A mouse selection is copied on release (OSC 52) and stays highlighted; wheel
-scrolling carries the highlight with the text it covers instead of dropping it.
-Panels repaint their own rows, so a scroll inside one clears the highlight.
+A mouse selection is copied on release (OSC 52) and stays highlighted. It is
+tracked in transcript coordinates, not screen rows: wheel scrolling carries it
+with the text it covers, and dragging past the top or bottom edge keeps
+scrolling one line at a time so a range can span more than one screen. Panels
+repaint their own rows, so a scroll inside one still clears the highlight.
 
 In `/skills`: `↑/↓` move, `Enter` opens the skill body (rendered markdown),
 `i` puts `/name ` into the editor to invoke it, `Backspace` goes back to the
