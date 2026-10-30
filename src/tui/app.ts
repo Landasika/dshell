@@ -835,8 +835,21 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return out
   }
 
+  /**
+   * `$name` is the composer's shorthand for a skill invocation; the Host only
+   * parses the `/name` gesture, so the rewrite happens here, at the last moment
+   * — the composer keeps showing what the user typed.
+   */
+  const expandSkillGestures = (text: string): string => {
+    const gesture = /(^|\s)\$([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/g
+    const hit = gesture.test(text)
+    gesture.lastIndex = 0
+    if (!hit) return text
+    return text.replace(gesture, (match, prefix: string, name: string) => `${prefix}/${name}`)
+  }
+
   const send = async (text: string, requested?: 'queue' | 'steer'): Promise<void> => {
-    const trimmed = text.replace(/\s+$/, '')
+    const trimmed = expandSkillGestures(text).replace(/\s+$/, '')
     if (trimmed.length === 0) return
     if (state.handle === undefined) {
       state.pendingPrompt = trimmed

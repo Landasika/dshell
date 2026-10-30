@@ -730,7 +730,7 @@ test('completion finds slash commands and @ files', () => {
   assert.equal(completionFor('look at @src/ma', ['src/main.ts']).items[0].label, '@src/main.ts')
 })
 
-test('a leading $ completes user-invocable skills into the /name gesture', () => {
+test('a leading $ completes user-invocable skills as $ mentions', () => {
   const skills = [
     { name: 'dsh-config', description: 'edit the harness config', userInvocable: true },
     { name: 'blackboard', description: 'multi-agent board', userInvocable: true },
@@ -742,7 +742,7 @@ test('a leading $ completes user-invocable skills into the /name gesture', () =>
 
   const items = completionFor('$ds', [], skills).items
   assert.deepEqual(items.map((item) => item.label), ['$dsh-config'])
-  assert.equal(items[0].insert, '/dsh-config ')
+  assert.equal(items[0].insert, '$dsh-config ', 'the composer keeps the $ mention')
   assert.equal(items[0].kind, 'skill')
   assert.deepEqual(
     completionFor('$', [], skills).items.map((item) => item.label),
@@ -2243,7 +2243,7 @@ test('provider editor pastes a field value and stores a raw sk- key', async () =
   await backend.disconnect()
 })
 
-test('typing $ opens the skill menu and expands to the slash gesture', async () => {
+test('a $ mention stays in the composer and ships as the /name gesture', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
   const { FakeBackend } = await import('../dist/backend/index.js')
@@ -2288,7 +2288,13 @@ test('typing $ opens the skill menu and expands to the slash gesture', async () 
 
     output.text = ''
     input.push('\t')
-    await waitFor(() => output.text.includes('/release-checklist'), 'the expanded gesture')
+    await waitFor(() => output.text.includes('$release-checklist'), 'the inserted $ mention')
+
+    // Send keeps the $ in the composer but ships the /name gesture.
+    output.text = ''
+    input.push('run it')
+    input.push('\r')
+    await waitFor(() => output.text.includes('echo: /release-checklist run it'), 'the rewritten gesture')
   } finally {
     input.push('\u0003')
     input.push('\u0004')

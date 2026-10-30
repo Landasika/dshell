@@ -109,7 +109,9 @@ export function skillItems(query: string, skills: readonly SkillCandidate[]): Co
       kind: 'skill' as const,
       label: `$${skill.name}`,
       description: skill.description,
-      insert: `/${skill.name} `,
+      // The composer keeps the `$` mention; send() rewrites it into the
+      // `/name` gesture the Host parses, so what the user typed stays put.
+      insert: `$${skill.name} `,
     }))
 }
 

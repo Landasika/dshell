@@ -33,8 +33,9 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   `provider/api-key` message and `provider-key` capability back it.
 
 - `$` at the start of the composer opens the skill menu; picking a row inserts
-  the `/name ` gesture the Host already parses, so invocation is two keys away
-  instead of remembering the name or opening `/skills`.
+  a `$name` mention that stays visible in the composer — the send path rewrites
+  it into the `/name` gesture the Host parses, so invocation is two keys away
+  without the visual jump to a slash.
 
 - `skills/dsh-config`: a skill that documents the layer order, the
   patch-row semantics (per-key replacement, `name` matching, `insert`), the

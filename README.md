@@ -207,7 +207,7 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Alt-Q` | queue the prompt for the next turn |
 | `Ctrl-Enter` / `Shift-Enter` | newline in the composer |
 | `Tab` | complete `/` commands, `$` skills and `@` files |
-| `$` at line start | skill menu — picking one inserts the `/name` gesture |
+| `$` at line start | skill menu — picking one inserts a `$name` mention |
 | `↑` / `↓` | prompt history |
 | `PgUp` / `PgDn`, wheel | scroll the transcript |
 | `Alt-↑` / `Alt-↓` | select blocks, then `Enter` to open or `Esc` to clear |
@@ -238,8 +238,10 @@ list, `Esc` closes.
 
 A skill is invoked by sending its `/name` gesture: the Host parses the token
 anywhere in the prompt and injects the skill body for that turn. `$` is the
-shortcut — `$dsh` lists user-invocable skills, `Tab` turns it into
-`/dsh-config ` so you can add the request after it.
+composer's shorthand — `$dsh` lists user-invocable skills, `Tab` completes it
+to a `$dsh-config` mention, and the send path rewrites `$name` into the
+`/name` gesture, so the composer keeps showing what you typed while the Host
+still receives the syntax it parses.
 
 In an `ask_user_question` card: `↑/↓` move, `Space` toggles a choice (multi-
 select), `c` types a custom answer, `Enter` submits, `Esc` leaves it pending
