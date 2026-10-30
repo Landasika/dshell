@@ -157,13 +157,18 @@ Each plugin row is `{id, name, disabled?, config?}`.
   the shipped file first, edit it, and paste; a partial array silently drops
   the omitted plugins.
 - **New preset**: `- insert:` a row with a fresh `preset-<id>`; `config.id` is
-  what the UI shows. Then select it as the default:
+  what the UI shows. Then make it the default. `default` is **required** by the
+  registry schema, so restate it — an override replaces `config` wholesale:
 
   ```yaml
   - id: agent-preset-registry
     name: '@deepseek-ai/dsh-agent-preset-registry'
-    config: { selectedDefault: my-agent }
+    config:
+      default: standard          # required: fallback when selectedDefault is unset
+      selectedDefault: my-agent  # what new sessions compose
   ```
+
+  The Web settings page does the same merge for you; hand-editing must not.
 
 - **Prompt**: `persona.config.prefix` **replaces** the deployment persona (it
   occupies the same `deployment:persona-prefix` slot). Instructions come from
