@@ -192,6 +192,12 @@ dsh --dump-config --profile web | grep -nB2 -A12 'preset-standard'
 
 # Warnings the loader logged while composing (mismatched ids/names land here):
 dsh --dump-config --profile web 2>&1 | grep -i 'patch:'
+
+# The patch/entry JSON Schema, when you are unsure a field name exists:
+dsh --dump-config-schema | head -c 2000
+
+# How the tree looks without your overrides (to diff against):
+dsh --dump-default-config --profile web | grep -nA12 'preset-standard'
 ```
 
 `--dump-config` rewrites the generated `cordis.yml` — that file is a build
