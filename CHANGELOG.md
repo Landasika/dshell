@@ -3,7 +3,7 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
-## [Unreleased]
+## [0.4.1] — 2026-10-31
 
 ### Changed
 
@@ -502,3 +502,4 @@ First V1 candidate for Linux.
 [0.1.0]: https://github.com/Landasika/dshell/releases/tag/v0.1.0
 
 [0.4.0]: https://github.com/Landasika/dshell/releases/tag/v0.4.0
+[0.4.1]: https://github.com/Landasika/dshell/releases/tag/v0.4.1
