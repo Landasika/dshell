@@ -7,6 +7,10 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- `Esc` on an empty composer while a turn runs now cancels the turn (with the
+  kill-subagents flag) and stays attached — terminating a task and quitting no
+  longer share `Ctrl-C`.
+
 - `/model` switches in one Enter: a model with reasoning levels applies with
   the remembered level (or the catalog default) instead of detouring through
   the level submenu first. The explicit list stays on `e` / `→`.

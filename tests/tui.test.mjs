@@ -2294,6 +2294,66 @@ test('u on a provider row syncs its models against the upstream', async () => {
   await backend.disconnect()
 })
 
+test('esc terminates the running turn but keeps the TUI attached', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'go' }] } } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+  ]
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  await waitFor(() => output.text.includes('idle'))
+  await new Promise((resolve) => setTimeout(resolve, 40))
+
+  // The fake Host completes a prompted turn synchronously, so hold a turn
+  // open the way a long-running one would: a dangling turn/start.
+  backend.emit('s1', { type: 'turn/start', seq: 3, data: { turn: 2 } })
+  await waitFor(() => output.text.includes('● running'))
+
+  // Empty composer + running turn: Esc cancels with the subagent flag.
+  input.push('\u001b')
+  await waitFor(() => backend.lastCancelKilledSubagents === true)
+  // The TUI is still alive: the app promise has not settled.
+  let exited = false
+  void app.then(() => { exited = true }, () => { exited = true })
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  assert.equal(exited, false, 'esc cancels without exiting')
+
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('ctrl-z detaches with the turn running, ctrl-c stops it and its subagents', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')

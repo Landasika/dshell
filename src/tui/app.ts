@@ -510,6 +510,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     resolveDone?.(code)
   }
 
+  /** Esc while running: stop the turn and its subagents, stay attached. */
+  const cancelRunningTurn = async (): Promise<void> => {
+    toast('cancelling the turn and its subagents…')
+    schedule()
+    try {
+      await state.handle?.cancel(true)
+    } catch (error) {
+      toast(`cancel failed: ${errorText(error)}`)
+      schedule()
+    }
+  }
+
   /** Ctrl-C while running: stop the turn and its subagents, then leave. */
   const cancelAndQuit = async (): Promise<void> => {
     toast('cancelling the turn and its subagents…')
@@ -2823,7 +2835,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         refreshCompletion()
         schedule()
       } else if (state.view?.status === 'running') {
-        toast('ctrl-c cancels and quits · ctrl-z detaches')
+        // An empty composer plus a running turn: Esc terminates the turn (and
+        // its live subagents) but leaves the TUI attached — Ctrl-C is the
+        // quit gesture now, so the two must not share a key.
+        void cancelRunningTurn()
       } else {
         // Double-Esc on an empty, idle composer opens the rewind list. The
         // first Esc is held for a short window so single-Esc stays harmless.
@@ -3530,7 +3545,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} tools/thinking`)
       body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'double esc')} rewind prompt`)
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
-      body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} stop run + quit · ${paint(theme, 'text', 'ctrl-z')} detach (run continues)`)
+      body.push(`${paint(theme, 'text', pad('esc', 15))} cancel the running turn · ${paint(theme, 'text', 'ctrl-c')} stop run + quit · ${paint(theme, 'text', 'ctrl-z')} detach`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
       return panelRule(theme, 'help & shortcuts', body, width)
     }
