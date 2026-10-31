@@ -55,6 +55,8 @@ import {
   ProviderEditError,
   addProvider,
   isProviderField,
+  readProviderDetail,
+  syncProviderModels,
   readProviders,
   removeProvider,
   setProviderField,
@@ -1082,12 +1084,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
   /** The Host's LLM surface; `discoverModels` interrogates an upstream listing. */
   const llmDiscovery = (): {
-    discoverModels(ns: string, request: { baseURL: string; api?: string; apiKey?: string }): Promise<
+    discoverModels(ns: string, request: { provider?: string; baseURL?: string; api?: string; apiKey?: string }): Promise<
       { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]
     >
   } | undefined => {
     const service = ctx.get?.('llm') as
-      | { discoverModels?: (ns: string, request: { baseURL: string; api?: string; apiKey?: string }) => Promise<unknown> }
+      | { discoverModels?: (ns: string, request: { provider?: string; baseURL?: string; api?: string; apiKey?: string }) => Promise<unknown> }
       | undefined
     if (typeof service?.discoverModels !== 'function') return undefined
     return { discoverModels: (ns, request) => service.discoverModels?.(ns, request) as Promise<never[]> }
@@ -1199,6 +1201,82 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     } catch (error) {
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error instanceof Error ? error.message : String(error) })
     }
+  }
+
+  /** Diff one configured provider's model list against its upstream listing. */
+  const syncPlan = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
+    const llm = llmDiscovery()
+    if (providerId.length === 0) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/sync-plan needs providerId' })
+      return
+    }
+    if (llm === undefined) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: 'this Host exposes no model discovery',
+        action: 'Edit the models list by hand.',
+      })
+      return
+    }
+    const file = providerFile()
+    if (file === undefined) {
+      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host found no cordis.patch.yml to read providers from' })
+      return
+    }
+    const detail = readProviderDetail(safeRead(file), providerId)
+    if (detail.baseURL === undefined) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: `provider ${providerId} declares no baseURL to list models from` })
+      return
+    }
+    try {
+      const discovered = await llm.discoverModels('llm-pi-ai', {
+        provider: providerId,
+        baseURL: detail.baseURL,
+        ...(detail.api === undefined ? {} : { api: detail.api }),
+      })
+      const upstream = new Set(discovered.map((model) => model.id))
+      const declared = new Set(detail.modelIds)
+      const added = [...upstream].filter((id) => !declared.has(id)).sort()
+      const removed = detail.modelIds.filter((id) => !upstream.has(id))
+      jsonLine(socket, { type: 'provider-sync-plan', providerId, added, removed, kept: declared.size - removed.length })
+    } catch (error) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  /** Apply a sync: adopt new ids, optionally drop the gone ones. */
+  const syncApply = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
+    const add = Array.isArray(message.add) ? message.add.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
+    const remove = Array.isArray(message.remove) ? message.remove.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
+    const file = providerFile()
+    if (providerId.length === 0 || (add.length === 0 && remove.length === 0)) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/sync-apply needs providerId and something to change' })
+      return
+    }
+    if (file === undefined || !providerWritable(file)) {
+      sendError(socket, {
+        type: 'error',
+        code: 'UNSUPPORTED_CAPABILITY',
+        message: file === undefined ? 'this Host found no cordis.patch.yml to write providers to' : `${file} is not writable`,
+      })
+      return
+    }
+    const before = safeRead(file)
+    let after: string
+    try {
+      after = syncProviderModels(before, providerId, add, remove)
+    } catch (error) {
+      if (error instanceof ProviderEditError) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        return
+      }
+      throw error
+    }
+    if (after !== before && !persistProviders(socket, file, after, providerRows())) return
+    jsonLine(socket, { type: 'provider-sync-applied', file, providerId, providers: providerRows() })
   }
 
   const createProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
@@ -2042,6 +2120,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'provider/discover':
           await discoverProviderModels(socket, message)
+          return
+        case 'provider/sync-plan':
+          await syncPlan(socket, message)
+          return
+        case 'provider/sync-apply':
+          await syncApply(socket, message)
           return
         case 'provider/create':
           await createProvider(socket, message)

@@ -277,6 +277,90 @@ export function addProvider(text: string, spec: NewProviderSpec): string {
   return joinDocument(lines, trailingNewline)
 }
 
+/** One provider's declared facts, for upstream model sync. */
+export interface ProviderDetail {
+  id: string
+  baseURL?: string
+  api?: string
+  apiKeyEnv?: string
+  modelIds: string[]
+}
+
+/** Read one provider's fields and model ids from the patch text. */
+export function readProviderDetail(text: string, providerId: string): ProviderDetail {
+  const lines = splitLines(text)
+  const block = findProviderBlock(lines)
+  const range = block === undefined ? undefined : providerRanges(lines, block).get(providerId)
+  if (range === undefined) {
+    throw new ProviderEditError('PROVIDER_NOT_FOUND', `provider ${providerId} is not declared in this patch file`)
+  }
+  const detail: ProviderDetail = { id: providerId, modelIds: [] }
+  for (let index = range.start + 1; index < range.end; index += 1) {
+    const line = lines[index] ?? ''
+    const model = /^ {10}- id:[ \t]+(.+?)\s*$/.exec(line)
+    if (model !== null) {
+      detail.modelIds.push(parseScalar(model[1] ?? ''))
+      continue
+    }
+    const field = FIELD.exec(line)
+    if (field === null) continue
+    const key = field[1]
+    const value = parseScalar(field[2] ?? '')
+    if (value.length === 0) continue
+    if (key === 'baseURL') detail.baseURL = value
+    else if (key === 'api') detail.api = value
+    else if (key === 'apiKeyEnv') detail.apiKeyEnv = value
+  }
+  return detail
+}
+
+/**
+ * Sync one provider's model list against the upstream: drop ids in `remove`
+ * (whole `- id:` rows), append ids in `add` as bare rows, and leave every
+ * other row — including hand-tuned capacities — byte-identical.
+ */
+export function syncProviderModels(text: string, providerId: string, add: readonly string[], remove: readonly string[]): string {
+  const { lines, trailingNewline } = splitDocument(text)
+  const block = findProviderBlock(lines)
+  const range = block === undefined ? undefined : providerRanges(lines, block).get(providerId)
+  if (range === undefined) {
+    throw new ProviderEditError('PROVIDER_NOT_FOUND', `provider ${providerId} is not declared in this patch file`)
+  }
+  const dropping = new Set(remove)
+  // models: key inside the provider range — the rebuilt rows replace what
+  // follows it up to the end of the provider block.
+  let modelsAt = -1
+  for (let index = range.start + 1; index < range.end; index += 1) {
+    if (/^ {8}models:[ \t]*(?:#.*)?$/.test(lines[index] ?? '')) {
+      modelsAt = index
+      break
+    }
+  }
+  if (modelsAt === -1) {
+    throw new ProviderEditError('BAD_FIELD', `provider ${providerId} declares no models list to sync`)
+  }
+  const keptIds = new Set(readProviderDetail(text, providerId).modelIds.filter((id) => !dropping.has(id)))
+  const additions = add.filter((id) => id.length > 0 && !keptIds.has(id) && !dropping.has(id))
+  const rebuilt: string[] = []
+  let currentId: string | null = null
+  const rowOf = (id: string) => `          - id: ${encodeScalar(id)}`
+  for (let index = range.start + 1; index < range.end; index += 1) {
+    const line = lines[index] ?? ''
+    const model = /^ {10}- id:[ \t]+(.+?)\s*$/.exec(line)
+    if (model !== null) {
+      const id = parseScalar(model[1] ?? '')
+      currentId = dropping.has(id) ? null : id
+      if (currentId !== null) rebuilt.push(line)
+      continue
+    }
+    if (currentId === null) continue // a dropped row's continuation lines go too
+    rebuilt.push(line)
+  }
+  for (const id of additions) rebuilt.push(rowOf(id))
+  const next = [...lines.slice(0, modelsAt + 1), ...rebuilt, ...lines.slice(range.end)]
+  return joinDocument(next, trailingNewline)
+}
+
 /** Remove a whole provider block; other providers stay byte-identical. */
 export function removeProvider(text: string, providerId: string): string {
   const { lines, trailingNewline } = splitDocument(text)

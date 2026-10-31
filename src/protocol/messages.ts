@@ -271,6 +271,23 @@ export interface ProviderDiscoveredMessage {
   models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]
 }
 
+export interface ProviderSyncPlanMessage {
+  type: 'provider-sync-plan'
+  providerId: string
+  /** Declared upstream but not in the patch file. */
+  added: string[]
+  /** Declared in the patch file but the upstream no longer lists. */
+  removed: string[]
+  kept: number
+}
+
+export interface ProviderSyncAppliedMessage {
+  type: 'provider-sync-applied'
+  file: string
+  providerId: string
+  providers: ProviderEntry[]
+}
+
 export interface ProviderCreatedMessage {
   type: 'provider-created'
   file: string
@@ -470,6 +487,8 @@ export type ClientMessage =
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
   | { type: 'provider/api-key'; providerId: string; value: string }
   | { type: 'provider/discover'; baseURL: string; api?: string; apiKey?: string }
+  | { type: 'provider/sync-plan'; providerId: string }
+  | { type: 'provider/sync-apply'; providerId: string; add: string[]; remove: string[] }
   | {
       type: 'provider/create'
       providerId: string
@@ -512,6 +531,8 @@ export type ServerMessage =
   | ProviderUpdatedMessage
   | ProviderKeyStoredMessage
   | ProviderDiscoveredMessage
+  | ProviderSyncPlanMessage
+  | ProviderSyncAppliedMessage
   | ProviderCreatedMessage
   | ProviderDeletedMessage
   | AgentRosterMessage

@@ -2234,6 +2234,65 @@ test('the provider create panel fetches model ids from the upstream', async () =
   await backend.disconnect()
 })
 
+test('u on a provider row syncs its models against the upstream', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', color: false, resume: 's1', input, output })
+
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for TUI output; got ${JSON.stringify(output.text.slice(-700))}`)
+  }
+  const pause = (ms = 25) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  await waitFor(() => output.text.includes('idle'))
+  await pause(60)
+  input.push('/provider')
+  input.push('\r')
+  await waitFor(() => output.text.includes('/fake/cordis.patch.yml'))
+  const before = (await backend.providerList()).providers.find((row) => row.id === 'fake').models
+
+  input.push('u')
+  await waitFor(() => output.text.includes('sync models'))
+  await waitFor(() => output.text.includes('+ new upstream (2)'))
+  await waitFor(() => output.text.includes('fake-v4-pro'))
+  input.push('a')
+  await waitFor(() => output.text.includes('synced fake: +2'))
+  const after = (await backend.providerList()).providers.find((row) => row.id === 'fake').models
+  assert.equal(after, before + 2, 'the two new ids were adopted')
+  await waitFor(() => output.text.includes('fake')) // back on the list
+
+  input.push('\u0003')
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('provider editor pastes a field value and stores a raw sk- key', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')

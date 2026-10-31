@@ -4,6 +4,8 @@ import test from 'node:test'
 import {
   ProviderEditError,
   addProvider,
+  readProviderDetail,
+  syncProviderModels,
   clearProviderField,
   encodeScalar,
   readProviders,
@@ -123,6 +125,29 @@ test('addProvider appends a well-formed block with models', () => {
   assert.match(next, /      my-relay:\n {8}apiKeyEnv: MY_RELAY_API_KEY\n {8}displayName: 'My Relay'\n {8}baseURL: https:\/\/relay\.example\/v1\n {8}models:\n {10}- id: m1\n {10}- id: m2\n- id: other-plugin/)
   // Existing providers are untouched byte for byte.
   assert.equal(next.slice(0, next.indexOf('      my-relay:')), PATCH.slice(0, PATCH.indexOf('- id: other-plugin')))
+})
+
+test('syncProviderModels adopts new ids and drops gone ones, preserving tuned rows', () => {
+  const detail = readProviderDetail(PATCH, 'kimi-relay')
+  assert.ok(detail.modelIds.includes('kimi-latest'))
+  assert.ok(detail.modelIds.includes('k3'))
+  assert.equal(detail.api, 'anthropic-messages')
+  assert.equal(detail.baseURL, 'http://192.168.8.77:8180')
+
+  const after = syncProviderModels(PATCH, 'kimi-relay', ['kimi-new', 'k3'], ['kimi-latest'])
+  const next = readProviderDetail(after, 'kimi-relay')
+  assert.equal(next.modelIds.includes('kimi-new'), true)
+  assert.equal(next.modelIds.includes('k3'), true)
+  assert.equal(next.modelIds.includes('kimi-latest'), false)
+  // The kept row keeps its hand-tuned capacities; the dropped row's
+  // continuation lines (input: []) go with it.
+  assert.match(after, /- id: k3\n {12}contextWindow: 1048576/)
+  assert.doesNotMatch(after, /kimi-latest/)
+  // A re-added id is not duplicated.
+  const twice = syncProviderModels(after, 'kimi-relay', ['kimi-new'], [])
+  assert.equal(readProviderDetail(twice, 'kimi-relay').modelIds.filter((id) => id === 'kimi-new').length, 1)
+  // The other provider's rows are untouched.
+  assert.deepEqual(readProviderDetail(after, 'glm-sa').modelIds, readProviderDetail(PATCH, 'glm-sa').modelIds)
 })
 
 test('addProvider writes the wire protocol ahead of the credential reference', () => {

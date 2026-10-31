@@ -24,6 +24,18 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `/provider` rows can sync against the upstream (`u`): the Host diffs the
+  declared models against `GET {baseURL}/models` and offers the result — `a`
+  adopts new ids, `r` also drops the gone ones. Hand-tuned capacities on kept
+  rows survive byte-identical; the router picks the change up live, and running
+  sessions keep the model they already selected.
+
+- `/provider` rows can sync against the upstream (`u`): the Host diffs the
+  declared models against `GET {baseURL}/models` and offers the result — `a`
+  adopts new ids, `r` also drops the gone ones. Hand-tuned capacities on kept
+  rows survive byte-identical; the router picks the change up live, and running
+  sessions keep the model they already selected.
+
 - `/provider`'s add panel can fetch model ids from the upstream (`f`): the Host
   interrogates `GET {baseURL}/models` through its own discovery seam and fills
   the draft — adoption, not sync, because a listing carries no capacities. The

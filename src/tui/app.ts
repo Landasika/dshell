@@ -134,6 +134,13 @@ type Overlay =
   | { kind: 'models'; index: number }
   | { kind: 'effort'; provider: string; model: string; index: number; back: number }
   | { kind: 'providers'; index: number }
+  | {
+      kind: 'providerSync'
+      providerId: string
+      added: string[]
+      removed: string[]
+      kept: number
+    }
   | { kind: 'harness'; index: number; roster: AgentRoster }
   | {
       kind: 'providerEdit'
@@ -1360,6 +1367,56 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
   }
 
+  /**
+   * `u` on a provider row: diff its declared models against the upstream
+   * listing, then offer adoption. `a` adds what appeared; `r` also drops what
+   * vanished (a running session that still names a dropped model keeps its own
+   * selection — the patch only shapes future routings).
+   */
+  const openSyncPlan = async (providerId: string): Promise<void> => {
+    if (!backend.capabilities().providerDiscover) {
+      toast('this Host cannot list upstream models')
+      schedule()
+      return
+    }
+    state.status = 'listing models'
+    schedule()
+    try {
+      const plan = await backend.providerSyncPlan(providerId)
+      state.overlay = { kind: 'providerSync', providerId, ...plan }
+    } catch (error) {
+      toast(`model listing failed: ${errorText(error)}`)
+    } finally {
+      state.status = 'idle'
+      schedule()
+    }
+  }
+
+  const applySync = async (overlay: Extract<Overlay, { kind: 'providerSync' }>, withRemoval: boolean): Promise<void> => {
+    const remove = withRemoval ? overlay.removed : []
+    if (overlay.added.length === 0 && remove.length === 0) {
+      state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
+      schedule()
+      return
+    }
+    state.status = 'syncing models'
+    schedule()
+    try {
+      state.providers = await backend.applyProviderSync(overlay.providerId, overlay.added, remove)
+      state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
+      toast(
+        overlay.added.length + remove.length === 0
+          ? 'nothing to sync'
+          : `synced ${overlay.providerId}: +${String(overlay.added.length)}${withRemoval ? ` -${String(remove.length)}` : ''} · the router picks it up live`,
+      )
+    } catch (error) {
+      toast(`sync failed: ${errorText(error)}`)
+    } finally {
+      state.status = 'idle'
+      schedule()
+    }
+  }
+
   const submitNewProvider = async (overlay: Extract<Overlay, { kind: 'providerCreate' }>): Promise<void> => {
     const id = overlay.draft.id.trim()
     const baseURL = overlay.draft.baseURL.trim()
@@ -2088,6 +2145,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         toast('approval still pending; answer with a/r or wait for the timeout')
       } else if (overlay.kind === 'effort') {
         reopenModelPicker(overlay.back)
+      } else if (overlay.kind === 'providerSync') {
+        state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
       } else if (overlay.kind === 'providerEdit' && overlay.editing !== undefined) {
         overlay.editing = undefined
       } else if (overlay.kind === 'providerEdit') {
@@ -2452,6 +2511,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const entry = rows[overlay.index]
         if (entry !== undefined) openProviderEditor(entry)
         return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'u') {
+        const entry = rows[overlay.index]
+        if (entry !== undefined) void openSyncPlan(entry.id)
+        return
       } else if (key.type === 'text' && key.text.toLowerCase() === 'r') {
         state.overlay = {
           kind: 'confirm',
@@ -2491,6 +2554,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           }
           schedule()
         }
+        return
+      }
+      schedule()
+      return
+    }
+    if (overlay.kind === 'providerSync') {
+      if (key.type === 'text' && key.text.toLowerCase() === 'a') {
+        void applySync(overlay, false)
+        return
+      } else if (key.type === 'text' && key.text.toLowerCase() === 'r') {
+        void applySync(overlay, true)
         return
       }
       schedule()
@@ -3563,7 +3637,32 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(paint(theme, 'muted', list?.file ?? 'no patch file found'))
       if (list?.writable === false) body.push(paint(theme, 'error', 'read-only: fix the file permissions to edit'))
       return panelRule(theme, 'providers', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ select · enter edit · a add · x remove · r restart · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ select · enter edit · a add · u sync models · x remove · r restart · esc close')],
+      })
+    }
+    if (overlay.kind === 'providerSync') {
+      const body: string[] = []
+      body.push(paint(theme, 'muted', `${overlay.providerId} · upstream vs cordis.patch.yml`))
+      body.push('')
+      if (overlay.added.length > 0) {
+        body.push(paint(theme, 'text', `+ new upstream (${String(overlay.added.length)}):`))
+        for (const id of overlay.added.slice(0, 8)) body.push(paint(theme, 'text', `    ${id}`))
+        if (overlay.added.length > 8) body.push(paint(theme, 'muted', `    … ${String(overlay.added.length - 8)} more`))
+      } else {
+        body.push(paint(theme, 'muted', 'nothing new upstream'))
+      }
+      body.push('')
+      if (overlay.removed.length > 0) {
+        body.push(paint(theme, 'error', `- no longer listed (${String(overlay.removed.length)}):`))
+        for (const id of overlay.removed.slice(0, 8)) body.push(paint(theme, 'error', `    ${id}`))
+        if (overlay.removed.length > 8) body.push(paint(theme, 'muted', `    … ${String(overlay.removed.length - 8)} more`))
+      } else {
+        body.push(paint(theme, 'muted', 'nothing gone upstream'))
+      }
+      body.push('')
+      body.push(paint(theme, 'muted', `${String(overlay.kept)} unchanged · new rows adopt bare ids; hand-tuned sizes stay`))
+      return panelRule(theme, 'sync models', body, width, {
+        footer: [paint(theme, 'muted', 'a add new · r add + drop gone · esc keep as-is')],
       })
     }
     if (overlay.kind === 'providerEdit') {

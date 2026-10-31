@@ -244,6 +244,10 @@ export interface DshellBackend {
   storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }>
   /** Interrogate an upstream's model listing; candidate ids, nothing stored. */
   discoverProviderModels(baseURL: string, api?: string, apiKey?: string): Promise<{ id: string; name?: string; contextWindow?: number; maxTokens?: number }[]>
+  /** Diff a configured provider's models against its upstream. */
+  providerSyncPlan(providerId: string): Promise<{ added: string[]; removed: string[]; kept: number }>
+  /** Adopt new model ids and/or drop gone ones; existing rows keep their fields. */
+  applyProviderSync(providerId: string, add: string[], remove: string[]): Promise<ProviderList>
   /** Append a new provider block; takes effect after the Host restarts. */
   createProvider(spec: NewProviderSpec): Promise<ProviderList>
   /** Remove a provider block; takes effect after the Host restarts. */

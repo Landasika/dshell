@@ -226,7 +226,10 @@ In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
 `apiKeyEnv` is stored in `~/.dsh/.credentials.yaml` and the field keeps only its
 reference), `s` saves, `r` restarts the Host. In the add panel, `f` lists the
 upstream's model ids into the draft (`GET {baseURL}/models`) — the listing
-carries no sizes, so they still come from the catalog or hand entry.
+carries no sizes, so they still come from the catalog or hand entry. On a
+provider row, `u` diffs its declared models against the upstream: `a` adopts
+what appeared, `r` also drops what vanished (hand-tuned sizes on kept rows stay
+byte-identical; running sessions keep their own model selection).
 
 A mouse selection is copied on release (OSC 52) and stays highlighted. It is
 tracked in transcript coordinates, not screen rows: wheel scrolling carries it

@@ -293,6 +293,21 @@ export class FakeBackend implements DshellBackend {
     ]
   }
 
+  async providerSyncPlan(providerId: string): Promise<{ added: string[]; removed: string[]; kept: number }> {
+    this.assertConnected()
+    const row = this.providerRows.find((candidate) => candidate.id === providerId)
+    if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
+    return { added: ['fake-v4-pro', 'fake-v4-flash'], removed: [], kept: row.models }
+  }
+
+  async applyProviderSync(providerId: string, add: string[], remove: string[]): Promise<ProviderList> {
+    this.assertConnected()
+    const row = this.providerRows.find((candidate) => candidate.id === providerId)
+    if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
+    row.models = Math.max(0, row.models + add.length - remove.length)
+    return this.providerList()
+  }
+
   async storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }> {
     this.assertConnected()
     const row = this.providerRows.find((candidate) => candidate.id === providerId)

@@ -117,7 +117,10 @@ the Anthropic spelling `/v1/models`) lists what an upstream serves. The Web
 Models page's "fetch available models" action and the TUI provider panel's `f`
 key do the same through the Host — but discovery is **adoption, not sync**: a
 listing carries no capacities or compat, so the ids land in a draft and
-`contextWindow`/`maxTokens` still come from the catalog or hand entry.
+`contextWindow`/`maxTokens` still come from the catalog or hand entry. When an
+upstream changes what it serves, the TUI's `u` (sync models) on a provider row
+diffs the declared list against the listing: adopt what appeared, optionally
+drop what vanished — kept rows keep their tuned fields byte-identical.
 
 ## 4. Add a model to an existing provider
 

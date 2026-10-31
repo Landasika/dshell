@@ -13,6 +13,8 @@ import type {
   ProviderCreatedMessage,
   ProviderKeyStoredMessage,
   ProviderDiscoveredMessage,
+  ProviderSyncPlanMessage,
+  ProviderSyncAppliedMessage,
   ProviderDeletedMessage,
   ProviderField,
   ProviderListMessage,
@@ -270,6 +272,34 @@ export class SocketBackend implements DshellBackend {
         30_000,
       )
       return message.models
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async providerSyncPlan(providerId: string): Promise<{ added: string[]; removed: string[]; kept: number }> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<ProviderSyncPlanMessage>(
+        { type: 'provider/sync-plan', providerId },
+        (candidate) => candidate.type === 'provider-sync-plan',
+        30_000,
+      )
+      return { added: message.added, removed: message.removed, kept: message.kept }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async applyProviderSync(providerId: string, add: string[], remove: string[]): Promise<ProviderList> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<ProviderSyncAppliedMessage>(
+        { type: 'provider/sync-apply', providerId, add, remove },
+        (candidate) => candidate.type === 'provider-sync-applied',
+        15_000,
+      )
+      return { file: message.file, writable: true, providers: message.providers }
     } catch (error) {
       throw mapError(error)
     }
