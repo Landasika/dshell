@@ -271,7 +271,7 @@ for the Web UI.
 | `/agents` | list subagents, open their transcripts |
 | `/skills [name]` | browse the Host skill catalog, or open one skill |
 | `/verbose` | toggle reasoning and lifecycle events |
-| `/model` | switch provider/model and reasoning level |
+| `/model` | switch provider/model — `Enter` applies with the remembered reasoning level; `e` picks the level explicitly |
 | `/provider` | edit provider rows in `cordis.patch.yml` |
 | `/quit` | leave the TUI (detach — the Host turn keeps running; `Ctrl-C` stops it) |
 

@@ -2439,10 +2439,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.index = nearestModelRow(overlay.index, delta)
       } else if (key.type === 'down' || key.type === 'ctrl-n') {
         overlay.index = nearestModelRow(overlay.index, 1)
-      } else if (key.type === 'enter' || key.type === 'tab' || key.type === 'right') {
+      } else if (key.type === 'enter' || key.type === 'tab') {
+        // Enter switches in one step: a model with reasoning levels applies
+        // with the remembered level (or the catalog default). The explicit
+        // level list stays one key away on `e` / →.
         if (row?.kind === 'model') {
-          if (hasEfforts(row)) openEffortPicker(row)
-          else void applyModel(row)
+          void applyModel(row)
         } else if (row?.kind === 'group') {
           // A provider header is not selectable; Enter jumps to its first model
           // so the key is never a silent no-op.
@@ -2454,6 +2456,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           toast(`provider ${row.providerName ?? row.provider ?? ''} unavailable: ${row.message ?? 'no route'}`)
         }
         return
+      } else if (key.type === 'right') {
+        if (row?.kind === 'model') openEffortPicker(row)
       } else if (key.type === 'text' && key.text.toLowerCase() === 'e') {
         if (row?.kind === 'model') openEffortPicker(row)
         else if (row?.kind === 'group') {
@@ -3591,7 +3595,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         `${paint(theme, 'success', '●')} ${paint(theme, 'muted', 'in use')}   ${paint(theme, 'accent', '▸')} ${paint(theme, 'muted', 'cursor · enter applies')}`,
       )
       return panelRule(theme, 'reasoning level', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ or 1-9 pick · enter switch · d default · ← back · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ or 1-9 pick · enter switch · e level · d default · ← back · esc close')],
       })
     }
     if (overlay.kind === 'harness') {

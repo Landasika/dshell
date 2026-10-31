@@ -1904,10 +1904,7 @@ test('TUI model picker switches the session model and saves a default', async ()
   input.push('\u001b[B')
   await new Promise((resolve) => setTimeout(resolve, 20))
   input.push('\r')
-  // Relay Flash declares reasoning levels, so the model pick steps into the
-  // level list first; the second enter commits model + level together.
-  await waitFor(() => output.text.includes('reasoning level') && output.text.includes('Low'))
-  input.push('\r')
+  // One Enter switches now; the catalog-default level (low) rides along.
   await waitFor(() => output.text.includes('model → relay/relay-flash · low'))
 
   input.push('/model')
@@ -1966,13 +1963,18 @@ test('TUI effort picker shows levels and remembers the choice in the rail', asyn
   await new Promise((resolve) => setTimeout(resolve, 20))
   input.push('\u001b[B')
   await new Promise((resolve) => setTimeout(resolve, 20))
-  input.push('\r')
-  await waitFor(() => output.text.includes('reasoning level'))
-  assert.equal(output.text.includes('Reserve for the hardest quality-first tasks.') || output.text.includes('low'), true)
+  // Enter now switches in one step; the remembered level (low) applies with it.
   input.push('\r')
   await waitFor(() => output.text.includes('model → relay/relay-flash · low'))
-  // The rail keeps showing the chosen level after the picker closes.
   assert.match(output.text.slice(-4000), /relay\/relay-flash · low/)
+
+  // The explicit level list is still one key away on `e`.
+  input.push('/model')
+  input.push('\r')
+  await waitFor(() => output.text.includes('Relay Flash'))
+  input.push('e')
+  await waitFor(() => output.text.includes('reasoning level'))
+  assert.equal(output.text.includes('Reserve for the hardest quality-first tasks.') || output.text.includes('low'), true)
 
   input.push('\u0003')
   input.push('\u0004')
@@ -2028,8 +2030,6 @@ test('a rejected model switch surfaces the Host error instead of hanging', async
   input.push('\u001b[B')
   await pause()
   input.push('\r')
-  await waitFor(() => output.text.includes('reasoning level'))
-  input.push('\r')
   await waitFor(() => output.text.includes('model switch failed'))
   assert.equal(output.text.includes('does not support reasoning effort'), true)
 
@@ -2082,8 +2082,9 @@ test('TUI level picker also accepts Shift+Enter and 1-9', async () => {
   await pause()
   input.push('\u001b[B')
   await pause()
-  // LF stands in for a terminal that sends \n on Enter / Shift+Enter.
-  input.push('\n')
+  // `e` opens the explicit level list; LF stands in for a terminal that
+  // sends \n on Enter / Shift+Enter inside it.
+  input.push('e')
   await waitFor(() => output.text.includes('reasoning level'))
   // '3' commits the third level without arrowing there first.
   input.push('3')

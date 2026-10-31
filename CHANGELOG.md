@@ -3,6 +3,14 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [Unreleased]
+
+### Changed
+
+- `/model` switches in one Enter: a model with reasoning levels applies with
+  the remembered level (or the catalog default) instead of detouring through
+  the level submenu first. The explicit list stays on `e` / `→`.
+
 ## [0.4.0] — 2026-10-31
 
 ### Changed
