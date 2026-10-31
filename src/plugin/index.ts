@@ -1828,16 +1828,43 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     else agent.followup(userMessage)
   }
 
-  const cancel = (socket: Socket, message: Record<string, unknown>): void => {
+  /**
+   * Abort the live subagents of one session: a cancelled turn stops its own
+   * tool calls, but a child spawned earlier (or holding a lease) can outlive
+   * it. Children are the sessions whose header says `origin: subagent` with
+   * this session as the parent.
+   */
+  const cancelSubagents = async (sessionId: string): Promise<number> => {
+    try {
+      const records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
+      let cancelled = 0
+      for (const record of records ?? []) {
+        if (record.header.origin !== 'subagent' || record.header.parentSession !== sessionId) continue
+        if (!record.live) continue
+        const child = ctx.agents.get(record.header.id)
+        if (child === undefined) continue
+        child.cancel({ kind: 'user' })
+        cancelled += 1
+      }
+      return cancelled
+    } catch {
+      // A session-list hiccup must not block the parent's own cancel.
+      return 0
+    }
+  }
+
+  const cancel = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
     if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'session/cancel requires a sessionId' })
       return
     }
+    const subagents = message.killSubagents === true ? await cancelSubagents(message.sessionId) : 0
     const agent = ctx.agents.get(message.sessionId)
     if (agent !== undefined) agent.cancel({ kind: 'user' })
     jsonLine(socket, {
       type: 'cancelled',
       sessionId: message.sessionId,
+      ...(subagents > 0 ? { subagentsCancelled: subagents } : {}),
       ...(typeof message.requestId === 'string' ? { requestId: message.requestId } : {}),
     })
   }

@@ -183,7 +183,8 @@ export interface SessionHandle {
   snapshot(): SessionView
 
   send(text: string, options?: SendOptions): Promise<SendReceipt>
-  cancel(): Promise<void>
+  /** Cancel the running turn; `killSubagents` also aborts its live subagents. */
+  cancel(killSubagents?: boolean): Promise<void>
   /** Delete one prompt still waiting in the Host inbox. */
   removeQueued(requestId: string): Promise<void>
   /** Rewrite one prompt still waiting in the Host inbox. */

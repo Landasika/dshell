@@ -510,6 +510,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     resolveDone?.(code)
   }
 
+  /** Ctrl-C while running: stop the turn and its subagents, then leave. */
+  const cancelAndQuit = async (): Promise<void> => {
+    toast('cancelling the turn and its subagents…')
+    schedule()
+    try {
+      await state.handle?.cancel(true)
+    } catch {
+      // The Host is going away with us; a dead socket is not an error.
+    }
+    quit(0)
+  }
+
   const onSignal = (): void => quit(0)
   const onEnd = (): void => quit(0)
 
@@ -2807,7 +2819,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         refreshCompletion()
         schedule()
       } else if (state.view?.status === 'running') {
-        toast('ctrl-c cancels the running turn')
+        toast('ctrl-c cancels and quits · ctrl-z detaches')
       } else {
         // Double-Esc on an empty, idle composer opens the rewind list. The
         // first Esc is held for a short window so single-Esc stays harmless.
@@ -2827,10 +2839,22 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.historyIndex = -1
         schedule()
       } else if (state.view?.status === 'running') {
-        void cancel()
+        // Ctrl-C quits AND stops the run: the turn is cancelled together with
+        // its live subagents, so nothing of this session outlives the TUI.
+        void cancelAndQuit()
       } else {
         quit(0)
       }
+      return
+    }
+    if (key.type === 'ctrl-z') {
+      // Detach: leave now and let the turn keep running in the Host — the
+      // tmux shape. /sessions reattaches later.
+      if (state.editor.text.length > 0) {
+        state.editor = createEditor()
+        state.historyIndex = -1
+      }
+      quit(0)
       return
     }
     if (key.type === 'ctrl-d') {
@@ -3502,7 +3526,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} tools/thinking`)
       body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'double esc')} rewind prompt`)
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
-      body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} cancel/quit · ${paint(theme, 'text', 'ctrl-d')} quit`)
+      body.push(`${paint(theme, 'text', pad('ctrl-c', 15))} stop run + quit · ${paint(theme, 'text', 'ctrl-z')} detach (run continues)`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
       return panelRule(theme, 'help & shortcuts', body, width)
     }

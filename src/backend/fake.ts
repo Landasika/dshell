@@ -81,6 +81,8 @@ export class FakeBackend implements DshellBackend {
   private nextId = 1
   private defaultModel: ModelSelection = { provider: 'fake', model: 'fake-flash' }
   private readonly sessionModels = new Map<string, ModelSelection>()
+  /** What the last `cancel` passed for killSubagents, for assertions. */
+  lastCancelKilledSubagents = false
   /** Secrets stored through `storeProviderKey`, so tests can assert on them. */
   readonly storedKeys = new Map<string, string>()
   /** Providers the fake patch file declares; `updateProvider` mutates this. */
@@ -713,8 +715,9 @@ class FakeSessionHandle implements SessionHandle {
     }
   }
 
-  async cancel(): Promise<void> {
+  async cancel(killSubagents = false): Promise<void> {
     this.assertOpen()
+    this.backend.lastCancelKilledSubagents = killSubagents
     if (this.session.status !== 'running') return
     // A cancel drops the inbox with the aborted turn, like the Host does.
     this.backend.dropQueued(this.id)

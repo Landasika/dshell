@@ -2293,6 +2293,52 @@ test('u on a provider row syncs its models against the upstream', async () => {
   await backend.disconnect()
 })
 
+test('ctrl-z detaches with the turn running, ctrl-c stops it and its subagents', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'go' }] } } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+  ]
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  await waitFor(() => output.text.includes('idle'))
+
+  // Ctrl-Z leaves immediately and sends nothing: the turn keeps running.
+  input.push('\u001a')
+  assert.equal(await app, 0)
+  assert.equal(backend.lastCancelKilledSubagents, false, 'detach sends no cancel')
+  await backend.disconnect()
+})
+
 test('provider editor pastes a field value and stores a raw sk- key', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
@@ -2691,18 +2737,12 @@ test('enter steers into the running turn and alt+q queues behind it', async () =
   await waitFor(() => output.text.includes('◷ queued'), 'the queued marker')
   assert.equal(backend.queuedPrompts.some((entry) => entry.text === 'after this' && entry.mode === 'queue'), true)
 
-  // Ctrl-C aborts the running turn but hands the queued prompt back, so it
-  // starts instead of disappearing with the aborted turn.
-  output.text = ''
+  // Ctrl-C on a running turn now means "stop and leave": the cancel goes out
+  // with the kill-subagents flag and the TUI exits instead of staying open.
   input.push('\u0003')
-  await waitFor(
-    () => output.text.includes('after this') && !output.text.includes('◷ queued'),
-    'the queued prompt restarted after cancel',
-  )
-  assert.equal(output.text.includes('cancelled this turn'), true)
-
-  input.push('\u0003')
-  input.push('\u0004')
+  // The TUI leaves right away; the toast cannot be relied on to render.
+  assert.equal(await app, 0)
+  assert.equal(backend.lastCancelKilledSubagents, true)
   assert.equal(await app, 0)
 })
 

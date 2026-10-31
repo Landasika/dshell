@@ -22,6 +22,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   copied in full, not just its visible part. Scrolling inside a panel still
   clears the highlight, because panels repaint their own rows.
 
+### Changed
+
+- Exit semantics split by key: `Ctrl-Z` detaches (the turn keeps running in
+  the Host, `/sessions` reattaches), while `Ctrl-C` on a running turn now
+  stops the run and quits — the cancel carries a kill-subagents flag that
+  aborts the session's live subagents too, so nothing of it outlives the TUI.
+  `Ctrl-D` stays a plain detach.
+
 ### Added
 
 - `/provider` rows can sync against the upstream (`u`): the Host diffs the

@@ -219,8 +219,9 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-G` | subagents (roster + read-only transcript) |
 | `Esc` `Esc` | rewind to a previous prompt |
 | `End` / `Esc` | jump to the bottom while scrolled up |
-| `Ctrl-C` | cancel the turn (or quit when idle) |
-| `Ctrl-D` | quit |
+| `Ctrl-C` | stop the run and quit — cancels the turn **and kills its live subagents** (quit when idle) |
+| `Ctrl-Z` | detach — quit now, the turn keeps running in the Host; `/sessions` reattaches |
+| `Ctrl-D` | quit (same detach as `Ctrl-Z`) |
 
 In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
 `apiKeyEnv` is stored in `~/.dsh/.credentials.yaml` and the field keeps only its
@@ -272,7 +273,7 @@ for the Web UI.
 | `/verbose` | toggle reasoning and lifecycle events |
 | `/model` | switch provider/model and reasoning level |
 | `/provider` | edit provider rows in `cordis.patch.yml` |
-| `/quit` | leave the TUI (does not cancel the Host turn) |
+| `/quit` | leave the TUI (detach — the Host turn keeps running; `Ctrl-C` stops it) |
 
 ## CLI
 

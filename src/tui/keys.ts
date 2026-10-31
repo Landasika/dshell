@@ -19,6 +19,7 @@ export type Key =
   | { type: 'shift-tab' }
   | { type: 'escape' }
   | { type: 'ctrl-c' }
+  | { type: 'ctrl-z' }
   | { type: 'ctrl-d' }
   | { type: 'ctrl-k' }
   | { type: 'ctrl-u' }
@@ -85,6 +86,7 @@ const SEQUENCES: Record<string, Key> = {
 }
 
 const CONTROL: Record<string, Key> = {
+  '\u001a': { type: 'ctrl-z' },
   '\r': { type: 'enter' },
   '\n': { type: 'newline' },
   '\u007f': { type: 'backspace' },

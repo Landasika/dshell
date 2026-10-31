@@ -610,9 +610,13 @@ export class SocketSessionHandle implements SessionHandle {
     }
   }
 
-  async cancel(): Promise<void> {
+  async cancel(killSubagents = false): Promise<void> {
     this.assertOpen()
-    this.connection.send({ type: 'session/cancel', sessionId: this.id })
+    this.connection.send({
+      type: 'session/cancel',
+      sessionId: this.id,
+      ...(killSubagents ? { killSubagents: true } : {}),
+    })
   }
 
   async removeQueued(requestId: string): Promise<void> {
