@@ -163,13 +163,13 @@ type Overlay =
 /** One navigable row of the ask overlay: an option, or a question's custom entry. */
 interface QuestionRow {
   qid: string
-  kind: 'option' | 'custom'
+  kind: 'option' | 'custom' | 'action'
   label?: string
   description?: string
   multi: boolean
 }
 
-function questionRows(question: AskedQuestion): QuestionRow[] {
+function questionRows(question: AskedQuestion, actionLabel = 'submit'): QuestionRow[] {
   const rows: QuestionRow[] = []
   for (const option of question.options ?? []) {
     rows.push({
@@ -183,6 +183,9 @@ function questionRows(question: AskedQuestion): QuestionRow[] {
   // Every question keeps one custom row so the cursor can always reach it,
   // and option-less questions are still answerable by typing.
   rows.push({ qid: question.id, kind: 'custom', multi: question.multiSelect === true })
+  // The commit row: ↓ lands on it and Enter moves to the next question or
+  // submits, so pressing Enter mid-list can never submit by accident.
+  rows.push({ qid: question.id, kind: 'action', label: actionLabel, multi: question.multiSelect === true })
   return rows
 }
 
@@ -2212,9 +2215,22 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const last = Math.max(0, questions.length - 1)
       const submitTab = overlay.tab > last
       const question = questions[Math.min(overlay.tab, last)]
-      const rows = question === undefined ? [] : questionRows(question)
+      const actionLabel = overlay.tab >= last ? 'submit' : 'next'
+      const rows = question === undefined ? [] : questionRows(question, actionLabel)
       const row = rows[overlay.cursor]
       const qid = question?.id ?? ''
+      /**
+       * A single-select question is radio: the option under the cursor is the
+       * tentative answer, so moving is choosing — space is still honored.
+       */
+      const followCursor = (): void => {
+        // Reads the row at the *new* cursor; the `row` above was captured
+        // before the move and would keep marking the previous option.
+        const current = rows[overlay.cursor]
+        if (current?.kind === 'option' && current.multi !== true && current.label !== undefined) {
+          overlay.selected[qid] = [current.label]
+        }
+      }
       /** Move on: next question, then the review page, then submit. */
       const advance = (): void => {
         overlay.customMode = false
@@ -2253,10 +2269,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.cursor = 0
       } else if (key.type === 'up' || key.type === 'ctrl-p') {
         overlay.cursor = Math.max(0, overlay.cursor - 1)
+        followCursor()
       } else if (key.type === 'down' || key.type === 'ctrl-n') {
         overlay.cursor = Math.min(Math.max(0, rows.length - 1), overlay.cursor + 1)
+        followCursor()
       } else if (key.type === 'text' && key.text === ' ') {
-        if (row?.kind === 'custom') {
+        if (row?.kind === 'action') {
+          advance()
+        } else if (row?.kind === 'custom') {
           overlay.customMode = true
         } else if (row?.label !== undefined) {
           const selected = overlay.selected[row.qid] ?? []
@@ -2286,15 +2306,27 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         }
       } else if (key.type === 'text' && (key.text === 'c' || key.text === 'C')) {
         overlay.customMode = true
-        overlay.cursor = Math.max(0, rows.length - 1)
+        overlay.cursor = Math.max(0, rows.length - 2)
       } else if (key.type === 'enter') {
         if (submitTab) {
           submitAnswers(overlay)
-        } else if (row?.kind === 'custom' && (overlay.custom[qid] ?? '').trim().length === 0) {
-          overlay.customMode = true
-        } else {
-          if (row?.label !== undefined && row.multi !== true) overlay.selected[qid] = [row.label]
+        } else if (row?.kind === 'action') {
+          // The commit row: next question, review page, or submit.
           advance()
+        } else if (row?.kind === 'custom') {
+          // A filled custom row commits on Enter; an empty one opens typing.
+          // Re-editing a filled row stays on `c`.
+          if ((overlay.custom[qid] ?? '').trim().length === 0) overlay.customMode = true
+          else advance()
+        } else if (row?.kind === 'option' && row.label !== undefined) {
+          // Enter mid-list picks (radio) or toggles (checkbox); only the
+          // action row submits, so an accidental Enter cannot send the batch.
+          const selected = overlay.selected[row.qid] ?? []
+          overlay.selected[row.qid] = row.multi
+            ? selected.includes(row.label)
+              ? selected.filter((label) => label !== row.label)
+              : [...selected, row.label]
+            : [row.label]
         }
       }
       schedule()
@@ -3404,7 +3436,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const last = Math.max(0, questions.length - 1)
     const submitTab = overlay.tab > last
     const question = questions[Math.min(overlay.tab, last)]
-    const rows = question === undefined ? [] : questionRows(question)
+    const actionLabel = overlay.tab >= last ? 'Submit' : 'Next'
+    const rows = question === undefined ? [] : questionRows(question, actionLabel.toLowerCase())
     const qid = question?.id ?? ''
     const lines: string[] = []
 
@@ -3504,13 +3537,21 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       lines.push(paint(theme, onCustomRow ? 'text' : 'dim', `${customMark} ✎ type a custom answer (c)`))
     }
 
+    // The commit row: ↓ reaches it from the last option, Enter confirms.
+    const actionRow = rows[overlay.cursor]?.kind === 'action'
+    const actionMark = actionRow ? paint(theme, 'accent', '▸') : ' '
+    const actionText = paint(theme, actionRow ? 'accent' : 'dim', actionRow
+      ? paint(theme, 'bold', `${actionLabel} ✓`)
+      : `${actionLabel} ✓`)
+    lines.push(` ${actionMark} ${actionText}`)
+
     const hint = customCursor
       ? questions.length === 1
         ? 'type an answer · enter submit · esc cancel text'
         : 'type an answer · enter done · esc cancel text'
-      : questions.length === 1
-        ? `↑↓ move · ${question.multiSelect === true ? 'space toggle' : 'space select'} · c custom · enter submit · esc later`
-        : `↑↓ move · ${question.multiSelect === true ? 'space toggle' : 'space select'} · ←→ question · c custom · enter next · esc later`
+      : question.multiSelect === true
+        ? `↑↓ move · space toggle · c custom · ↓ ${actionLabel.toLowerCase()} commits · esc later`
+        : `↑↓ choose (radio) · c custom · ↓ ${actionLabel.toLowerCase()} commits · esc later`
     lines.push(footer(hint))
     return {
       lines,

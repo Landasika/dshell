@@ -206,16 +206,21 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   await waitFor(() => output.text.includes('the model asks'))
   await waitFor(() => output.text.includes('包名用哪个？'))
 
-  // Space selects the option under the cursor (single-select radio).
+  // Single-select is radio: the cursor on an option marks it, no space needed.
   const beforeSelection = output.text.length
-  input.push(' ')
-  await waitFor(() => output.text.slice(beforeSelection).includes('● 1. A'))
+  input.push('\u001b[B')
+  await waitFor(() => output.text.slice(beforeSelection).includes('● 2. B'))
+  await waitFor(() => output.text.includes('Submit ✓'))
 
-  // Enter submits the batch; the overlay closes and the answer is recorded.
+  // ↓ twice more — past the custom row onto Submit; Enter submits the batch.
+  input.push('\u001b[B')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  input.push('\u001b[B')
+  await waitFor(() => output.text.includes('▸') && output.text.includes('Submit ✓'))
   input.push('\r')
   await waitFor(() => output.text.includes('answers sent'))
   assert.deepEqual(backend.answeredQuestions, [
-    { sessionId: 's1', callId: 'q1', answers: [{ id: 'pkg', selected: ['A'] }] },
+    { sessionId: 's1', callId: 'q1', answers: [{ id: 'pkg', selected: ['B'] }] },
   ])
 
   input.push('\u0004')
@@ -481,6 +486,10 @@ test('an answered ask does not reopen while the Host settles it', async () => {
     })
     await waitFor(() => stripAnsi(output.text).includes('the model asks'), 'the ask overlay')
     input.push(' ')
+    // The radio pick is stored; commit from the action row, two rows down.
+    input.push('\u001b[B')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    input.push('\u001b[B')
     input.push('\r')
     await waitFor(() => stripAnsi(output.text).includes('answers sent'), 'the submitted answer')
 

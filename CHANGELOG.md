@@ -3,6 +3,16 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [Unreleased]
+
+### Changed
+
+- The ask wizard's single-select questions are radio: the option under the
+  cursor is the pick, no `Space` needed. Each question ends in a `Submit`/
+  `Next` row that `↓` reaches — `Enter` there advances or sends, so an
+  `Enter` pressed mid-list no longer submits the whole batch by accident.
+  A filled custom row commits on `Enter` too; `c` re-opens it for editing.
+
 ## [0.4.1] — 2026-10-31
 
 ### Changed

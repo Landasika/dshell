@@ -250,9 +250,12 @@ to a `$dsh-config` mention, and the send path rewrites `$name` into the
 `/name` gesture, so the composer keeps showing what you typed while the Host
 still receives the syntax it parses.
 
-In an `ask_user_question` card: `↑/↓` move, `Space` toggles a choice (multi-
-select), `c` types a custom answer, `Enter` submits, `Esc` leaves it pending
-for the Web UI.
+In an `ask_user_question` card: `↑/↓` move — a single-select question is
+radio, so the row under the cursor is the pick; `Space` toggles a choice
+(multi-select), `c` types a custom answer. Every question ends in a
+`Submit`/`Next` row: `↓` onto it and `Enter` moves to the next question or
+sends the answers — pressing `Enter` mid-list can no longer submit by
+accident. `Esc` leaves the ask pending for the Web UI.
 
 ## Slash commands
 
