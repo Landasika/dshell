@@ -10,11 +10,11 @@
 </p>
 
 <p align="center">
-  <a href="docs/promo/out/dshell-promo.mp4"><img alt="demo" src="https://img.shields.io/badge/%E2%96%B6_demo-1m27s-1f6feb?style=flat-square"></a>
+  <a href="docs/promo/out/dshell-promo.mp4"><img alt="demo" src="https://img.shields.io/badge/%E2%96%B6_demo-1m50s-1f6feb?style=flat-square"></a>
   <img alt="node" src="https://img.shields.io/badge/node-%5E22.19_%7C_%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.2-4d6bfe?style=flat-square">
   <a href="https://github.com/Landasika/dshell/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/Landasika/dshell/ci.yml?branch=main&style=flat-square&label=ci"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-151_passing-2ea043?style=flat-square">
+  <img alt="tests" src="https://img.shields.io/badge/tests-194_passing-2ea043?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-linux-FCC624?style=flat-square&logo=linux&logoColor=black">
 </p>
 
@@ -67,7 +67,7 @@ without adding a second brain:
     <img src="docs/promo/out/poster.png" width="720" alt="watch the dshell demo" />
   </a>
   <br/>
-  <sub>1:27 · one conversation, folded tools, steering, approvals, session switching</sub>
+  <sub>1:50 · streaming + folded tools · steering & queueing · $ skills · one-Enter /model · radio asks · sessions & approvals</sub>
 </p>
 
 The video is silent; the narration is in the captions. Storyboard and
@@ -87,14 +87,21 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
   prompt for the next one, `Alt-Backspace` drops a queued prompt.
 - **Approvals you can trust** — answered by a Host bridge that races the Web UI
   fairly: first valid answer wins, everything else fails closed.
-- **Questions in the terminal** — `ask_user_question` renders as a selectable
-  card (`↑/↓`, `Space`, `c` for a custom answer, `Enter`); timed-out questions
-  stay answerable instead of dying with the turn.
+- **Questions in the terminal** — `ask_user_question` renders as a wizard:
+  single-select is radio (the row under the cursor is the pick), and every
+  question ends in a `Submit`/`Next` row, so `Enter` mid-list never sends by
+  accident. Timed-out questions stay answerable instead of dying with the turn.
 - **Subagents** — `⇢ agent started` cards that settle to `✓ finished` / `✗
   failed`; `Ctrl-G` lists children and opens their transcripts read-only.
-- **Model & provider control** — `/model` picks provider, model and reasoning
-  level from the Host's own catalog; `/provider` edits `cordis.patch.yml`
-  surgical lines and offers to restart the Host.
+- **Model & provider control** — `/model` switches in one `Enter` (`e` picks
+  the reasoning level explicitly); `/provider` edits `cordis.patch.yml`
+  surgically, stores pasted `sk-…` keys in the Host credential store, lists a
+  gateway's models (`f`) and syncs them against the upstream (`u`).
+- **Skills** — `/skills` browses the Host catalog; the composer's `$` opens a
+  menu and sends the `/name` gesture. The `dsh-config` skill documents the
+  whole patch-file harness.
+- **Harness viewer** — `/harness` shows the agent presets a session composes:
+  persona, tool rows and which layer overrode them.
 - **Herdr aware** — inside a [Herdr](https://herdr.dev) pane it reports
   `working` / `blocked` / `idle`, the session id and a resume command, with no
   hook to install.
@@ -103,7 +110,7 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
 
 ## Status
 
-`0.2.0` is the V1 candidate: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
+`0.4.1` is current: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
 plan (TUI, scriptable CLI, sessions/workspaces, approval bridge,
 models/providers, subagents, terminal questions) is complete — see the
 [changelog](CHANGELOG.md) and [supported versions](docs/SUPPORTED-VERSIONS.md).
@@ -217,12 +224,10 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-R` | search prompts sent in this session |
 | `Ctrl-B` | session panel |
 | `Ctrl-G` | subagents (roster + read-only transcript) |
-| `Esc` `Esc` | rewind to a previous prompt |
-| `End` / `Esc` | jump to the bottom while scrolled up |
-| `Esc` | cancel this turn (subagents keep running) while staying attached — takes priority over Esc's other duties (scroll-to-tail, close menu, clear draft) |
-| `Ctrl-C` | stop and quit — cancels the turn **and kills its live subagents** (quit when idle) |
-| `Ctrl-Z` | detach — quit now, the turn keeps running in the Host; `/sessions` reattaches |
-| `Ctrl-D` | quit (same detach as `Ctrl-Z`) |
+| `Esc` (turn running) | cancel this turn — subagents keep running, TUI stays; outranks Esc's other duties (scroll-to-tail, close menu, clear draft) |
+| `Esc` (idle) | close menu / clear draft / jump to tail; `Esc` `Esc` rewinds to a previous prompt |
+| `Ctrl-C` | quit — and if a turn runs, cancel it **and kill its subagents** |
+| `Ctrl-Z` / `Ctrl-D` / `/quit` | detach — quit now, the turn keeps running; `/sessions` reattaches |
 
 In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
 `apiKeyEnv` is stored in `~/.dsh/.credentials.yaml` and the field keeps only its
@@ -277,6 +282,7 @@ accident. `Esc` leaves the ask pending for the Web UI.
 | `/verbose` | toggle reasoning and lifecycle events |
 | `/model` | switch provider/model — `Enter` applies with the remembered reasoning level; `e` picks the level explicitly |
 | `/provider` | edit provider rows in `cordis.patch.yml` |
+| `/harness` | agent presets a session composes: persona, tools, overrides |
 | `/quit` | leave the TUI (detach — the Host turn keeps running; `Ctrl-C` stops it) |
 
 ## CLI
@@ -450,7 +456,7 @@ that the confirmation offers.
 pnpm install
 pnpm typecheck   # tsc --noEmit
 pnpm lint        # alias of typecheck
-pnpm test        # build + node --test (151 tests)
+pnpm test        # build + node --test (194 tests)
 ./scripts/ci.sh  # full local gate, including a clean pack/install
 ```
 

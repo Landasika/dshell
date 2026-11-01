@@ -238,7 +238,7 @@ const longTurn = async (submitted, requestId) => {
   emit('s1', 'turn/start', { turn: 3 })
   await sleep(200)
   emit('s1', 'user/message', user(requestId, submitted))
-  const body = '正在梳理依赖：先跑一遍现有的测试，确认改动前的基线，然后把 load.ts 的同步读盘拆成异步加载 + 缓存，再补上缓存失效的用例。'
+  const body = '正在梳理依赖：先跑一遍现有的测试，确认改动前的基线，然后把 load.ts 的同步读盘拆成异步加载 + 缓存，再补上缓存失效的用例。随后核对 schema 的默认值合并逻辑，确认缓存层不会绕过校验；最后把 README 里配置一节同步更新，标出新参数与迁移说明。' 
   for (let index = 1; index <= body.length; index += 1) {
     if (cancelled) break
     stream('s1', body.slice(0, index))
@@ -251,6 +251,18 @@ const longTurn = async (submitted, requestId) => {
     }
   }
   busy = false
+}
+
+const skillTurn = async (submitted, requestId) => {
+  const reply = '已按 release-checklist 过完：typecheck ✓ · test ✓ · pack ✓，可以发版。'
+  emit('s1', 'turn/start', { turn: 5 })
+  await sleep(200)
+  emit('s1', 'user/message', user(requestId, submitted))
+  await sleep(300)
+  await slowly('s1', reply, 1800)
+  stream('s1', '')
+  emit('s1', 'assistant/message', assistant(reply))
+  emit('s1', 'turn/end', { reason: { kind: 'completed' } })
 }
 
 let steer = null
@@ -277,6 +289,7 @@ onSend = async (submitted, mode, requestId) => {
   if (submitted.includes('配置加载')) return refactorTurn(submitted, requestId)
   if (submitted.includes('测试')) return shortTurn(submitted, requestId)
   if (submitted.includes('一起做掉')) return longTurn(submitted, requestId)
+  if (submitted.includes('release-checklist')) return skillTurn(submitted, requestId)
 }
 
 // ---------------------------------------------------------------- timeline
@@ -343,11 +356,51 @@ const main = async () => {
   await type('跑一遍 pnpm test')
   key(ALT_Q)
   await sleep(2800)
-  caption('Ctrl-C 只打断这一轮，队列里的请求接着跑')
-  key(CTRL_C)
+  caption('Esc 打断这一轮，子代理保留；Ctrl-C 才退出并连它们一起停')
+  key(ESC)
   await sleep(5200)
 
-  chapter('03 · 会话是共享的')
+  chapter('03 · 技能就在输入框')
+  caption('$ 唤起技能菜单，Tab 补全成 $mention')
+  await type('$rel')
+  await sleep(1400)
+  key('\t')
+  await sleep(900)
+  caption('发送时自动改写成 /name 手势，Host 注入技能正文')
+  await type(' 帮我过一遍发布检查', 30)
+  key('\u001b[F') // End: back to the tail so Enter sends, not jumps
+  await sleep(300)
+  key(ENTER)
+  await sleep(4200)
+
+  chapter('04 · 模型与提问')
+  caption('/model 一次 Enter 就切，e 手动挑推理档')
+  await type('/model')
+  key('\u001b[F')
+  await sleep(200)
+  key(ENTER)
+  await sleep(1600)
+  key('\u001b[B')
+  await sleep(700)
+  key('\u001b[B')
+  await sleep(700)
+  key(ENTER)
+  await sleep(3200)
+  caption('单选即光标；最下面的 Submit 行才提交')
+  backend.askQuestion('s1', 'q1', [
+    { id: 'pkg', question: '包名用哪个？', header: '包名', options: [{ label: 'dshell', description: '保持现状' }, { label: 'tide', description: '换新名字' }] },
+  ])
+  await sleep(1800)
+  key('\u001b[B')
+  await sleep(1100)
+  key('\u001b[B')
+  await sleep(700)
+  key('\u001b[B')
+  await sleep(700)
+  key(ENTER)
+  await sleep(3200)
+
+  chapter('05 · 会话是共享的')
   caption('/sessions：按最后编辑时间排序')
   await type('/sessions')
   key(ENTER)
@@ -359,7 +412,7 @@ const main = async () => {
   caption('会话属于 Host：换个终端、换台机器都能接上')
   await sleep(3200)
 
-  chapter('04 · 审批也在终端里')
+  chapter('06 · 审批也在终端里')
   caption('危险操作就地审批，按 a 通过')
   backend.askApproval('s2', {
     requestId: 'ap-1',
@@ -371,7 +424,7 @@ const main = async () => {
   key('a')
   await sleep(2400)
 
-  chapter('05 · 结束')
+  chapter('07 · 结束')
   caption('一个命令开始：dshell')
   // Hold for the closing card, which the renderer overlays on the tail.
   await sleep(8600)
