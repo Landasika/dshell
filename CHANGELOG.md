@@ -7,6 +7,12 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- `Esc` while a turn runs now cancels it outright: the running-turn check
+  moved ahead of Esc's other duties (return to the live tail, close the
+  completion menu, clear a draft), which used to swallow the key one purpose
+  at a time — a reader scrolled up through a streaming answer needed several
+  presses before a cancel landed.
+
 - The ask wizard's single-select questions are radio: the option under the
   cursor is the pick, no `Space` needed. Each question ends in a `Submit`/
   `Next` row that `↓` reaches — `Enter` there advances or sends, so an

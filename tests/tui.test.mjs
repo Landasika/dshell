@@ -2351,6 +2351,17 @@ test('esc terminates the running turn but keeps the TUI attached', async () => {
   // Empty composer + running turn: Esc cancels with the subagent flag.
   input.push('\u001b')
   await waitFor(() => backend.lastCancelKilledSubagents === true)
+
+  // The same holds while scrolled up and with a draft in the composer: the
+  // running turn outranks Esc's other duties.
+  backend.emit('s1', { type: 'turn/start', seq: 4, data: { turn: 3 } })
+  await waitFor(() => output.text.includes('● running'))
+  input.push('\u001b[5~') // pgup: scroll away from the tail
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  input.push('draft')
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  input.push('\u001b')
+  await waitFor(() => backend.lastCancelKilledSubagents === true)
   // The TUI is still alive: the app promise has not settled.
   let exited = false
   void app.then(() => { exited = true }, () => { exited = true })

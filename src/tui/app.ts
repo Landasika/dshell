@@ -2851,6 +2851,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    if (key.type === 'escape' && state.view?.status === 'running') {
+      // A running turn outranks everything Esc also does — jumping to the
+      // tail, closing the completion menu, clearing a draft. The reader who
+      // scrolls up through a streaming answer and wants it stopped should not
+      // have to press Esc once per intercepted purpose before it lands.
+      void cancelRunningTurn()
+      return
+    }
     if (key.type === 'escape' && viewport.scrollOffset > 0) {
       // Codex semantics: Esc returns to the live tail before it clears input.
       viewport.reset()
@@ -2866,11 +2874,6 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.historyIndex = -1
         refreshCompletion()
         schedule()
-      } else if (state.view?.status === 'running') {
-        // An empty composer plus a running turn: Esc terminates the turn (and
-        // its live subagents) but leaves the TUI attached — Ctrl-C is the
-        // quit gesture now, so the two must not share a key.
-        void cancelRunningTurn()
       } else {
         // Double-Esc on an empty, idle composer opens the rewind list. The
         // first Esc is held for a short window so single-Esc stays harmless.
