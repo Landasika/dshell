@@ -228,6 +228,65 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   await backend.disconnect()
 })
 
+test('ctrl-c inside the ask wizard dismisses it instead of quitting', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  await waitFor(() => output.text.includes('idle'))
+
+  backend.askQuestion('s1', 'q1', [
+    { id: 'pkg', question: '包名？', options: [{ label: 'A' }, { label: 'B' }] },
+  ])
+  await waitFor(() => output.text.includes('the model asks'))
+
+  // Ctrl-C on the wizard: the ask hides, the TUI survives.
+  input.push('\u0003')
+  await waitFor(() => output.text.includes('question stays pending'))
+  let exited = false
+  void app.then(() => { exited = true }, () => { exited = true })
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  assert.equal(exited, false, 'ctrl-c on an ask must not quit the TUI')
+
+  // The ask stays hidden (dismissed, not aborted) and the TUI survives.
+  output.text = ''
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal(output.text.includes('the model asks'), false, 'the ask is hidden, not reopened')
+  assert.equal(exited, false, 'ctrl-c on an ask must not quit the TUI')
+
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('a custom answer keeps the cursor, submits with Enter, and Esc backs out of the field', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
@@ -4020,6 +4079,9 @@ test('an ask that arrives behind a panel is announced, then surfaces when the pa
     await waitFor(() => stripAnsi(output.text).includes('● 1. A'), 'an option selected from the ask')
     assert.deepEqual(backend.answeredQuestions, [])
   } finally {
+    // The ask is open at this point: the first ctrl-c dismisses it (the new
+    // semantics), the second quits from the empty composer.
+    input.push('\u0003')
     input.push('\u0003')
     await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
     await backend.disconnect()

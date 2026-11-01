@@ -3,6 +3,19 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [Unreleased]
+
+### Fixed
+
+- `Ctrl-C` with any panel open — including a model question — quit the TUI
+  outright, dropping the connection under a pending `ask_user_question` and
+  aborting it. It now closes the panel (a question is dismissed, not aborted,
+  and reopens in either frontend); quitting stays `Ctrl-C` with no panel,
+  `Ctrl-Z`/`Ctrl-D` detach.
+- A `Ctrl-C` quit while a turn runs now stops the parent turn before the
+  subagent sweep (the session list could delay it), and the TUI waits for the
+  Host's cancel acknowledgement — bounded at 3s — before exiting.
+
 ## [0.4.2] — 2026-11-01
 
 ### Changed

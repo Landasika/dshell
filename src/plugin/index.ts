@@ -1858,9 +1858,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'session/cancel requires a sessionId' })
       return
     }
-    const subagents = message.killSubagents === true ? await cancelSubagents(message.sessionId) : 0
+    // Stop the parent's turn first — the user is watching it stop. The
+    // subagent sweep can wait behind the session list without delaying it.
     const agent = ctx.agents.get(message.sessionId)
     if (agent !== undefined) agent.cancel({ kind: 'user' })
+    const subagents = message.killSubagents === true ? await cancelSubagents(message.sessionId) : 0
     jsonLine(socket, {
       type: 'cancelled',
       sessionId: message.sessionId,

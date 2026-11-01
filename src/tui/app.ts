@@ -2200,7 +2200,25 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (key.type === 'ctrl-c') {
-      quit(0)
+      // Ctrl-C's reflex inside any panel is "close this", not "quit the TUI":
+      // a plain quit here dropped the connection under a pending
+      // ask_user_question and aborted it. Esc keeps its per-overlay semantics;
+      // Ctrl-C is the hard close.
+      if (overlay.kind === 'questions') {
+        if (overlay.customMode) {
+          overlay.customMode = false
+        } else {
+          state.dismissedAsks.add(overlay.callId)
+          state.overlay = null
+          toast('question stays pending · it reopens here and in the Web UI')
+        }
+      } else if (overlay.kind === 'agentView') {
+        closeAgentView()
+        state.overlay = null
+      } else {
+        state.overlay = null
+      }
+      schedule()
       return
     }
     if (key.type === 'text' && key.text === 'y' && copyOverlayContent()) return

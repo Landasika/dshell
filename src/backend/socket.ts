@@ -612,11 +612,22 @@ export class SocketSessionHandle implements SessionHandle {
 
   async cancel(killSubagents = false): Promise<void> {
     this.assertOpen()
-    this.connection.send({
-      type: 'session/cancel',
-      sessionId: this.id,
-      ...(killSubagents ? { killSubagents: true } : {}),
-    })
+    // Wait for the Host's acknowledgement (bounded): a client that quits on
+    // Ctrl-C must not race its own cancel — the turn should already be
+    // stopping before the process goes away.
+    try {
+      await this.connection.request(
+        {
+          type: 'session/cancel',
+          sessionId: this.id,
+          ...(killSubagents ? { killSubagents: true } : {}),
+        },
+        (candidate) => candidate.type === 'cancelled',
+        3_000,
+      )
+    } catch {
+      // The cancel was sent; a slow or absent reply must not block quitting.
+    }
   }
 
   async removeQueued(requestId: string): Promise<void> {

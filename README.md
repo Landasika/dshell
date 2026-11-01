@@ -226,7 +226,8 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-G` | subagents (roster + read-only transcript) |
 | `Esc` (turn running) | cancel this turn — subagents keep running, TUI stays; outranks Esc's other duties (scroll-to-tail, close menu, clear draft) |
 | `Esc` (idle) | close menu / clear draft / jump to tail; `Esc` `Esc` rewinds to a previous prompt |
-| `Ctrl-C` | quit — and if a turn runs, cancel it **and kill its subagents** |
+| `Ctrl-C` (panel open) | close the panel / dismiss a pending question — never quits, so an ask cannot be aborted by reflex |
+| `Ctrl-C` (otherwise) | quit — and if a turn runs, cancel it **and kill its subagents** |
 | `Ctrl-Z` / `Ctrl-D` / `/quit` | detach — quit now, the turn keeps running; `/sessions` reattaches |
 
 In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
