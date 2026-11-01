@@ -7,7 +7,9 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
-- `Esc` while a turn runs now cancels it outright: the running-turn check
+- `Esc` while a turn runs now cancels that turn only — subagents keep
+  running; killing them belongs to `Ctrl-C`, which quits and takes the
+  children down. The running-turn check moved ahead of Esc's other duties: the running-turn check
   moved ahead of Esc's other duties (return to the live tail, close the
   completion menu, clear a draft), which used to swallow the key one purpose
   at a time — a reader scrolled up through a streaming answer needed several

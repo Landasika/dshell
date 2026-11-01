@@ -513,12 +513,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     resolveDone?.(code)
   }
 
-  /** Esc while running: stop the turn and its subagents, stay attached. */
+  /**
+   * Esc while running: stop this turn only. Subagents keep running — killing
+   * them is Ctrl-C's part of the split (it quits and takes the children down).
+   */
   const cancelRunningTurn = async (): Promise<void> => {
-    toast('cancelling the turn and its subagents…')
+    toast('cancelling the turn…')
     schedule()
     try {
-      await state.handle?.cancel(true)
+      await state.handle?.cancel(false)
     } catch (error) {
       toast(`cancel failed: ${errorText(error)}`)
       schedule()
@@ -3589,7 +3592,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} tools/thinking`)
       body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'double esc')} rewind prompt`)
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
-      body.push(`${paint(theme, 'text', pad('esc', 15))} cancel the running turn · ${paint(theme, 'text', 'ctrl-c')} stop run + quit · ${paint(theme, 'text', 'ctrl-z')} detach`)
+      body.push(`${paint(theme, 'text', pad('esc', 15))} cancel this turn · ${paint(theme, 'text', 'ctrl-c')} quit + kill subagents · ${paint(theme, 'text', 'ctrl-z')} detach`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
       return panelRule(theme, 'help & shortcuts', body, width)
     }

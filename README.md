@@ -219,8 +219,8 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-G` | subagents (roster + read-only transcript) |
 | `Esc` `Esc` | rewind to a previous prompt |
 | `End` / `Esc` | jump to the bottom while scrolled up |
-| `Esc` | cancel the running turn (and its subagents) while staying attached — takes priority over Esc's other duties (scroll-to-tail, close menu, clear draft) |
-| `Ctrl-C` | stop the run and quit — cancels the turn **and kills its live subagents** (quit when idle) |
+| `Esc` | cancel this turn (subagents keep running) while staying attached — takes priority over Esc's other duties (scroll-to-tail, close menu, clear draft) |
+| `Ctrl-C` | stop and quit — cancels the turn **and kills its live subagents** (quit when idle) |
 | `Ctrl-Z` | detach — quit now, the turn keeps running in the Host; `/sessions` reattaches |
 | `Ctrl-D` | quit (same detach as `Ctrl-Z`) |
 
