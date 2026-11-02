@@ -287,6 +287,9 @@ interface ModelRow {
   model?: ModelOption
   message?: string
   count?: number
+  /** Route facts for the group line: where it goes and which key it uses. */
+  baseURL?: string
+  keyHint?: string
 }
 
 
@@ -1002,7 +1005,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (catalog === undefined) return []
     const rows: ModelRow[] = []
     for (const group of catalog.groups) {
-      rows.push({ kind: 'group', provider: group.id, providerName: group.name, count: group.models.length })
+      rows.push({
+        kind: 'group',
+        provider: group.id,
+        providerName: group.name,
+        count: group.models.length,
+        ...(group.baseURL === undefined ? {} : { baseURL: group.baseURL }),
+        ...(group.keyHint === undefined ? {} : { keyHint: group.keyHint }),
+      })
       for (const model of group.models) {
         rows.push({ kind: 'model', provider: group.id, providerName: group.name, model })
       }
@@ -3664,7 +3674,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const index = start + offset
         if (row.kind === 'group') {
           if (body.length > 0) body.push('')
-          body.push(`${paint(theme, 'bold', paint(theme, 'accentSoft', row.providerName ?? row.provider ?? ''))} ${paint(theme, 'muted', `· ${String(row.count ?? 0)}`)}`)
+          const title = `${paint(theme, 'bold', paint(theme, 'accentSoft', row.providerName ?? row.provider ?? ''))} ${paint(theme, 'muted', `· ${String(row.count ?? 0)}`)}`
+          // Several relays serve the same vendor; the route line keeps them
+          // apart: where it points and which key it uses (prefix only).
+          const route = [row.baseURL, row.keyHint].filter((part) => part !== undefined && part.length > 0)
+          body.push(title)
+          if (route.length > 0) {
+            body.push(paint(theme, 'dim', truncate(`  ${route.join('  ·  ')}`, Math.max(10, inner - 2))))
+          }
           continue
         }
         if (row.kind === 'failure') {

@@ -73,6 +73,9 @@ export interface ModelProviderGroup {
   id: string
   name: string
   models: ModelOption[]
+  /** Route facts for the picker's disambiguation line (never the full key). */
+  baseURL?: string
+  keyHint?: string
 }
 
 export interface ModelCatalogFailure {

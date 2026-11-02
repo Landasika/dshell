@@ -7,6 +7,12 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `/model` group headers carry a route line — the provider's baseURL and a
+  6-character key prefix (`sk-TA9…`) — so several relays of the same vendor
+  stay distinguishable in the picker. The full key never crosses the socket.
+
+
+
 - A reconnect now auto-continues an interrupted task: when the reattached
   session ends in an `interrupted` turn, the TUI sends 继续 itself — once per
   interrupted turn and at most three times per TUI lifetime, so a Host that

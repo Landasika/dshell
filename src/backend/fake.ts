@@ -133,6 +133,8 @@ export class FakeBackend implements DshellBackend {
       {
         id: 'relay',
         name: 'Relay',
+        baseURL: 'http://relay.example:8180',
+        keyHint: 'sk-ex…',
         models: [
           {
             id: 'relay-flash',

@@ -841,6 +841,31 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     return { type: 'agents/roster', presets, ...(defaultId === undefined ? {} : { defaultId }) }
   }
 
+  /**
+   * Add each route's baseURL and a 6-character key hint to the catalog, so
+   * several relays of the same vendor stay distinguishable in the picker.
+   * The full secret never crosses the socket.
+   */
+  const annotateCatalogRoutes = async (catalog: ModelCatalog): Promise<void> => {
+    const rows = new Map(providerRows().map((row) => [row.id, row]))
+    const resolveRef = credentialResolve()
+    await Promise.all(catalog.groups.map(async (group) => {
+      const row = rows.get(group.id)
+      if (row === undefined) return
+      if (row.baseURL !== undefined) group.baseURL = row.baseURL
+      if (row.apiKeyEnv === undefined || resolveRef === undefined) return
+      try {
+        const resolved = await resolveRef.resolve(row.apiKeyEnv)
+        const value = typeof resolved === 'string' ? resolved : resolved?.value
+        if (typeof value === 'string' && value.length > 0) {
+          group.keyHint = `${value.slice(0, 6)}…`
+        }
+      } catch {
+        // A hint is cosmetic; an unresolvable ref simply shows none.
+      }
+    }))
+  }
+
   const forwardModelCatalog = async (socket: Socket): Promise<void> => {
     const controller = sessionController()
     if (controller === undefined) {
@@ -853,6 +878,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     const catalog = await controller.modelCatalog()
+    await annotateCatalogRoutes(catalog)
     jsonLine(socket, { type: 'model-catalog', catalog })
   }
 
@@ -927,6 +953,16 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   }
 
   const skillRegistry = (): SkillsRegistryLike | undefined => ctx.get?.('skills') as SkillsRegistryLike | undefined
+  /** Read one credential reference through the Host store (picker hints). */
+  const credentialResolve = ():
+    | { resolve(ref: string): Promise<{ value?: string } | string | undefined> }
+    | undefined => {
+    const service = ctx.get?.('credentials') as { resolve?: unknown } | undefined
+    const resolve = service?.resolve
+    if (typeof resolve !== 'function') return undefined
+    return { resolve: (ref: string) => resolve.call(service, ref) as Promise<{ value?: string } | string | undefined> }
+  }
+
   /** The Host's credential store: `set` writes ~/.dsh/.credentials.yaml. */
   const credentialStore = (): { set(ref: string, value: string): Promise<void> } | undefined => {
     const service = ctx.get?.('credentials') as

@@ -2140,6 +2140,9 @@ test('TUI model picker switches the session model and saves a default', async ()
   input.push('/model')
   input.push('\r')
   await waitFor(() => output.text.includes('Fake Provider') && output.text.includes('Relay Flash'))
+  // The relay group carries its route line: where it points, which key.
+  assert.equal(output.text.includes('http://relay.example:8180'), true)
+  assert.equal(output.text.includes('sk-ex…'), true)
   // Default is fake/fake-flash; move past fake-pro to relay/relay-flash.
   input.push('\u001b[B')
   await new Promise((resolve) => setTimeout(resolve, 20))
