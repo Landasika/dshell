@@ -102,6 +102,19 @@ export function prettyFailureMessage(raw: string): string {
  * restart closed it with reason `interrupted`). The context is durable, so a
  * follow-up prompt continues the task.
  */
+export function lastInterruptedTurn(events: readonly SessionEvent[]): number | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event === undefined) continue
+    if (event.type === 'turn/start' || event.type === 'step/start') return undefined
+    if (event.type === 'turn/end') {
+      const reason = (dataOf(event).reason ?? {}) as Json
+      return String(reason.kind ?? '') === 'interrupted' ? Number(dataOf(event).turn ?? 0) : undefined
+    }
+  }
+  return undefined
+}
+
 export function lastTurnInterrupted(events: readonly SessionEvent[]): boolean {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]

@@ -36,6 +36,7 @@ import {
   renderBlocks,
   renderBlocksWithRanges,
   toolLabel,
+  lastInterruptedTurn,
   lastTurnInterrupted,
   turnFailureMessage,
   type Block,
@@ -377,6 +378,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   // A transcript selection is kept in content space (a line index into
   // transcript().lines), so dragging past the top or bottom edge can scroll and
   // keep growing the range instead of being pinned to screen rows.
+  // Auto-continue bookkeeping: once per interrupted turn, at most three per
+  // TUI lifetime, so a Host that keeps dying cannot loop us.
+  let autoContinued = new Set<number>()
+  let autoContinueCount = 0
   let selectAnchor: { line: number; column: number } | null = null
   let selectFocus: { line: number; column: number } | null = null
   /** Screen-space anchor for a drag that started inside a panel (no scrolling). */
@@ -1232,7 +1237,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.status = 'idle'
         state.error = undefined
         toast('host back · reattached')
-        if (lastTurnInterrupted(reopened.events)) {
+        const interruptedTurn = lastInterruptedTurn(reopened.events)
+        if (interruptedTurn !== undefined && !autoContinued.has(interruptedTurn) && autoContinueCount < 3) {
+          // Full-auto: the durable context is intact, so continue the task
+          // ourselves. Once per interrupted turn, and at most three times in
+          // a TUI lifetime, so a Host that keeps dying cannot loop us.
+          autoContinued.add(interruptedTurn)
+          autoContinueCount += 1
+          toast('task was interrupted · continuing automatically (/cancel to stop)')
+          schedule()
+          await send('继续')
+          return
+        }
+        if (interruptedTurn !== undefined) {
           toast('the task was interrupted · /continue resumes it')
         }
         schedule()

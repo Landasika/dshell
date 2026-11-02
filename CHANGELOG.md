@@ -7,6 +7,11 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- A reconnect now auto-continues an interrupted task: when the reattached
+  session ends in an `interrupted` turn, the TUI sends 继续 itself — once per
+  interrupted turn and at most three times per TUI lifetime, so a Host that
+  keeps dying cannot loop it. `/cancel` (or Esc once it starts) still stops it.
+
 - `/continue` resumes a task a Host restart interrupted: DSH closes the open
   turn as `interrupted` and keeps every message, tool result and pending-call
   recovery in the durable log, so one command sends 继续 against that full

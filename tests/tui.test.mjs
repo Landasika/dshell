@@ -280,6 +280,63 @@ test('/continue resumes a turn the Host interrupted', async () => {
   await backend.disconnect()
 })
 
+test('a reconnect auto-continues an interrupted task once', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '重构配置加载' }] } } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+    { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'interrupted' } } },
+  ]
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 400; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  await waitFor(() => output.text.includes('idle'))
+
+  // The Host drops and comes back: the reconnect path auto-continues.
+  backend.simulateDisconnect()
+  await waitFor(() => output.text.includes('continuing automatically'))
+  await waitFor(() => output.text.includes('echo: 继续'))
+
+  // A second drop of the SAME interrupted turn does not continue again.
+  output.text = ''
+  backend.simulateDisconnect()
+  await waitFor(() => output.text.includes('host back'))
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(output.text.includes('echo: 继续'), false, 'one auto-continue per interrupted turn')
+
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('the sessions list shows running, needs-input and done states', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
