@@ -222,7 +222,42 @@ Each plugin row is `{id, name, disabled?, config?}`.
   `<project>/.agents/skills`; extra roots go in that preset's plugin row:
   `config: { customSkillDirs: ['/abs/path'] }`.
 
-## 7. Verify before you walk away
+## 7. Mount an MCP server
+
+Each MCP server is one `dsh-mcp-client` row. In the home patch (every agent) or
+inside a preset's `plugins` (that agent only):
+
+```yaml
+# stdio: a local command
+- insert:
+    - id: mcp-filesystem
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: fs            # <= 32 chars of [A-Za-z0-9_-]
+        transport: stdio
+        command: npx
+        args: ['-y', '@modelcontextprotocol/server-filesystem', '/home/me']
+        env: {}                   # literal values — treat the file like .env
+
+# streamable-http: a remote endpoint
+- insert:
+    - id: mcp-demo
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: demo
+        transport: streamable-http
+        url: http://127.0.0.1:3000/mcp
+        headers: {}
+        failOnStartupError: true  # default false: a dead server only logs
+```
+
+Its tools register into `ctx.tools` like any other tool, so dshell folds them
+into the transcript and `/harness` shows the row. Useful knobs:
+`toolCallTimeoutMs` (default 60 000), `reconnect` (`enabled`,
+`initialDelayMs`, `maxDelayMs`, `maxAttempts`). A failing row never blocks the
+Host unless `failOnStartupError` is set.
+
+## 8. Verify before you walk away
 
 ```bash
 # Effective composition, after all layers are applied:
@@ -249,7 +284,7 @@ by default"), so a save applies without a restart:
 - preset rows: **new** sessions compose the new preset; running agents keep the
   composition they mounted. Restart the session (or the Host) to remount.
 
-## 8. Safety
+## 9. Safety
 
 - Back up before editing: `cp cordis.patch.yml cordis.patch.yml.bak`.
 - A YAML syntax error in a patch stops the Host from booting. Keep the edit
