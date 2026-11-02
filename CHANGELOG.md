@@ -5,7 +5,16 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
-### Added
+### Fixed
+
+- A turn-failure notice no longer outstays its turn: a queued prompt (or the
+  auto-continue, or any spooled turn) starts a new turn without passing through
+  the send path, so the previous failure kept rendering in the notice row under
+  the running turn. The notice now follows the transcript tail and clears when
+  the failed turn is no longer the latest one; command errors keep their own
+  lifetime.
+
+
 
 - `/model` group headers carry a route line — the provider's baseURL and a
   6-character key prefix (`sk-TA9…`) — so several relays of the same vendor

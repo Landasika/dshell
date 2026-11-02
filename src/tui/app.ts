@@ -436,6 +436,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let lastBodyTop = 3
   let reattaching = false
   let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
+  let lastTurnFailure: string | undefined
   /** Call id already announced as waiting behind another panel. */
   let askNotice: string | undefined
   let resolveDone: ((code: number) => void) | undefined
@@ -713,11 +714,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const failure = turnFailureMessage(view.events)
     if (failure !== undefined && failure !== state.error) {
       state.error = failure
+      lastTurnFailure = failure
       const now = Date.now()
       if (failure !== lastFailureToast.text || now - lastFailureToast.at > 30_000) {
         lastFailureToast = { text: failure, at: now }
         toast(`turn failed: ${failure.length > 80 ? `${failure.slice(0, 80)}…` : failure}`)
       }
+    } else if (failure === undefined && state.error !== undefined && state.error === lastTurnFailure) {
+      // The transcript moved on (a queued prompt or auto-continue opened a new
+      // turn without passing through send()); the notice must move on too.
+      // Command errors set elsewhere keep their own lifetime.
+      state.error = undefined
+      lastTurnFailure = undefined
     }
     state.inbox = foldInbox(view.events)
     const live = new Set([...state.inbox.nextTurn, ...state.inbox.nextStep].map((item) => item.id))

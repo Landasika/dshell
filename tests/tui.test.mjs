@@ -280,6 +280,61 @@ test('/continue resumes a turn the Host interrupted', async () => {
   await backend.disconnect()
 })
 
+test('a queued prompt starting a new turn clears the stale failure notice', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  // The transcript ends in a failed turn: the notice row shows its message.
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'go' }] } } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+    { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'error', error: { message: '404 · model not supported', code: 'PI_AI_ERROR' } } } },
+  ]
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  // A failed tail shows the notice and an error status, not 'idle'.
+  await waitFor(() => output.text.includes('404 · model not supported'))
+
+  // A queued prompt spools a new turn without passing through send(): the
+  // stale failure must not keep rendering under the running turn.
+  backend.emit('s1', { type: 'turn/start', seq: 4, data: { turn: 2 } })
+  await waitFor(() => output.text.includes('● running'))
+  output.text = ''
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal(output.text.includes('404 · model not supported'), false, 'the stale failure is gone')
+
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('a reconnect auto-continues an interrupted task once', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
