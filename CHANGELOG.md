@@ -7,6 +7,13 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Added
 
+- `/continue` resumes a task a Host restart interrupted: DSH closes the open
+  turn as `interrupted` and keeps every message, tool result and pending-call
+  recovery in the durable log, so one command sends 继续 against that full
+  context (`/continue 注意并发安全` appends a note). After a reconnect the TUI
+  toasts the hint when it sees an interrupted tail.
+
+
 - Host: a `session/delete` message retires a finished session — the directory
   moves under `sessions/.trash-<ts>/` and drops out of every list (tombstone
   bookkeeping is Host-side; the TUI picker wiring is still pending).

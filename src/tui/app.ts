@@ -36,6 +36,7 @@ import {
   renderBlocks,
   renderBlocksWithRanges,
   toolLabel,
+  lastTurnInterrupted,
   turnFailureMessage,
   type Block,
   type BlockRange,
@@ -1224,10 +1225,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.handle = undefined
       state.view = undefined
       await openSession(sessionId)
-      if (state.view !== undefined) {
+      // openSession reassigns state.view internally; defeat the control-flow
+      // narrowing that still sees the undefined we just set.
+      const reopened = (state as { view?: SessionView }).view
+      if (reopened !== undefined) {
         state.status = 'idle'
         state.error = undefined
         toast('host back · reattached')
+        if (lastTurnInterrupted(reopened.events)) {
+          toast('the task was interrupted · /continue resumes it')
+        }
         schedule()
         return
       }
@@ -1797,6 +1804,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       case '/cancel':
         await cancel()
         return
+      case '/continue':
+      case '/resume-task': {
+        if (state.view?.status === 'running') {
+          toast('a turn is already running')
+          return
+        }
+        if (state.view === undefined || !lastTurnInterrupted(state.view.events)) {
+          toast('the last turn was not interrupted; type your next request instead')
+          return
+        }
+        const note = argument.trim()
+        await send(note.length === 0 ? '继续' : `继续：${note}`)
+        return
+      }
       case '/clear':
         state.clearedAtSeq = state.view?.cursor ?? -1
         viewport.reset()

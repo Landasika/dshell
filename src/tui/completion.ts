@@ -14,6 +14,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/new', description: 'create a session' },
   { name: '/attach', description: 'attach by id', needsArgument: true },
   { name: '/cancel', description: 'cancel the running turn' },
+  { name: '/continue', description: 'resume the task interrupted by a Host restart' },
   { name: '/clear', description: 'clear the local transcript view' },
   { name: '/reconnect', description: 'reattach the current session' },
   { name: '/rewind', description: 'restore a previous prompt into the composer' },

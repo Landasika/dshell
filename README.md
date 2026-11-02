@@ -273,6 +273,7 @@ accident. `Esc` leaves the ask pending for the Web UI.
 | `/new` | create a session |
 | `/attach <id>` | attach by id |
 | `/cancel` | cancel the running turn |
+| `/continue` | resume a task the Host restart interrupted (sends 继续 with the durable context; add a note after it) |
 | `/clear` | clear the local transcript view |
 | `/reconnect` | reattach the current session |
 | `/rewind` | restore a previous prompt into the composer |

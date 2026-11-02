@@ -228,6 +228,58 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   await backend.disconnect()
 })
 
+test('/continue resumes a turn the Host interrupted', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  // The durable tail: a turn the Host closed with reason "interrupted".
+  const events = [
+    { type: 'user/message', seq: 1, data: { message: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '重构配置加载' }] } } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+    { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'interrupted' } } },
+  ]
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  await waitFor(() => output.text.includes('idle'))
+
+  input.push('/continue')
+  input.push('\r')
+  // The fake runs an idle send synchronously; the echo proves the prompt went
+  // out as 继续 with the interrupted context still in the transcript.
+  await waitFor(() => output.text.includes('echo: 继续'))
+
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('the sessions list shows running, needs-input and done states', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
