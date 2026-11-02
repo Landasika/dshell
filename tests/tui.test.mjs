@@ -228,6 +228,71 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   await backend.disconnect()
 })
 
+test('the sessions list shows running, needs-input and done states', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  // s1: running with a pending question; s2: idle (done); s3: running clean.
+  const s1 = [
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+  ]
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([
+    { sessionId: 's1', cwd: '/work', title: 'needs answer', events: s1 },
+    { sessionId: 's2', cwd: '/work', title: 'finished job' },
+    { sessionId: 's3', cwd: '/other', title: 'long task' },
+  ])
+  await backend.connect()
+  backend.requireSession('s1').status = 'running'
+  backend.requireSession('s3').status = 'running'
+  backend.askQuestion('s1', 'q1', [{ id: 'pkg', question: 'which?', options: [{ label: 'A' }] }])
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out; got ${JSON.stringify(output.text.slice(-400))}`)
+  }
+  // s1 runs with a pending question: wait for the frame, not 'idle'.
+  await waitFor(() => output.text.includes('the model asks'))
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  // Dismiss the ask so /sessions can open.
+  input.push('\u0003')
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  input.push('/sessions')
+  input.push('\r')
+  await waitFor(() => output.text.includes('finished job'))
+  assert.equal(output.text.includes('? question'), true, 's1 shows the question state')
+  assert.equal(output.text.includes('▶ running'), true, 's3 shows the running state')
+  assert.equal(output.text.includes('✓ done'), true, 's2 shows the done state')
+
+  // Close the sessions panel (ctrl-c), then quit from the composer.
+  input.push('\u0003')
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  input.push('\u0004')
+  assert.equal(await app, 0)
+  await backend.disconnect()
+})
+
 test('ctrl-c inside the ask wizard dismisses it instead of quitting', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')

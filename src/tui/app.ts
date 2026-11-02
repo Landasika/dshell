@@ -3848,21 +3848,25 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const body = sessions.slice(start, start + visibleCount).map((session, offset) => {
         const index = start + offset
         const marker = index === overlay.index ? paint(theme, 'accent', '▸') : ' '
-        // `live` means the Host still holds this session's agent in memory — it
-        // is true only while a frontend keeps it open or after a prompt in this
-        // Host. Everything else is a durable session that simply is not loaded
-        // yet, so it gets no label at all: "cold" read like decay, not storage.
+        // Row state, strongest first: waiting on you > running > done.
+        // `live` alone means the Host holds the agent in memory but no turn is
+        // open — it reads as "done", because there is nothing to watch.
         const age = timeAgo(session.updatedAt ?? session.createdAt)
         const label = session.title?.trim() || 'untitled session'
         const row = `${marker} ${paint(theme, index === overlay.index ? 'text' : 'muted', truncate(label, 26))}`
-        const right = session.live === true
-          ? `${paint(theme, 'success', '● live')} ${paint(theme, 'muted', age)}`
-          : paint(theme, 'muted', age)
+        const state = session.needsInput === 'approval'
+          ? paint(theme, 'warning', '! approval')
+          : session.needsInput === 'question'
+            ? paint(theme, 'warning', '? question')
+            : session.running === true
+              ? paint(theme, 'accent', '▶ running')
+              : paint(theme, 'dim', '✓ done')
+        const right = `${state} ${paint(theme, 'muted', age)}`
         return `${row}${' '.repeat(Math.max(1, inner - displayWidth(row) - displayWidth(right)))}${right}`
       })
       if (body.length === 0) body.push(paint(theme, 'muted', 'no sessions; press n to create one'))
       return panelRule(theme, 'sessions', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ select · enter attach · n new · esc close')],
+        footer: [paint(theme, 'muted', '↑/↓ select · enter open (✓ 查看 / ! ? 接手) · n new · esc close')],
       })
     }
     if (overlay.kind === 'history') {

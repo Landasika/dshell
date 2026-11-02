@@ -268,7 +268,7 @@ accident. `Esc` leaves the ask pending for the Web UI.
 | Command | Purpose |
 | --- | --- |
 | `/help` | show keys and commands |
-| `/sessions` (`/resume`) | switch session |
+| `/sessions` (`/resume`) | switch session — rows show `? question` / `! approval` (waiting on you), `▶ running`, `✓ done` |
 | `/workspaces` | switch workspace |
 | `/new` | create a session |
 | `/attach <id>` | attach by id |

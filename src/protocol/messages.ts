@@ -36,6 +36,7 @@ export type DshellErrorCode =
   | 'UNSUPPORTED_CAPABILITY'
   | 'SESSION_NOT_FOUND'
   | 'SESSION_ALREADY_LIVE'
+  | 'SESSION_ACTIVE'
   | 'APPROVAL_NOT_PENDING'
   | 'QUESTION_NOT_PENDING'
   | 'QUEUE_ITEM_NOT_FOUND'
@@ -119,6 +120,10 @@ export interface SessionSummary {
   formatStatus?: string
   workspaceId?: string
   status?: string
+  /** A turn is open in this session right now (Host-computed). */
+  running?: boolean
+  /** The open turn is waiting on the user: an approval or a question. */
+  needsInput?: 'approval' | 'question'
 }
 
 export interface SessionHeader {

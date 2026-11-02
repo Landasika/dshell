@@ -3,6 +3,19 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [Unreleased]
+
+### Added
+
+- Host: a `session/delete` message retires a finished session — the directory
+  moves under `sessions/.trash-<ts>/` and drops out of every list (tombstone
+  bookkeeping is Host-side; the TUI picker wiring is still pending).
+- `/sessions` rows now carry turn state: `? question` / `! approval` when the
+  open turn is waiting on you (derived from the durable tail — an unanswered
+  `approval/asked` or a dangling `ask_user_question`), `▶ running` for an open
+  turn, `✓ done` otherwise. Enter opens the session either way, so a done row
+  is the transcript view and a waiting row hands you the panel.
+
 ## [0.4.3] — 2026-11-02
 
 ### Fixed

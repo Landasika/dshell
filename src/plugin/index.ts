@@ -7,6 +7,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -14,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { createServer, Socket, type Server } from 'node:net'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import {
@@ -40,7 +41,7 @@ import {
   type SessionSummary,
   type WorkspaceSummary,
 } from '../protocol/index.js'
-import { resolveSocketPath } from '../shared/paths.js'
+import { resolveDshHome, resolveSocketPath } from '../shared/paths.js'
 import { ApprovalCoordinator } from './approval.js'
 import {
   HUB_PROVIDER,
@@ -222,7 +223,7 @@ interface SessionControllerLike {
   list?(
     request: { cursor?: string },
     signal: AbortSignal,
-  ): Promise<{ items: readonly { sessionId: string; updatedAt: number }[] }>
+  ): Promise<{ items: readonly { sessionId: string; updatedAt: number; running?: boolean }[] }>
 }
 
 interface PluginContext {
@@ -479,6 +480,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   // list briefly, resolve titles only for the sessions we actually return, and
   // keep subagent children out of the picker (they belong to a parent's roster).
   const sessionCache = new Map<string, { at: number; sessions: SessionSummary[] }>()
+  /** Running-session input state, cached with the same TTL as the list. */
+  const pendingInput = new Map<string, { at: number; value: 'approval' | 'question' | undefined }>()
   const titleCache = new Map<string, { at: number; title: string }>()
   const SESSION_LIST_TIMEOUT_MS = 15_000
   const SESSION_CACHE_MS = 4_000
@@ -489,9 +492,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (cached !== undefined && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions
     const records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
     if (records === undefined) return []
+    loadTrashedOnce()
+    const notTrashed = trashedIds.size === 0 ? records : records.filter((r) => !trashedIds.has(r.header.id))
     // The durable activity time comes from the Host's session list projection;
     // without it the picker falls back to the creation time.
     const activity = new Map<string, number>()
+    const runningIds = new Set<string>()
     const controller = sessionController()
     if (controller?.list !== undefined) {
       const abort = new AbortController()
@@ -501,6 +507,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         for (const item of listed.items ?? []) {
           if (typeof item?.sessionId === 'string' && typeof item.updatedAt === 'number') {
             activity.set(item.sessionId, item.updatedAt)
+          }
+          if (typeof item?.sessionId === 'string' && item.running === true) {
+            runningIds.add(item.sessionId)
           }
         }
       } catch {
@@ -516,7 +525,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
     const workspaceOf = (record: SessionRecordLike): WorkspaceSummary | undefined =>
       record.header.cwd === undefined ? undefined : workspaceByPath.get(record.header.cwd)
-    const visible = records
+    const visible = notTrashed
       .filter((record) => record.header.origin !== 'subagent' && record.header.parentSession === undefined)
       .map((record) => ({ record, workspace: workspaceOf(record) }))
       .filter((entry) => workspaceId === undefined || entry.workspace?.id === workspaceId)
@@ -565,7 +574,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       }
     }
 
-    const sessions = visible.map(({ record, workspace }) => {
+    const sessions: SessionSummary[] = visible.map(({ record, workspace }) => {
       const title = titles.get(record.header.id) ?? record.header.title
       return {
         sessionId: record.header.id,
@@ -577,11 +586,49 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         persisted: record.persisted,
         formatStatus: record.formatStatus,
         ...(workspace === undefined ? {} : { workspaceId: workspace.id }),
+        ...(runningIds.has(record.header.id) ? { running: true } : {}),
         // A resident agent is not the same thing as a running turn; the turn
         // state lives in the event log, which this list does not read.
-        status: record.live ? 'live' : 'idle',
+        status: runningIds.has(record.header.id) ? 'running' : record.live ? 'live' : 'idle',
       }
     })
+    // "Needs input" comes from the durable tail of the running sessions only
+    // (an idle turn cannot hold a live approval or question): an unanswered
+    // approval/asked or a dangling ask_user_question call inside the open turn.
+    const needsInputOf = (sessionId: string): Promise<'approval' | 'question' | undefined> => {
+      const pending = pendingInput.get(sessionId)
+      if (pending !== undefined && Date.now() - pending.at < SESSION_CACHE_MS) return Promise.resolve(pending.value)
+      return withTimeout(ctx.sessionQuery.readSession(sessionId), 2_000, 'session tail').then((snapshot) => {
+        const events = snapshot?.events ?? []
+        let askTool: string | undefined
+        let approval: 'approval' | undefined
+        for (let index = Math.max(0, events.length - 300); index < events.length; index += 1) {
+          const event = events[index]
+          if (event === undefined) continue
+          const type = event.type
+          if (type === 'tool/call') {
+            const name = (event.data as { name?: unknown } | null)?.name
+            if (name === 'ask_user_question') askTool = String((event.data as { callId?: unknown } | null)?.callId ?? '')
+          } else if (type === 'tool/result') {
+            const callId = String(((event.data as { message?: { toolCallId?: unknown } } | null)?.message ?? {}).toolCallId ?? '')
+            if (askTool !== undefined && (callId.length === 0 || callId === askTool)) askTool = undefined
+          } else if (type === 'approval/asked') {
+            approval = 'approval'
+          } else if (type === 'approval/decided' || type === 'turn/end' || type === 'turn/failed') {
+            approval = undefined
+            askTool = undefined
+          }
+        }
+        const value = askTool !== undefined ? 'question' : approval
+        pendingInput.set(sessionId, { at: Date.now(), value })
+        return value
+      }).catch(() => undefined)
+    }
+    await Promise.all(sessions.map(async (session) => {
+      if (session.running !== true) return
+      const needs = await needsInputOf(session.sessionId)
+      if (needs !== undefined) session.needsInput = needs
+    }))
     sessionCache.set(cacheKey, { at: Date.now(), sessions })
     return sessions
   }
@@ -638,6 +685,92 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
   const sendError = (socket: Socket, error: ErrorMessage): void => {
     jsonLine(socket, error)
+  }
+
+  // 回收站即墓碑：.trash-* 里出现过的 session 目录一律不再出现在列表里。
+  // dsh 核心的 sessionQuery 有自己的账本（删了磁盘它也不知道），插件层负责兜底。
+  const trashedIds = new Set<string>()
+  let trashedLoaded = false
+  const loadTrashedOnce = (): void => {
+    if (trashedLoaded) return
+    trashedLoaded = true
+    try {
+      const root = resolve(join(resolveDshHome(), 'sessions'))
+      for (const entry of readdirSync(root)) {
+        if (!entry.startsWith('.trash')) continue
+        for (const group of readdirSync(join(root, entry))) {
+          try { for (const sid of readdirSync(join(root, entry, group))) trashedIds.add(sid) } catch { /* 空分组 */ }
+        }
+      }
+    } catch { /* sessions 根不存在 */ }
+  }
+
+  // 会话存储目录名固定为 session-<uuid>；其余形态一律拒绝（路径注入防线）
+  const SESSION_DIR_RE = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+  /**
+   * session/delete：把一个已结束的会话从磁盘挪进回收站目录（sessions/.trash-<ts>/）。
+   * dsh 核心没有删除 API（sessionQuery 只有 list/read/observe），这里在插件层落实现：
+   *  - 活会话（live）拒绝删除，Host 正在写它的存储目录
+   *  - 不直接 rm：rename 进 .trash-<ts>/<原分组>/，误删可手工找回
+   *  - 目标路径经 resolve+前缀+目录名三重校验，只动 sessions/ 之内
+   */
+  const deleteSession = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const sessionId = typeof message.sessionId === 'string' ? message.sessionId : ''
+    if (!SESSION_DIR_RE.test(sessionId)) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'sessionId must look like session-<uuid>' })
+      return
+    }
+    let records: SessionRecordLike[] | undefined
+    try {
+      records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
+    } catch (error) {
+      sendError(socket, { type: 'error', code: 'INTERNAL', message: `session list failed: ${String(error)}` })
+      return
+    }
+    loadTrashedOnce()
+    const record = records?.find((candidate) => candidate.header.id === sessionId)
+    if (record === undefined || trashedIds.has(sessionId)) {
+      sendError(socket, { type: 'error', code: 'SESSION_NOT_FOUND', message: `no such session: ${sessionId}` })
+      return
+    }
+    if (record.live) {
+      sendError(socket, {
+        type: 'error',
+        code: 'SESSION_ACTIVE',
+        message: 'session is live; wait for it to finish before deleting',
+        action: 'Cancel or finish the running turn, then delete again.',
+      })
+      return
+    }
+    // 定位磁盘目录：sessions/<encoded-cwd>/session-<uuid>
+    const sessionsRoot = resolve(join(resolveDshHome(), 'sessions'))
+    let target: string | undefined
+    try {
+      for (const group of readdirSync(sessionsRoot)) {
+        if (group.startsWith('.trash')) continue
+        const candidate = join(sessionsRoot, group, sessionId)
+        // 绝大多数分组下并没有这个会话目录：ENOENT 是常态，跳过继续找，
+        // 不能让它把整个定位循环打断（初版就是在这里被第一个分组噎住的）
+        let st
+        try { st = lstatSync(candidate) } catch { continue }
+        if (st.isDirectory() && !st.isSymbolicLink()) { target = candidate; break }
+      }
+    } catch { /* sessions 根目录缺失按未持久化处理 */ }
+    if (target !== undefined) {
+      const resolved = resolve(target)
+      if (!resolved.startsWith(sessionsRoot + sep) || basename(resolved) !== sessionId) {
+        sendError(socket, { type: 'error', code: 'INTERNAL', message: 'resolved session path escaped sessions root' })
+        return
+      }
+      const trash = join(sessionsRoot, `.trash-${Date.now()}`)
+      const group = dirname(resolved).slice(sessionsRoot.length + 1)
+      mkdirSync(join(trash, group), { recursive: true })
+      renameSync(resolved, join(trash, group, sessionId))
+    }
+    trashedIds.add(sessionId)   // 核心账本不感知磁盘删除，列表过滤靠它即时生效
+    sessionCache.clear()        // 列表缓存作废，下一次 list 立刻反映删除
+    jsonLine(socket, { type: 'session-deleted', sessionId })
   }
 
   const sessionController = (): SessionControllerLike | undefined => {
@@ -2104,6 +2237,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'prompt':
           await prompt(socket, message)
+          return
+        case 'session/delete':
+          await deleteSession(socket, message)
           return
         case 'session/cancel':
           cancel(socket, message)

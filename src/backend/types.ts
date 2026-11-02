@@ -121,6 +121,10 @@ export interface SessionSummary {
   persisted?: boolean
   workspaceId?: string
   status?: string
+  /** A turn is open in this session right now (Host-computed). */
+  running?: boolean
+  /** The open turn is waiting on the user: an approval or a question. */
+  needsInput?: 'approval' | 'question'
 }
 
 export interface ApprovalView {

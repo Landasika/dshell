@@ -579,6 +579,8 @@ export class FakeBackend implements DshellBackend {
       persisted: true,
       workspaceId: workspace?.id,
       status: session.status,
+      running: session.status === 'running',
+      ...(session.pendingAsk !== undefined ? { needsInput: 'question' as const } : {}),
     }
   }
 
