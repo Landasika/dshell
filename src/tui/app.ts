@@ -248,6 +248,12 @@ interface AppState {
   pasteSeq: number
   /** Ask calls the user dismissed with Esc; they stay hidden until answered. */
   dismissedAsks: Set<string>
+  /**
+   * How tool approvals are answered while the user is away from the keyboard.
+   * `ask` (default) surfaces every request; `auto` allows each one as it
+   * arrives, which is the "allow all" a long unattended run needs.
+   */
+  approvalMode: 'ask' | 'auto'
 }
 
 /** One row under the transcript: a prompt waiting in the Host's inbox. */
@@ -377,6 +383,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const parser = new KeyParser()
   // 1-based terminal row of the "jump to bottom" pill, for click hit-testing.
   let pillRow: number | null = null
+  // 1-based terminal row of the composer's top rule, where the mode pill sits.
+  let modeRow: number | null = null
   let agentHandle: SessionHandle | null = null
   // A transcript selection is kept in content space (a line index into
   // transcript().lines), so dragging past the top or bottom edge can scroll and
@@ -407,6 +415,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     clearedAtSeq: -1,
     approvalBusy: false,
     quitting: false,
+    approvalMode: 'ask',
     todosFolded: false,
     tpsSamples: [],
     escapeAt: 0,
@@ -739,7 +748,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     pruneQueued(view)
     sampleSpeed(view)
     if (view.pendingApproval !== undefined) {
-      if (state.overlay?.kind !== 'approval') state.overlay = { kind: 'approval', details: false }
+      // In `allow all` the panel never opens: the request is answered on the
+      // way in, so an unattended turn keeps moving instead of stalling here.
+      if (state.approvalMode === 'auto') autoAllowApproval()
+      else if (state.overlay?.kind !== 'approval') state.overlay = { kind: 'approval', details: false }
     } else if (state.overlay?.kind === 'approval') {
       state.overlay = null
     }
@@ -991,6 +1003,38 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.approvalBusy = false
       schedule()
     }
+  }
+
+  /**
+   * `allow all` answers each approval as it lands instead of opening the panel.
+   * It goes through the same `allowed-once` outcome the `a` key sends: the
+   * Host has no session-scoped grant, and inventing one here would quietly
+   * widen what the model may run.
+   */
+  const autoAllowApproval = (): void => {
+    const pending = state.view?.pendingApproval
+    if (pending === undefined || state.handle === undefined || state.approvalBusy) return
+    if (state.approvalMode !== 'auto') return
+    const requestId = pending.requestId
+    state.approvalBusy = true
+    void state.handle.answerApproval(requestId, 'allowed-once')
+      .then(() => toast(`allowed ${pending.toolName ?? 'tool'} · allow all`))
+      .catch((error: unknown) => {
+        state.error = errorText(error)
+      })
+      .finally(() => {
+        state.approvalBusy = false
+        schedule()
+      })
+  }
+
+  /** Flip the approval mode; the pill on the rule and `/mode` share this. */
+  const setApprovalMode = (mode: 'ask' | 'auto'): void => {
+    if (state.approvalMode === mode) return
+    state.approvalMode = mode
+    toast(mode === 'auto' ? 'allow all: approvals answer themselves' : 'ask: approvals wait for you')
+    if (mode === 'auto') autoAllowApproval()
+    schedule()
   }
 
   const switchOverlaySession = (index: number): void => {
@@ -1872,6 +1916,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         toast(`verbose ${state.verbose ? 'on' : 'off'}`)
         schedule()
         return
+      case '/mode': {
+        // A bare `/mode` flips; `/mode ask` and `/mode allow-all` set outright,
+        // so a scripted start never depends on the current state.
+        const wanted = argument.trim().toLowerCase()
+        if (wanted.length === 0) setApprovalMode(state.approvalMode === 'auto' ? 'ask' : 'auto')
+        else if (wanted === 'ask' || wanted === 'on' || wanted === 'auto' || wanted === 'allow-all' || wanted === 'allowall') {
+          setApprovalMode(wanted === 'ask' ? 'ask' : 'auto')
+        } else {
+          toast('usage: /mode [ask|allow-all]')
+        }
+        return
+      }
       case '/rewind':
         openRewind()
         return
@@ -2084,6 +2140,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         schedule()
         return true
       }
+      // Clicking the mode pill on the composer rule flips it, the same way
+      // shift+tab does, so the control is where the label is.
+      if (modeRow !== null && key.row === modeRow && key.column <= displayWidth('allow all') + 1) {
+        setApprovalMode(state.approvalMode === 'auto' ? 'ask' : 'auto')
+        return true
+      }
       stopAutoScroll()
       panelAnchor = null
       selectAnchor = null
@@ -2129,12 +2191,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (selectAnchor !== null && selectFocus !== null) {
         const moved = selectAnchor.line !== selectFocus.line || selectAnchor.column !== selectFocus.column
         if (moved) {
+          // Copy silently: a toast takes a row, and pushing the transcript up
+          // by one row right after a drag makes the band the user just drew
+          // look misaligned. The highlight is the confirmation.
           const text = contentSelectionText()
-          if (text.length > 0) {
-            screen.copyText(text)
-            const lines = text.split('\n').length
-            toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
-          }
+          if (text.length > 0) screen.copyText(text)
         } else {
           selectAnchor = null
           selectFocus = null
@@ -2148,10 +2209,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         panelAnchor = null
         if (moved) {
           const text = screen.copySelection()
-          if (text.length > 0) {
-            const lines = text.split('\n').length
-            toast(`copied ${lines > 1 ? `${lines} lines` : `${text.length} chars`}`)
-          }
+          if (text.length > 0) screen.copyText(text)
         } else {
           screen.setSelection(null)
         }
@@ -2194,7 +2252,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return { id: question.id, selected, ...(custom.length > 0 ? { custom } : {}) }
     })
     if (answers.every((answer) => answer.selected.length === 0 && answer.custom === undefined)) {
-      toast('pick an option (space) or type an answer (c) first')
+      toast('pick an option (enter) or type an answer (c) first')
       return
     }
     const callId = overlay.callId
@@ -2297,16 +2355,28 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const row = rows[overlay.cursor]
       const qid = question?.id ?? ''
       /**
-       * A single-select question is radio: the option under the cursor is the
-       * tentative answer, so moving is choosing — space is still honored.
+       * `Enter` is the switch, and the only one. Moving the cursor never
+       * changes an answer, so a pick survives every `↑`/`↓` — the old
+       * follow-the-cursor radio silently re-picked an option on each move and
+       * made a deliberate choice look like it ran away.
+       *
+       * A multi-select question collects checks and waits for its `Submit`
+       * row, so one `Enter` never ends a batch the reader is still building.
+       * A one-choice question is answered by that key: it stores the pick and
+       * moves on, the same shape a single-question ask uses to send.
        */
-      const followCursor = (): void => {
-        // Reads the row at the *new* cursor; the `row` above was captured
-        // before the move and would keep marking the previous option.
-        const current = rows[overlay.cursor]
-        if (current?.kind === 'option' && current.multi !== true && current.label !== undefined) {
-          overlay.selected[qid] = [current.label]
+      const toggle = (target: QuestionRow | undefined): void => {
+        if (target?.kind !== 'option' || target.label === undefined) return
+        const picked = overlay.selected[target.qid] ?? []
+        const on = picked.includes(target.label)
+        if (target.multi) {
+          overlay.selected[target.qid] = on
+            ? picked.filter((label) => label !== target.label)
+            : [...picked, target.label]
+          return
         }
+        overlay.selected[target.qid] = [target.label]
+        advance()
       }
       /** Move on: next question, then the review page, then submit. */
       const advance = (): void => {
@@ -2346,25 +2416,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.cursor = 0
       } else if (key.type === 'up' || key.type === 'ctrl-p') {
         overlay.cursor = Math.max(0, overlay.cursor - 1)
-        followCursor()
       } else if (key.type === 'down' || key.type === 'ctrl-n') {
         overlay.cursor = Math.min(Math.max(0, rows.length - 1), overlay.cursor + 1)
-        followCursor()
       } else if (key.type === 'text' && key.text === ' ') {
-        if (row?.kind === 'action') {
-          advance()
-        } else if (row?.kind === 'custom') {
-          overlay.customMode = true
-        } else if (row?.label !== undefined) {
-          const selected = overlay.selected[row.qid] ?? []
-          overlay.selected[row.qid] = row.multi
-            ? selected.includes(row.label)
-              ? selected.filter((label) => label !== row.label)
-              : [...selected, row.label]
-            : selected.includes(row.label)
-              ? []
-              : [row.label]
-        }
+        // Space belongs to typing, not picking: in the ask it is deliberately
+        // inert, so a stray press cannot toggle an answer behind the reader's
+        // back. Choosing is `Enter`; typing a custom answer starts with `c`.
+        schedule()
+        return
       } else if (key.type === 'text' && /^[1-9]$/u.test(key.text) && question?.options !== undefined) {
         // Digits answer at once, as the numbered rows invite.
         const options = question.options
@@ -2395,15 +2454,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           // Re-editing a filled row stays on `c`.
           if ((overlay.custom[qid] ?? '').trim().length === 0) overlay.customMode = true
           else advance()
-        } else if (row?.kind === 'option' && row.label !== undefined) {
-          // Enter mid-list picks (radio) or toggles (checkbox); only the
-          // action row submits, so an accidental Enter cannot send the batch.
-          const selected = overlay.selected[row.qid] ?? []
-          overlay.selected[row.qid] = row.multi
-            ? selected.includes(row.label)
-              ? selected.filter((label) => label !== row.label)
-              : [...selected, row.label]
-            : [row.label]
+        } else {
+          // On an option, Enter is the switch; only the action row submits, so
+          // an accidental Enter cannot send the batch.
+          toggle(row)
         }
       }
       schedule()
@@ -2917,6 +2971,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'ctrl-g') {
       openAgents()
+      return
+    }
+    if (key.type === 'shift-tab') {
+      // Claude-Code-style mode cycle: the pill on the composer rule flips
+      // between asking and allowing every tool the turn requests.
+      setApprovalMode(state.approvalMode === 'auto' ? 'ask' : 'auto')
       return
     }
     if (key.type === 'escape' && state.editingQueued !== undefined) {
@@ -3572,9 +3632,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     for (const line of wrapText(question.question, inner)) {
       lines.push(paint(theme, 'bold', paint(theme, 'text', ` ${line}`)))
     }
-    if (question.multiSelect === true) {
-      lines.push(paint(theme, 'muted', ' select all that apply · space toggles'))
-    }
+    lines.push(paint(theme, 'muted', question.multiSelect === true
+      ? ' select all that apply · enter toggles'
+      : ' pick one · enter answers and moves on'))
 
     const options = question.options ?? []
     const optionRows = rows.filter((entry) => entry.kind === 'option')
@@ -3630,8 +3690,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         ? 'type an answer · enter submit · esc cancel text'
         : 'type an answer · enter done · esc cancel text'
       : question.multiSelect === true
-        ? `↑↓ move · space toggle · c custom · ↓ ${actionLabel.toLowerCase()} commits · esc later`
-        : `↑↓ choose (radio) · c custom · ↓ ${actionLabel.toLowerCase()} commits · esc later`
+        ? `↑↓ move · enter toggle · c custom · ↓ ${actionLabel.toLowerCase()} commits · esc later`
+        : `↑↓ move · enter answers · ↓ ${actionLabel.toLowerCase()} commits · esc later`
     lines.push(footer(hint))
     return {
       lines,
@@ -3665,6 +3725,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('ctrl+r', 15))} history search · ${paint(theme, 'text', 'ctrl+b')} session panel`)
       body.push(`${paint(theme, 'text', pad('ctrl+t', 15))} fold todos · ${paint(theme, 'text', 'ctrl+o')} tools/thinking`)
       body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'double esc')} rewind prompt`)
+      body.push(`${paint(theme, 'text', pad('shift+tab', 15))} approval mode: ask ↔ allow all (or /mode)`)
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
       body.push(`${paint(theme, 'text', pad('esc', 15))} cancel this turn · ${paint(theme, 'text', 'ctrl-c')} quit + kill subagents · ${paint(theme, 'text', 'ctrl-z')} detach`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
@@ -4266,6 +4327,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       : renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns), {
           ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
           ...(showSpeed ? { tps: speed } : {}),
+          approvalMode: state.approvalMode,
         })
     const noticeRows = notice === undefined ? 0 : 1
     const total = transcriptData.lines.length
@@ -4327,6 +4389,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     lines.push(...menu)
     const composerStart = lines.length
     lines.push(...composer.lines)
+    modeRow = askOverlay === undefined && lines.length > composerStart ? composerStart + 1 : null
     if (askOverlay === undefined) {
       cursor = { row: composerStart + (composer as { cursorRow: number }).cursorRow + 1, column: (composer as { cursorColumn: number }).cursorColumn }
     } else if (composer.cursorRow !== undefined) {

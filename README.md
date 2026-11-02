@@ -239,11 +239,23 @@ provider row, `u` diffs its declared models against the upstream: `a` adopts
 what appeared, `r` also drops what vanished (hand-tuned sizes on kept rows stay
 byte-identical; running sessions keep their own model selection).
 
-A mouse selection is copied on release (OSC 52) and stays highlighted. It is
-tracked in transcript coordinates, not screen rows: wheel scrolling carries it
-with the text it covers, and dragging past the top or bottom edge keeps
-scrolling one line at a time so a range can span more than one screen. Panels
-repaint their own rows, so a scroll inside one still clears the highlight.
+The composer's top rule carries the approval mode on its left end: `ask`
+(dim) surfaces every tool request as a panel, `allow all` (amber) answers each
+one as it lands so an unattended turn keeps moving. `shift+tab` flips it,
+`/mode` sets it explicitly, and clicking the pill works too. `allow all` sends
+the same `allowed-once` decision as the `a` key — the Host has no session-wide
+grant, so nothing is widened behind your back; the pill stays visible for as
+long as it is on.
+
+A mouse selection is copied on release (OSC 52) silently and stays
+highlighted — there is no `copied N lines` toast, because that extra row
+pushed the transcript up right after a drag and made the band look
+misaligned. A selection crossing lines paints as one block running to the
+right edge, blank rows included. It is tracked in transcript coordinates, not
+screen rows: wheel scrolling carries it with the text it covers, and dragging
+past the top or bottom edge keeps scrolling one line at a time so a range can
+span more than one screen. Panels repaint their own rows, so a scroll inside
+one still clears the highlight.
 
 In `/skills`: `↑/↓` move, `Enter` opens the skill body (rendered markdown),
 `i` puts `/name ` into the editor to invoke it, `Backspace` goes back to the
@@ -256,12 +268,13 @@ to a `$dsh-config` mention, and the send path rewrites `$name` into the
 `/name` gesture, so the composer keeps showing what you typed while the Host
 still receives the syntax it parses.
 
-In an `ask_user_question` card: `↑/↓` move — a single-select question is
-radio, so the row under the cursor is the pick; `Space` toggles a choice
-(multi-select), `c` types a custom answer. Every question ends in a
-`Submit`/`Next` row: `↓` onto it and `Enter` moves to the next question or
-sends the answers — pressing `Enter` mid-list can no longer submit by
-accident. `Esc` leaves the ask pending for the Web UI.
+In an `ask_user_question` card: `↑/↓` only move — they never change an
+answer, so a pick survives the cursor. `Enter` answers a one-choice question
+outright (it stores the pick and moves on, and the last question sends the
+batch), while a multi-select question collects checks: `Enter` toggles the row,
+nothing is sent until you walk down to `Submit` and press `Enter` there. `c`
+types a custom answer and `Space` does nothing here, so a stray press cannot
+change an answer behind your back. `Esc` leaves the ask pending for the Web UI.
 
 ## Slash commands
 
@@ -282,6 +295,7 @@ accident. `Esc` leaves the ask pending for the Web UI.
 | `/agents` | list subagents, open their transcripts |
 | `/skills [name]` | browse the Host skill catalog, or open one skill |
 | `/verbose` | toggle reasoning and lifecycle events |
+| `/mode` | approval mode — bare flips, `/mode ask` and `/mode allow-all` set it (same as `shift+tab`) |
 | `/model` | switch provider/model — `Enter` applies with the remembered reasoning level; `e` picks the level explicitly |
 | `/provider` | edit provider rows in `cordis.patch.yml` |
 | `/harness` | agent presets a session composes: persona, tools, overrides |

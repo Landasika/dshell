@@ -35,7 +35,7 @@ rules:
 ├ status strip (only when agents/jobs/todos exist) ──────────────────────┤
 │ ✓ agents 1/1  ● jobs 1  ● todo 0/6                                     │
 ├ composer ──────────────────────────────────────────────────────────────┤
-│ ────────────────────────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps                 │
+│ allow all ──────── ctx ▰▰▰▱▱▱▱▱▱▱ 25% · 42 tps
 │ ❯ draft                                                                │
 │ ───────────────────────────────────────────────────────────────────────│
 │   enter send · / commands · @ files · ctrl+r history · ? help          │
@@ -77,7 +77,7 @@ The default family is **mist blue** (`src/tui/theme.ts`):
 | `muted` | `#7b879c` | hints, secondary labels |
 | `border` | `#2f3a4f` | rules and frames |
 | `success` | `#48c78e` | completion, comfortable context |
-| `warning` | `#f5b451` | context ≥ 80%, approvals |
+| `warning` | `#f5b451` | context ≥ 80%, approvals, the `allow all` mode pill |
 | `error` | `#f26d78` | failures, context ≥ 95% |
 
 The context bar uses a five-step blue ramp (`contextSystem` → `contextTools`).
@@ -152,12 +152,28 @@ milliseconds.
 ## Selection and clipboard
 
 Mouse reporting is enabled for the wheel, but a left-button drag is captured
-and rendered as a reverse-video selection over the last frame. On release the
-app extracts the selected display cells (wide CJK/emoji aware, ANSI stripped,
-trailing padding trimmed) and writes it to the terminal clipboard with OSC 52,
-showing `copied N lines`/`copied N chars`. Holding Shift still hands the drag
-to the terminal's native selection for environments where OSC 52 is disabled.
-`DSHELL_NO_MOUSE=1` disables the whole mouse protocol.
+and rendered as a reverse-video selection over the last frame. A range that
+crosses lines paints as one block: every row between the endpoints runs to the
+right edge, blank rows included, so the band never breaks into pieces. On
+release the app extracts the selected display cells (wide CJK/emoji aware, ANSI
+stripped, trailing padding trimmed) and writes it to the terminal clipboard
+with OSC 52 — silently, because a toast would take a row and shift the
+transcript under the band the user just drew. Holding Shift still hands the
+drag to the terminal's native selection for environments where OSC 52 is
+disabled. `DSHELL_NO_MOUSE=1` disables the whole mouse protocol.
+
+## Approval mode
+
+The composer's top rule carries the mode at its left end — `ask` dim, or
+`allow all` in the warning tone — because it changes what the model may run
+without asking and must never be invisible. `shift+tab` cycles it, `/mode`
+sets it outright, and the pill is a click target.
+
+`ask` opens the approval panel for every request. `allow all` answers each one
+on arrival through the same `allowed-once` outcome the `a` key sends: the Host
+grants per request and exposes no session-wide permission, so the TUI cannot
+decide to widen anything permanently, and the amber pill reports that the mode
+is on for as long as it is.
 
 ## Secondary pages
 

@@ -129,8 +129,14 @@ export class TerminalScreen {
         const row = index + 1
         if (row >= selection.startRow && row <= selection.endRow) {
           const from = row === selection.startRow ? selection.startColumn : 1
-          const to = row === selection.endRow ? Math.max(selection.endColumn, selection.startColumn) : displayWidth(raw)
-          line = highlightColumns(raw, from, to)
+          // A selection crossing lines is a block: the rows between the ends
+          // run to the right edge, including the empty ones. Padding to the
+          // span before highlighting is what reverses the spaces too, so the
+          // band stays one piece instead of breaking at blank lines.
+          const to = row === selection.endRow
+            ? Math.max(selection.endColumn, from)
+            : columns
+          line = highlightColumns(pad(raw, Math.max(displayWidth(raw), to)), from, to)
         }
       }
       const painted = pad(line, columns)

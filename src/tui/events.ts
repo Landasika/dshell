@@ -297,7 +297,7 @@ export function askQuestionLines(rawArguments: unknown): string[] | undefined {
     lines.push(question.question)
     const multi = question.multiSelect === true
     if (question.options !== undefined && question.options.length > 0) {
-      lines.push(`· ${multi ? 'checkbox, space toggles' : 'one choice'}`)
+      lines.push(`· ${multi ? 'checkbox, enter toggles' : 'one choice'}`)
       for (const option of question.options) {
         lines.push(`  ${multi ? '☐' : '○'} ${option.label}${option.description === undefined ? '' : ` — ${option.description}`}`)
       }

@@ -24,6 +24,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/skills', description: 'browse skills from the Host skill hub', needsArgument: false },
   { name: '/status', description: 'alias for /panel' },
   { name: '/verbose', description: 'toggle reasoning and lifecycle events' },
+  { name: '/mode', description: 'approval mode: ask, or allow all (shift+tab)' },
   { name: '/model', description: 'switch provider/model and reasoning level' },
   { name: '/provider', description: 'edit provider rows in cordis.patch.yml' },
   { name: '/harness', description: 'agent presets: prompts and tools a session composes' },

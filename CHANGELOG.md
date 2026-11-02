@@ -5,7 +5,38 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
+### Added
+
+- The composer's top rule shows the approval mode and lets you flip it:
+  `ask` (default, dim) surfaces each tool request as a panel, `allow all`
+  (amber) answers requests as they land so an unattended turn keeps running.
+  `shift+tab` toggles, `/mode [ask|allow-all]` sets it, and the pill is
+  clickable. `allow all` sends the same `allowed-once` decision the `a` key
+  sends — the Host exposes no session-wide grant, so nothing is widened
+  silently and the amber pill stays on screen while it applies.
+
+### Changed
+
+- In an `ask_user_question` card `Enter` is the only switch, and it means two
+  different things by question shape. A one-choice question is answered
+  outright: `Enter` stores the pick and moves to the next question (the last
+  one sends the batch). A multi-select question only collects checks — `Enter`
+  toggles the row and nothing is sent until you walk down to `Submit` and press
+  `Enter` there. `↑/↓` never change an answer and `Space` does nothing, so a
+  pick cannot drift to the row the cursor happens to be on or be cleared by a
+  stray space.
+
+- A mouse selection no longer toasts `copied N lines`. The toast took a row,
+  which pushed the transcript up immediately after the drag and made the
+  highlight look misaligned; the highlight is the confirmation now.
+
 ### Fixed
+
+- A selection crossing several transcript lines paints as one contiguous band.
+  Only the text used to be reversed, so every blank line and every row shorter
+  than the selection broke the band into pieces — and the `copied N lines`
+  count included those empty rows. Rows inside the range now run to the right
+  edge, blank ones included.
 
 - A turn-failure notice no longer outstays its turn: a queued prompt (or the
   auto-continue, or any spooled turn) starts a new turn without passing through

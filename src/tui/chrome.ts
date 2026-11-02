@@ -81,6 +81,19 @@ export interface ComposerStatus {
   contextPct?: number
   /** Live or last-turn token speed. */
   tps?: number
+  /** How tool approvals are answered; drawn as a pill on the top rule. */
+  approvalMode?: 'ask' | 'auto'
+}
+
+/**
+ * The approval-mode pill on the composer's top rule. `ask` is the default and
+ * stays quiet (a muted word); `allow all` is a standing change to what the
+ * model may run, so it is painted in the warning tone and never hidden.
+ */
+function modePill(theme: Theme, mode: 'ask' | 'auto'): { plain: string; painted: string } {
+  return mode === 'auto'
+    ? { plain: 'allow all', painted: paint(theme, 'warning', 'allow all') }
+    : { plain: 'ask', painted: paint(theme, 'muted', 'ask') }
 }
 
 /**
@@ -126,11 +139,19 @@ function composerTop(theme: Theme, total: number, status: ComposerStatus | undef
   if (tpsText !== undefined && tpsLabel !== undefined) {
     variants.push({ plain: tpsText, painted: tpsLabel })
   }
+  // The mode rides the same rule: left of the fill, so it is the first thing
+  // the eye lands on and never competes with the context bar for space.
+  const mode = status?.approvalMode === undefined ? undefined : modePill(theme, status.approvalMode)
   for (const variant of variants) {
-    const width = displayWidth(variant.plain)
+    const width = displayWidth(variant.plain) + (mode === undefined ? 0 : displayWidth(mode.plain) + 3)
     if (width > total - 2) continue
     const fill = Math.max(1, total - width - 1)
-    return `${paint(theme, 'border', '─'.repeat(fill))} ${variant.painted}`
+    const lead = mode === undefined ? '' : `${mode.painted} ${paint(theme, 'border', '─')} `
+    return `${lead}${paint(theme, 'border', '─'.repeat(fill))} ${variant.painted}`
+  }
+  if (mode !== undefined && displayWidth(mode.plain) + 3 <= total - 2) {
+    const fill = Math.max(1, total - displayWidth(mode.plain) - 3)
+    return `${mode.painted} ${paint(theme, 'border', '─'.repeat(fill))}`
   }
   return paint(theme, 'border', '─'.repeat(total))
 }

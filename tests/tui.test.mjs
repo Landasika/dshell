@@ -147,7 +147,7 @@ test('ask labels read as a question, never as raw tool JSON', () => {
     '  ○ pnpm — fast',
     '  ○ npm',
   ])
-  assert.deepEqual(askQuestionLines(args)?.slice(6, 9), ['extra', 'anything else?', '· checkbox, space toggles'])
+  assert.deepEqual(askQuestionLines(args)?.slice(6, 9), ['extra', 'anything else?', '· checkbox, enter toggles'])
   assert.equal(askQuestionLines(args)?.[9], '  ☐ lint')
 
   // Answers render as `id → value`, including a custom reply.
@@ -206,17 +206,14 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   await waitFor(() => output.text.includes('the model asks'))
   await waitFor(() => output.text.includes('包名用哪个？'))
 
-  // Single-select is radio: the cursor on an option marks it, no space needed.
+  // Moving the cursor never changes an answer: nothing is marked until Enter.
   const beforeSelection = output.text.length
   input.push('\u001b[B')
-  await waitFor(() => output.text.slice(beforeSelection).includes('● 2. B'))
-  await waitFor(() => output.text.includes('Submit ✓'))
+  await waitFor(() => output.text.slice(beforeSelection).includes('▸ ○ 2. B'))
+  assert.equal(output.text.slice(beforeSelection).includes('● '), false, 'down must not pick')
 
-  // ↓ twice more — past the custom row onto Submit; Enter submits the batch.
-  input.push('\u001b[B')
-  await new Promise((resolve) => setTimeout(resolve, 30))
-  input.push('\u001b[B')
-  await waitFor(() => output.text.includes('▸') && output.text.includes('Submit ✓'))
+  // Enter on a one-choice row answers the question and moves on, so the last
+  // question's pick sends the batch.
   input.push('\r')
   await waitFor(() => output.text.includes('answers sent'))
   assert.deepEqual(backend.answeredQuestions, [
@@ -226,6 +223,154 @@ test('the model can ask questions and the TUI answers from an overlay', async ()
   input.push('\u0004')
   assert.equal(await app, 0)
   await backend.disconnect()
+})
+
+test('arrows never pick, Enter answers a one-choice ask, and a multi waits for Submit', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+  const plain = () => stripAnsi(output.text)
+
+  await waitFor(() => plain().includes('idle'), 'the first attach')
+  try {
+    backend.askQuestion('s1', 'q1', [
+      {
+        id: 'clients',
+        question: 'which clients should use it?',
+        options: [{ label: 'claude code' }, { label: 'cursor' }, { label: 'codex' }],
+      },
+    ])
+    await waitFor(() => plain().includes('▸ ○ 1. claude code'), 'the ask with an unpicked first row')
+
+    // The bug: ↓ used to move the pick. The cursor moves, the answer does not.
+    output.text = ''
+    input.push('\u001b[B')
+    await waitFor(() => plain().includes('▸ ○ 2. cursor'), 'the cursor on row 2')
+    assert.equal(plain().includes('● 2. cursor'), false, 'down must not pick row 2')
+
+    // Space stays inert in the ask.
+    output.text = ''
+    input.push(' ')
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.equal(plain().includes('● '), false, 'space must not pick anything')
+
+    // Enter answers the one-choice question outright: it sends and closes.
+    input.push('\r')
+    await waitFor(() => plain().includes('answers sent'), 'the submitted answer')
+    assert.deepEqual(backend.answeredQuestions.at(-1)?.answers, [{ id: 'clients', selected: ['cursor'] }])
+  } finally {
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+    await backend.disconnect()
+  }
+})
+
+test('a multi-select ask toggles with Enter and commits from its Submit row', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+  const plain = () => stripAnsi(output.text)
+
+  await waitFor(() => plain().includes('idle'), 'the first attach')
+  try {
+    backend.askQuestion('s1', 'q1', [
+      {
+        id: 'lint',
+        question: 'which linters?',
+        multiSelect: true,
+        options: [{ label: 'eslint' }, { label: 'dprint' }],
+      },
+    ])
+    await waitFor(() => plain().includes('▸ ☐ 1. eslint'), 'the multi ask')
+
+    // Enter checks a row and stays put: the batch is not sent mid-build.
+    input.push('\r')
+    await waitFor(() => plain().includes('☑ 1. eslint'), 'the first check')
+    assert.equal(backend.answeredQuestions.length, 0, 'a multi never sends on a check')
+
+    // Enter again unchecks it, so a mis-press is reversible.
+    input.push('\r')
+    await waitFor(() => plain().includes('☐ 1. eslint'), 'the check undone')
+
+    // Check both, then walk down to Submit and commit there.
+    input.push('\r')
+    await waitFor(() => plain().includes('☑ 1. eslint'), 'the first check again')
+    input.push('\u001b[B')
+    input.push('\r')
+    await waitFor(() => plain().includes('☑ 2. dprint'), 'the second check')
+    assert.equal(backend.answeredQuestions.length, 0, 'still nothing sent')
+
+    for (let step = 0; step < 2; step += 1) {
+      input.push('\u001b[B')
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    }
+    await waitFor(() => plain().includes('▸ Submit ✓'), 'the Submit row')
+    input.push('\r')
+    await waitFor(() => plain().includes('answers sent'), 'the submitted batch')
+    assert.deepEqual(backend.answeredQuestions.at(-1)?.answers, [{ id: 'lint', selected: ['eslint', 'dprint'] }])
+  } finally {
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+    await backend.disconnect()
+  }
 })
 
 test('/continue resumes a turn the Host interrupted', async () => {
@@ -773,8 +918,8 @@ test('an answered ask does not reopen while the Host settles it', async () => {
       data: { name: 'ask_user_question', callId: 'q1', arguments: JSON.stringify({ questions: [{ id: 'pkg', question: 'which?', options: [{ label: 'A' }] }] }) },
     })
     await waitFor(() => stripAnsi(output.text).includes('the model asks'), 'the ask overlay')
-    input.push(' ')
-    // The radio pick is stored; commit from the action row, two rows down.
+    // The pick lives on row 1; commit from the action row, two rows down.
+    input.push('\r')
     input.push('\u001b[B')
     await new Promise((resolve) => setTimeout(resolve, 30))
     input.push('\u001b[B')
@@ -1021,7 +1166,8 @@ test('completion finds slash commands and @ files', () => {
   assert.equal(sessions.length, 1)
   assert.equal(sessions[0].label, '/sessions')
   assert.deepEqual(completionFor('/res', []).items.map((item) => item.label), ['/resume'])
-  assert.deepEqual(completionFor('/mod', []).items.map((item) => item.label), ['/model'])
+  // `/mode` is a prefix of `/model`, so both are offered; the exact match leads.
+  assert.deepEqual(completionFor('/mod', []).items.map((item) => item.label), ['/mode', '/model'])
   const file = completionContext('look at @src/ma')
   assert.deepEqual(file, { kind: 'file', query: 'src/ma', start: 8, end: 15 })
   assert.equal(completionFor('look at @src/ma', ['src/main.ts']).items[0].label, '@src/main.ts')
@@ -2144,7 +2290,7 @@ test('drag selects text and copies it through OSC 52', async () => {
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.match(output.text, /\u001b\[7m/)
   input.push('\u001b[<0;20;3m')
-  await waitFor(() => output.text.includes('copied'))
+  await waitFor(() => /\u001b\]52;c;[A-Za-z0-9+/=]+\u0007/.test(output.text), 'the clipboard write')
   const match = /\u001b\]52;c;([A-Za-z0-9+/=]+)\u0007/.exec(output.text)
   assert.ok(match)
   assert.match(Buffer.from(match[1], 'base64').toString('utf8'), /HELLO-TARGET/)
@@ -4016,12 +4162,13 @@ test('panel viewers copy their body with y and with a mouse drag', async () => {
     input.push('y')
     await waitFor(() => stripAnsi(output.text).includes('copied'), 'the copy toast')
 
-    // A drag inside the open panel must select (and copy) the panel rows.
+    // A drag inside the open panel must select (and copy) the panel rows. The
+    // copy is silent now, so the clipboard write is the signal, not a toast.
     output.text = ''
     input.push('\u001b[<0;10;12M')
     input.push('\u001b[<32;30;14M')
     input.push('\u001b[<0;30;14m')
-    await waitFor(() => stripAnsi(output.text).includes('copied'), 'a drag copy inside the panel')
+    await waitFor(() => /\u001b\]52;c;[A-Za-z0-9+/=]+\u0007/.test(output.text), 'a drag copy inside the panel')
   } finally {
     input.push('\u001b')
     input.push('\u0004')
@@ -4083,9 +4230,9 @@ test('a copied selection follows the text it covers when the wheel scrolls', asy
     input.push('\u001b[<0;2;10M')
     input.push('\u001b[<32;24;18M')
     input.push('\u001b[<0;24;18m')
-    await waitFor(() => stripAnsi(output.text).includes('copied'), 'the copy toast')
+    await waitFor(() => /\u001b\]52;c;[A-Za-z0-9+/=]+\u0007/.test(output.text), 'the clipboard write')
+    await waitFor(() => highlights().length > 0, 'the selection paint')
     const before = highlights()
-    assert.ok(before.length > 0, `expected highlighted lines, got ${JSON.stringify(stripAnsi(output.text).slice(-400))}`)
 
     // Scrolling must keep the highlight on the same text, not drop it.
     output.text = ''
@@ -4168,7 +4315,7 @@ test('dragging past the top edge keeps scrolling and grows the selection', async
     // Give the timer a few more ticks, then commit the selection.
     await new Promise((resolve) => setTimeout(resolve, 300))
     input.push('\u001b[<0;3;3m')
-    await waitFor(() => stripAnsi(output.text).includes('copied'), 'the copy toast')
+    await waitFor(() => clipboard().length > 0, 'the clipboard write')
 
     const text = clipboard()
     const firstVisible = Number(/message number (\d+)/u.exec(stripAnsi(visibleBefore))?.[1] ?? '0')
@@ -4254,6 +4401,76 @@ test('a user-invocable skill reaches the model as a /name gesture', async () => 
   }
 })
 
+test('shift+tab flips the approval mode shown on the composer rule, and allow all answers by itself', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-600))}`)
+  }
+  const plain = () => stripAnsi(output.text)
+
+  await waitFor(() => plain().includes('idle'), 'the first attach')
+  try {
+    // The default asks: the rule carries the word and the panel opens.
+    assert.match(plain(), / ask ─/)
+    backend.askApproval('s1', { requestId: 'r1', toolName: 'bash', reason: 'needs network' })
+    await waitFor(() => plain().includes('needs network'), 'the approval panel in ask mode')
+
+    // Back to idle, then flip the mode from the keyboard.
+    output.text = ''
+    input.push('r')
+    await waitFor(() => plain().includes('rejected'), 'the reject acknowledgement')
+    assert.equal(plain().includes('needs network'), false, 'the panel closed')
+    output.text = ''
+    input.push('\u001b[Z')
+    await waitFor(() => plain().includes('allow all'), 'the allow-all pill')
+    assert.match(plain(), /allow all ─/)
+
+    // With allow all on, an approval never opens the panel: it is answered.
+    output.text = ''
+    backend.askApproval('s1', { requestId: 'r2', toolName: 'edit', reason: 'write file' })
+    await waitFor(() => plain().includes('allowed edit'), 'the auto-allow toast')
+    assert.equal(plain().includes('write file'), false, 'allow all must not stop for the panel')
+
+    // And the flip is reversible from the same key.
+    output.text = ''
+    input.push('\u001b[Z')
+    await waitFor(() => plain().includes('ask'), 'the ask pill back')
+    assert.equal(plain().includes('allow all'), false)
+  } finally {
+    input.push('\u0004')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+    await backend.disconnect()
+  }
+})
+
 test('an ask that arrives behind a panel is announced, then surfaces when the panel closes', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
@@ -4306,10 +4523,11 @@ test('an ask that arrives behind a panel is announced, then surfaces when the pa
     output.text = ''
     input.push('\u001b')
     await waitFor(() => stripAnsi(output.text).includes('包名用哪个？'), 'the ask after the panel closes')
+    // The surfaced ask takes keys: Enter on the first option answers it.
     output.text = ''
-    input.push(' ')
-    await waitFor(() => stripAnsi(output.text).includes('● 1. A'), 'an option selected from the ask')
-    assert.deepEqual(backend.answeredQuestions, [])
+    input.push('\r')
+    await waitFor(() => stripAnsi(output.text).includes('answers sent'), 'an answer from the surfaced ask')
+    assert.deepEqual(backend.answeredQuestions.at(-1)?.answers, [{ id: 'pkg', selected: ['A'] }])
   } finally {
     // The ask is open at this point: the first ctrl-c dismisses it (the new
     // semantics), the second quits from the empty composer.
