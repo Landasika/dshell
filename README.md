@@ -110,7 +110,7 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
 
 ## Status
 
-`0.4.1` is current: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
+`0.5.0` is current: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
 plan (TUI, scriptable CLI, sessions/workspaces, approval bridge,
 models/providers, subagents, terminal questions) is complete — see the
 [changelog](CHANGELOG.md) and [supported versions](docs/SUPPORTED-VERSIONS.md).

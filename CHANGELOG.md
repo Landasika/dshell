@@ -3,18 +3,7 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
-## [Unreleased]
-
-### Fixed
-
-- A Host loading the plugin no longer preempts a busy peer's control socket.
-  The stale-socket probe used to treat an unanswered connect within 300ms as
-  "nobody is listening" and unlink the live Host's socket — splitting every
-  client across two servers and surfacing `session … is already owned by an
-  active write handle` whenever the two sides met on one session. The probe
-  is now tri-state (`connected` / `refused` / `unknown`, 1s budget): only a
-  confirmed `refused` clears the path; an inconclusive probe refuses to bind
-  and says what to do instead.
+## [0.5.0] — 2026-11-03
 
 ### Added
 
@@ -57,6 +46,15 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   highlight look misaligned; the highlight is the confirmation now.
 
 ### Fixed
+
+- A Host loading the plugin no longer preempts a busy peer's control socket.
+  The stale-socket probe used to treat an unanswered connect within 300ms as
+  "nobody is listening" and unlink the live Host's socket — splitting every
+  client across two servers and surfacing `session … is already owned by an
+  active write handle` whenever the two sides met on one session. The probe
+  is now tri-state (`connected` / `refused` / `unknown`, 1s budget): only a
+  confirmed `refused` clears the path; an inconclusive probe refuses to bind
+  and says what to do instead.
 
 - Auto-continue after a Host restart deduplicated by turn number alone, but
   turn numbers restart at 1 in every session: continuing session A's turn 1
@@ -648,3 +646,4 @@ First V1 candidate for Linux.
 [0.4.1]: https://github.com/Landasika/dshell/releases/tag/v0.4.1
 [0.4.2]: https://github.com/Landasika/dshell/releases/tag/v0.4.2
 [0.4.3]: https://github.com/Landasika/dshell/releases/tag/v0.4.3
+[0.5.0]: https://github.com/Landasika/dshell/releases/tag/v0.5.0
