@@ -323,7 +323,7 @@ function mappedError(error: unknown): ErrorMessage {
       action: 'Run `dshell list` and attach an existing session.',
     }
   }
-  if (/already owned by an active write/i.test(message)) {
+  if (code === 'session/writer-held' || /already owned by an active write/i.test(message)) {
     return {
       type: 'error',
       code: 'SESSION_ALREADY_LIVE',
@@ -377,30 +377,47 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   })
 }
 
-function canConnect(socketPath: string, timeoutMs = 300): Promise<boolean> {
+/** Outcome of probing a control-socket path for an existing listener. */
+export type SocketProbeOutcome = 'connected' | 'refused' | 'unknown'
+
+/**
+ * Probe whether another dshell host is listening on `socketPath`.
+ *
+ * Only `refused` means the path is definitely safe to reclaim. A busy host's
+ * event loop may accept too slowly for the probe to complete — that is
+ * `unknown`, never proof the file is stale, and must not be treated as one
+ * (a host that unlinked a live peer's socket split every client across two
+ * servers; see the socket-probe tests).
+ */
+export function probeSocket(socketPath: string, timeoutMs = 1_000): Promise<SocketProbeOutcome> {
   return new Promise((resolve) => {
     const socket = new Socket()
     let settled = false
-    const settle = (value: boolean) => {
+    const settle = (value: SocketProbeOutcome) => {
       if (settled) return
       settled = true
       socket.destroy()
       resolve(value)
     }
-    const timer = setTimeout(() => settle(false), timeoutMs)
+    const timer = setTimeout(() => settle('unknown'), timeoutMs)
+    timer.unref?.()
     socket.once('connect', () => {
       clearTimeout(timer)
-      settle(true)
+      settle('connected')
     })
-    socket.once('error', () => {
+    socket.once('error', (error) => {
       clearTimeout(timer)
-      settle(false)
+      const code = (error as NodeJS.ErrnoException).code
+      settle(code === 'ECONNREFUSED' || code === 'ENOENT' ? 'refused' : 'unknown')
     })
     socket.connect(socketPath)
   })
 }
 
-async function prepareSocketPath(socketPath: string): Promise<void> {
+export async function prepareSocketPath(
+  socketPath: string,
+  probe: (path: string) => Promise<SocketProbeOutcome> = probeSocket,
+): Promise<void> {
   const directory = dirname(socketPath)
   mkdirSync(directory, { recursive: true, mode: 0o700 })
   try {
@@ -414,8 +431,16 @@ async function prepareSocketPath(socketPath: string): Promise<void> {
     if (!stat.isSocket()) {
       throw new Error(`refusing to replace non-socket path: ${socketPath}`)
     }
-    if (await canConnect(socketPath)) {
+    const outcome = await probe(socketPath)
+    if (outcome === 'connected') {
       throw new Error(`another dshell host is already listening on ${socketPath}`)
+    }
+    if (outcome === 'unknown') {
+      throw new Error(
+        `refusing to replace ${socketPath}: the probe could not confirm it is stale ` +
+        '(another host may be listening but slow to answer); ' +
+        'if that host is really gone, delete the socket file and reload',
+      )
     }
     unlinkSync(socketPath)
   } catch (error) {

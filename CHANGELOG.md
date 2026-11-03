@@ -5,7 +5,25 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ## [Unreleased]
 
+### Fixed
+
+- A Host loading the plugin no longer preempts a busy peer's control socket.
+  The stale-socket probe used to treat an unanswered connect within 300ms as
+  "nobody is listening" and unlink the live Host's socket — splitting every
+  client across two servers and surfacing `session … is already owned by an
+  active write handle` whenever the two sides met on one session. The probe
+  is now tri-state (`connected` / `refused` / `unknown`, 1s budget): only a
+  confirmed `refused` clears the path; an inconclusive probe refuses to bind
+  and says what to do instead.
+
 ### Added
+
+- Attaching a session (reconnect, `/attach`, the pickers) and sending into it
+  (`/continue`, reconnect auto-continue, ordinary prompts) now ride out a
+  lost writer race instead of failing the action: up to four retries over
+  ~15s (`session held by another writer · retrying 1/4`), then the existing
+  error and hint. The Host-side `session/writer-held` code maps to the same
+  `SESSION_ALREADY_LIVE` the raw persistence message already did.
 
 - The composer's top rule shows the approval mode and lets you flip it:
   `ask` (default, dim) surfaces each tool request as a panel, `allow all`

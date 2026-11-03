@@ -941,3 +941,57 @@ test('shutdown flushes the final approval resolution before closing (DS-009)', a
   assert.equal((await outcomes)[0], 'unavailable')
   await client.closed
 })
+
+test('prompt maps a writer-held resume to SESSION_ALREADY_LIVE', async (t) => {
+  const held = Object.assign(new Error('session "s9" is already owned by an active write handle'), {
+    code: 'session/writer-held',
+  })
+  const harness = await startHarness(t, {}, {
+    agents: {
+      get: () => undefined,
+      list: () => [],
+      resume: async () => {
+        throw held
+      },
+      create: async () => {
+        throw new Error('unused')
+      },
+    },
+  })
+  makeSession(harness, 's9', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'prompt', sessionId: 's9', text: 'wake up' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'error')
+  assert.equal(reply.code, 'SESSION_ALREADY_LIVE')
+})
+
+test('prompt still maps a raw SessionAlreadyOwnedError message to SESSION_ALREADY_LIVE', async (t) => {
+  const harness = await startHarness(t, {}, {
+    agents: {
+      get: () => undefined,
+      list: () => [],
+      resume: async () => {
+        // The persistence seam's own error, without the controller's code.
+        throw new Error('session "s9" is already owned by an active write handle')
+      },
+      create: async () => {
+        throw new Error('unused')
+      },
+    },
+  })
+  makeSession(harness, 's9', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'prompt', sessionId: 's9', text: 'wake up' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'error')
+  assert.equal(reply.code, 'SESSION_ALREADY_LIVE')
+})

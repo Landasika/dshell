@@ -26,6 +26,7 @@ import type {
 import { KeyParser, type Key } from './keys.js'
 import { COMMAND_SPECS, completionContext, completionFor, type CompletionItem, type CompletionState } from './completion.js'
 import { createEditor, editKey, insertText, type EditorState } from './editor.js'
+import { retryOnWriterHeld } from './retry.js'
 import { normalizePaste, pastePlaceholder, shouldFoldPaste } from './paste.js'
 import {
   askAnswerLines,
@@ -811,7 +812,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     try {
       state.status = `attaching ${shortId(sessionId)}`
       schedule()
-      const next = await backend.openSession(sessionId)
+      // Another writer on this session is often a handoff in flight (a
+      // crashed peer's kernel lease releasing, a turn ending); ride it out
+      // briefly instead of failing the attach outright.
+      const next = await retryOnWriterHeld(() => backend.openSession(sessionId), {
+        onRetry: (attempt, total) => {
+          toast(`session held by another writer · retrying ${attempt}/${total}`)
+          schedule()
+        },
+      })
       if (generation !== sessionGeneration) {
         // A newer pick superseded this one; drop the handle so its socket and
         // listeners do not outlive the attempt.
@@ -988,7 +997,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     reportHerdr(state.view, 'working')
     schedule()
     try {
-      const receipt = await state.handle.send(expandAttachments(trimmed), { mode })
+      const handle = state.handle
+      // The writer lease can change hands right as we send (a Host restart
+      // finishing, another writer's turn ending); retry briefly so /continue
+      // and auto-continue survive the handoff instead of erroring the turn.
+      const receipt = await retryOnWriterHeld(
+        () => handle.send(expandAttachments(trimmed), { mode }),
+        {
+          onRetry: (attempt, total) => {
+            toast(`session held by another writer · retrying ${attempt}/${total}`)
+            schedule()
+          },
+        },
+      )
       if (wasRunning) {
         // The transcript only shows the message once the Host delivers it, so
         // keep it visible until its user/message arrives.
