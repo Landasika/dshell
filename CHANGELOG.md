@@ -17,6 +17,14 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
 
 ### Changed
 
+- `Ctrl-C` no longer quits on the first press. The first press only warns
+  (`press ctrl-c again within 2s to quit`, or `… to cancel the turn and quit`
+  while a turn runs) and the second press inside the window leaves. Any other
+  key in between disarms it, so typing proves you did not mean to leave. The
+  key is a reflex and this TUI owns no Agent state: quitting under a live turn
+  or a pending question is the expensive mistake, not the extra keypress.
+  `Ctrl-D`, `Ctrl-Z` and `/quit` still leave immediately without confirming.
+
 - In an `ask_user_question` card `Enter` is the only switch, and it means two
   different things by question shape. A one-choice question is answered
   outright: `Enter` stores the pick and moves to the next question (the last
@@ -31,6 +39,21 @@ The project follows [Semantic Versioning](https://semver.org/) independently of 
   highlight look misaligned; the highlight is the confirmation now.
 
 ### Fixed
+
+- Auto-continue after a Host restart deduplicated by turn number alone, but
+  turn numbers restart at 1 in every session: continuing session A's turn 1
+  made session B's turn 1 look already continued, so B was never resumed. The
+  key is now `sessionId:turn`.
+
+- Picking two sessions in quick succession could leave the older one on
+  screen. `openSession` awaited the attach and then assigned the result, so a
+  slow reply for the session you left could land after the fast reply for the
+  one you picked next and replace it. Each attach now takes a generation
+  ticket; a superseded reply disposes its handle and returns. (The fix is not
+  covered by a regression test: driving two overlapping attaches through the
+  key path needs a delay hook the fake backend did not have, and the attempts
+  reproduced the ordering without reliably reaching the stale reply. The cancel
+  path and the handle count were verified by hand.)
 
 - A selection crossing several transcript lines paints as one contiguous band.
   Only the text used to be reversed, so every blank line and every row shorter

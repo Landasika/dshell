@@ -3259,13 +3259,20 @@ test('enter steers into the running turn and alt+q queues behind it', async () =
   await waitFor(() => output.text.includes('◷ queued'), 'the queued marker')
   assert.equal(backend.queuedPrompts.some((entry) => entry.text === 'after this' && entry.mode === 'queue'), true)
 
-  // Ctrl-C on a running turn now means "stop and leave": the cancel goes out
-  // with the kill-subagents flag and the TUI exits instead of staying open.
+  // Ctrl-C on a running turn means "stop and leave", but only on the second
+  // press: the first arms and warns, so a reflex key cannot kill a live turn.
   input.push('\u0003')
-  // The TUI leaves right away; the toast cannot be relied on to render.
+  await waitFor(() => output.text.includes('press ctrl-c again'), 'the quit confirmation')
+  let exited = false
+  void app.then(() => { exited = true }, () => { exited = true })
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal(exited, false, 'one press must not quit')
+  assert.equal(backend.lastCancelKilledSubagents, false, 'one press must not cancel')
+
+  input.push('\u0003')
+  // The confirming press cancels with the kill-subagents flag, then leaves.
   assert.equal(await app, 0)
   assert.equal(backend.lastCancelKilledSubagents, true)
-  assert.equal(await app, 0)
 })
 
 test('alt+arrows walk blocks and enter opens tools and subagents', async () => {
@@ -4398,6 +4405,85 @@ test('a user-invocable skill reaches the model as a /name gesture', async () => 
     input.push('\u0004')
     await app
     await backend.disconnect()
+  }
+})
+
+test('ctrl-c asks twice before quitting, and any other key disarms it', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const boot = async () => {
+    const input = new FakeInput()
+    const output = new FakeOutput()
+    const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+    await backend.connect()
+    const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+    for (let index = 0; index < 300; index += 1) {
+      if (stripAnsi(output.text).includes('idle')) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    return { input, output, backend, app }
+  }
+  const settled = async (app, ms = 250) => {
+    let done = false
+    void app.then(() => { done = true }, () => { done = true })
+    await new Promise((resolve) => setTimeout(resolve, ms))
+    return done
+  }
+
+  try {
+    // One press only arms: it must warn and stay.
+    {
+      const { input, output, app } = await boot()
+      input.push('\u0003')
+      assert.equal(await settled(app), false, 'one press must not quit')
+      assert.match(stripAnsi(output.text), /press ctrl-c again/, 'the arming warning')
+      input.push('\u0004')
+      await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+    }
+
+    // Two presses inside the window quit.
+    {
+      const { input, app } = await boot()
+      input.push('\u0003')
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      input.push('\u0003')
+      assert.equal(await app, 0, 'the second press quits')
+    }
+
+    // Typing between the presses disarms: the second press arms again instead
+    // of quitting on a stale confirmation.
+    {
+      const { input, output, app } = await boot()
+      input.push('\u0003')
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      input.push('x')
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      input.push('\u0003')
+      assert.equal(await settled(app), false, 'typing must disarm the pending quit')
+      assert.match(stripAnsi(output.text), /press ctrl-c again/, 'it warns again')
+      input.push('\u0004')
+      await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+    }
+  } finally {
+    // Nothing to clean up: every branch above leaves the app finished.
   }
 })
 

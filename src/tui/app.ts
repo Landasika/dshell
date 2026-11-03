@@ -220,6 +220,12 @@ interface AppState {
   tpsSamples: TpsSample[]
   speedPrevious?: { at: number; tokens: number }
   escapeAt: number
+  /**
+   * When the first of the two quitting `Ctrl-C` presses landed. A second press
+   * inside the window is what actually leaves; the first only warns, so a
+   * reflex press can no longer drop a live session.
+   */
+  quitArmAt?: number
   /** Skill catalog last read for this session, reused by `/name` invocation. */
   skillCatalog?: { sessionId?: string; entries: SkillEntry[] }
   /** Provider/model catalog loaded by `/model`. */
@@ -267,6 +273,9 @@ interface QueueEntry {
 }
 
 const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 'displayName']
+
+/** How long a first `Ctrl-C` stays armed before it has to be pressed again. */
+const CTRL_C_WINDOW_MS = 2_000
 
 const PROVIDER_CREATE_FIELDS = ['id', 'displayName', 'baseURL', 'api', 'apiKeyEnv', 'models'] as const
 type ProviderCreateField = (typeof PROVIDER_CREATE_FIELDS)[number]
@@ -390,9 +399,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   // transcript().lines), so dragging past the top or bottom edge can scroll and
   // keep growing the range instead of being pinned to screen rows.
   // Auto-continue bookkeeping: once per interrupted turn, at most three per
-  // TUI lifetime, so a Host that keeps dying cannot loop us.
-  let autoContinued = new Set<number>()
+  // TUI lifetime, so a Host that keeps dying cannot loop us. The key is
+  // `sessionId:turn` because turn numbers restart at 1 in every session — a
+  // bare turn number would make session B's turn 1 look already continued
+  // just because session A's turn 1 was.
+  let autoContinued = new Set<string>()
   let autoContinueCount = 0
+  /**
+   * Ticket for `openSession`. Each attach bumps it; a reply from an older
+   * attempt is disposed instead of being allowed to replace the current one.
+   */
+  let sessionGeneration = 0
   let selectAnchor: { line: number; column: number } | null = null
   let selectFocus: { line: number; column: number } | null = null
   /** Screen-space anchor for a drag that started inside a panel (no scrolling). */
@@ -557,6 +574,28 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       // The Host is going away with us; a dead socket is not an error.
     }
     quit(0)
+  }
+
+  /**
+   * `Ctrl-C` never leaves on the first press. The first one arms and warns
+   * (with a second press inside the window doing the real thing), because the
+   * key is a reflex and this TUI owns no Agent state: quitting under a live
+   * turn or a pending question is the expensive mistake, not the extra key.
+   *
+   * `quitNow` is the action the second press runs: a plain `quit`, or the
+   * cancel-and-quit a running turn needs.
+   */
+  const confirmQuit = (label: string, quitNow: () => void): void => {
+    const now = Date.now()
+    const armed = state.quitArmAt
+    if (armed !== undefined && now - armed < CTRL_C_WINDOW_MS) {
+      state.quitArmAt = undefined
+      quitNow()
+      return
+    }
+    state.quitArmAt = now
+    toast(`press ctrl-c again within 2s to ${label}`)
+    schedule()
   }
 
   const onSignal = (): void => quit(0)
@@ -765,10 +804,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.startup = undefined
       return
     }
+    // Attaching is asynchronous, so two quick picks can overlap: A's reply may
+    // land after B's and silently take the screen back to a session the reader
+    // already left. Each attempt takes a ticket and only the newest one wins.
+    const generation = ++sessionGeneration
     try {
       state.status = `attaching ${shortId(sessionId)}`
       schedule()
       const next = await backend.openSession(sessionId)
+      if (generation !== sessionGeneration) {
+        // A newer pick superseded this one; drop the handle so its socket and
+        // listeners do not outlive the attempt.
+        next.dispose()
+        return
+      }
       state.handle?.dispose()
       state.handle = next
       state.currentId = sessionId
@@ -1300,11 +1349,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.error = undefined
         toast('host back · reattached')
         const interruptedTurn = lastInterruptedTurn(reopened.events)
-        if (interruptedTurn !== undefined && !autoContinued.has(interruptedTurn) && autoContinueCount < 3) {
+        const continuedKey = interruptedTurn === undefined ? undefined : `${sessionId}:${interruptedTurn}`
+        if (continuedKey !== undefined && !autoContinued.has(continuedKey) && autoContinueCount < 3) {
           // Full-auto: the durable context is intact, so continue the task
           // ourselves. Once per interrupted turn, and at most three times in
           // a TUI lifetime, so a Host that keeps dying cannot loop us.
-          autoContinued.add(interruptedTurn)
+          autoContinued.add(continuedKey)
           autoContinueCount += 1
           toast('task was interrupted · continuing automatically (/cancel to stop)')
           schedule()
@@ -2317,7 +2367,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       // Ctrl-C's reflex inside any panel is "close this", not "quit the TUI":
       // a plain quit here dropped the connection under a pending
       // ask_user_question and aborted it. Esc keeps its per-overlay semantics;
-      // Ctrl-C is the hard close.
+      // Ctrl-C is the hard close. Closing a panel also disarms any quit that
+      // was pending, so the next press starts the confirmation from scratch.
+      state.quitArmAt = undefined
       if (overlay.kind === 'questions') {
         if (overlay.customMode) {
           overlay.customMode = false
@@ -2877,14 +2929,21 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     const startup = state.startup
     if (startup === undefined) return
+    if (key.type === 'ctrl-c') {
+      // The startup list is where a mistyped key costs the least to confirm and
+      // the most to get wrong: a reflex press here closes the picker before a
+      // session was even chosen.
+      confirmQuit('quit', () => quit(0))
+      return
+    }
     if (startup.loading === true) {
       // Ignore enter/n until the list is real: creating a session by accident
       // while the Host is still answering would be surprising.
-      if (key.type === 'ctrl-c' || key.type === 'ctrl-d' || key.type === 'escape') quit(0)
+      if (key.type === 'ctrl-d' || key.type === 'escape') quit(0)
       else if (key.type === 'text' && key.text.toLowerCase() === 'q') quit(0)
       return
     }
-    if (key.type === 'ctrl-c' || key.type === 'ctrl-d' || key.type === 'escape') {
+    if (key.type === 'ctrl-d' || key.type === 'escape') {
       quit(0)
       return
     }
@@ -2913,6 +2972,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const handleKey = (key: Key): void => {
     if (state.quitting) return
+    // Any other key disarms a pending `Ctrl-C`: typing between the two presses
+    // is how the reader proves they did not mean to leave, so the next press
+    // starts the confirmation over instead of quitting on a stale arm.
+    if (key.type !== 'ctrl-c') state.quitArmAt = undefined
     if (key.type === 'focus') {
       // Coming back to the terminal: catch up on sessions and git state.
       if (key.focused) {
@@ -3026,15 +3089,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'ctrl-c') {
       if (state.editor.text.length > 0) {
+        // Clearing a draft is cheap and reversible; only an empty composer can
+        // reach the quit path, so the two presses are never eaten by a typo.
         state.editor = createEditor()
         state.historyIndex = -1
+        state.quitArmAt = undefined
         schedule()
       } else if (state.view?.status === 'running') {
-        // Ctrl-C quits AND stops the run: the turn is cancelled together with
-        // its live subagents, so nothing of this session outlives the TUI.
-        void cancelAndQuit()
+        // The turn is cancelled together with its live subagents, so nothing of
+        // this session outlives the TUI — but only on the confirming press.
+        confirmQuit('cancel the turn and quit', () => {
+          void cancelAndQuit()
+        })
       } else {
-        quit(0)
+        confirmQuit('quit', () => quit(0))
       }
       return
     }

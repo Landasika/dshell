@@ -227,7 +227,7 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Esc` (turn running) | cancel this turn — subagents keep running, TUI stays; outranks Esc's other duties (scroll-to-tail, close menu, clear draft) |
 | `Esc` (idle) | close menu / clear draft / jump to tail; `Esc` `Esc` rewinds to a previous prompt |
 | `Ctrl-C` (panel open) | close the panel / dismiss a pending question — never quits, so an ask cannot be aborted by reflex |
-| `Ctrl-C` (otherwise) | quit — and if a turn runs, cancel it **and kill its subagents** |
+| `Ctrl-C` `Ctrl-C` | quit — the first press only warns, the second (within 2s) leaves; if a turn runs it is cancelled **with its subagents**. Any other key in between disarms it |
 | `Ctrl-Z` / `Ctrl-D` / `/quit` | detach — quit now, the turn keeps running; `/sessions` reattaches |
 
 In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
@@ -299,7 +299,7 @@ change an answer behind your back. `Esc` leaves the ask pending for the Web UI.
 | `/model` | switch provider/model — `Enter` applies with the remembered reasoning level; `e` picks the level explicitly |
 | `/provider` | edit provider rows in `cordis.patch.yml` |
 | `/harness` | agent presets a session composes: persona, tools, overrides |
-| `/quit` | leave the TUI (detach — the Host turn keeps running; `Ctrl-C` stops it) |
+| `/quit` | leave the TUI (detach — the Host turn keeps running; `Ctrl-C` `Ctrl-C` stops it) |
 
 ## CLI
 

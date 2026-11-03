@@ -149,6 +149,9 @@ test('the TUI reports its session to herdr and releases on quit', async () => {
     assert.equal(report.params.agent, 'dshell')
     assert.equal(report.params.state, 'idle')
     assert.deepEqual(report.params.resume_argv, ['dshell', '--resume', 's1'])
+    // Quitting now takes two Ctrl-C presses: the first only arms the warning.
+    input.push('\u0003')
+    await new Promise((resolve) => setTimeout(resolve, 120))
     input.push('\u0003')
     await app
     await waitFor(() => requests.some((request) => request.method === 'pane.release_agent'))

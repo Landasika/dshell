@@ -83,6 +83,15 @@ export class FakeBackend implements DshellBackend {
   private readonly sessionModels = new Map<string, ModelSelection>()
   /** What the last `cancel` passed for killSubagents, for assertions. */
   lastCancelKilledSubagents = false
+  /**
+   * Test hook: delay each `openSession` by this many milliseconds, so a test
+   * can interleave two picks and prove the older reply does not win.
+   */
+  openSessionDelayMs = 0
+  /** Handles still open, so a test can prove a superseded attach was dropped. */
+  get openHandleCount(): number {
+    return this.handles.size
+  }
   /** Secrets stored through `storeProviderKey`, so tests can assert on them. */
   readonly storedKeys = new Map<string, string>()
   /** Providers the fake patch file declares; `updateProvider` mutates this. */
@@ -401,6 +410,10 @@ export class FakeBackend implements DshellBackend {
     const session = this.sessions.get(sessionId)
     if (session === undefined) {
       throw new BackendError('SESSION_NOT_FOUND', `session "${sessionId}" was not found`)
+    }
+    if (this.openSessionDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.openSessionDelayMs))
+      this.assertConnected()
     }
     const handle = new FakeSessionHandle(sessionId, this, session)
     this.handles.add(handle)
