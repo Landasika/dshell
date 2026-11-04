@@ -96,6 +96,11 @@ function createFakeCtx() {
         if (index >= 0) current.splice(index, 1)
       }
     },
+    /** 测试可替换的服务查找表（真实 dsh 由 cordis 容器提供）。 */
+    services: {},
+    get(name) {
+      return this.services[name]
+    },
     effect(fn) {
       this.disposers.push(fn())
     },
@@ -322,4 +327,49 @@ test('配对码只能换一次 token', async (t) => {
     body: JSON.stringify({ code, name: 'b' }),
   })
   assert.notEqual(second.status, 201, '同一个码第二次不该签发 token')
+})
+
+test('宠物连上即收到聚合 state（无需自己请求）', async (t) => {
+  const harness = await start(t)
+  harness.workspaces.set('w1', { id: 'w1', path: '/home/u/project', title: 'project' })
+  harness.sessions.set('busy', {
+    header: { id: 'busy', cwd: '/home/u/project', title: '正在跑', createdAt: 2000 },
+    events: [],
+    live: true,
+    persisted: true,
+  })
+  // `running` 来自 Host 的 sessionController 投影，不是 listSessions 的字段
+  harness.ctx.services.sessionController = {
+    list: async () => ({ items: [{ sessionId: 'busy', running: true, updatedAt: 5000 }] }),
+  }
+
+  const token = await issueToken(harness.port)
+  const pet = await WsClient.open(harness.port, token, '&client=pet')
+  t.after(() => pet.destroy())
+  pet.send({ type: 'hello', protocol: 2 })
+
+  const state = await pet.next('state', 6000)
+  assert.ok(Array.isArray(state.sessions), 'state.sessions 应是数组')
+  assert.equal(state.sessions.length, 1)
+  assert.equal(state.sessions[0].id, 'busy')
+  assert.equal(state.sessions[0].phase, 'working', 'running+working 应折叠成 working')
+  assert.equal(state.running, 1)
+  assert.equal(state.focus, '正在跑', 'focus 应指向运行中的会话')
+})
+
+test('宠物身份不影响 app 客户端收到的是自己的视图', async (t) => {
+  const harness = await start(t)
+  const token = await issueToken(harness.port)
+  const app = await WsClient.open(harness.port, token)
+  t.after(() => app.destroy())
+  app.send({ type: 'hello', protocol: 2 })
+  const welcome = await app.next('welcome')
+  assert.equal(welcome.protocol, 2)
+  // app 不该被自动推 state
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(
+    app.messages.filter((message) => message.type === 'state').length,
+    0,
+    'app 客户端不该收到 pet 的 state 推送',
+  )
 })

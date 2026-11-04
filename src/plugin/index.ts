@@ -575,6 +575,53 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const pendingInput = new Map<string, { at: number; value: 'approval' | 'question' | undefined }>()
   const titleCache = new Map<string, { at: number; title: string }>()
   const previewCache = new Map<string, { at: number; preview: string }>()
+  /**
+   * 一条会话当前处在什么相位。
+   *
+   * 输入是 Host 已经算好的投影（`running` / `needsInput` / `status`），
+   * 不是原始事件流——重扫事件既慢又会和 Host 的判断打架。
+   */
+  type PetPhase = 'idle' | 'thinking' | 'working' | 'waiting-approval' | 'completed' | 'error'
+  const phaseOf = (row: SessionSummary): PetPhase => {
+    // 等待用户输入优先级最高：宠物要立刻表现出"需要你"
+    if (row.needsInput === 'approval' || row.needsInput === 'question') return 'waiting-approval'
+    if (row.running === true) {
+      // `listSessions` 的 status 只有 running/live/idle 三值——"在调工具"与
+      // "在思考"的分界在事件日志里，而这份列表故意不读事件日志（那会很慢）。
+      // 所以统一报 `working`：对挂件来说"有活在跑"就够表达，不必知道细节。
+      return 'working'
+    }
+    if (row.status === 'error') return 'error'
+    if (row.status === 'completed') return 'completed'
+    return 'idle'
+  }
+
+  /** 组装并推送一份聚合状态。宠物连上时推一次，之后按需推。 */
+  const sendPetState = async (channel: Channel): Promise<void> => {
+    if (!channel.alive) return
+    try {
+      const rows = await listSessions(undefined, false)
+      if (!channel.alive) return
+      const sessions = rows.slice(0, 30).map((row) => ({
+        id: row.sessionId,
+        title: row.title ?? '',
+        phase: phaseOf(row),
+        updatedAt: row.updatedAt ?? row.createdAt ?? 0,
+        preview: row.preview ?? '',
+      }))
+      jsonLine(channel, {
+        type: 'state',
+        sessions,
+        running: sessions.filter((entry) => entry.phase === 'thinking' || entry.phase === 'working').length,
+        waitingApproval: sessions.filter((entry) => entry.phase === 'waiting-approval').length,
+        focus: sessions.find((entry) => entry.phase === 'thinking' || entry.phase === 'working')?.title ?? '',
+        at: Date.now(),
+      })
+    } catch {
+      // 状态是增值信息；取不到就不推，不能让宠物连接因此中断
+    }
+  }
+
   const SESSION_LIST_TIMEOUT_MS = 15_000
   const SESSION_CACHE_MS = 4_000
   const PREVIEW_CACHE_MS = 300_000
@@ -2581,6 +2628,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             sessions: [],
             workspaces: workspaceList(),
           })
+          // 状态订阅者连上就该看到当前状态，不该等它自己发 state。
+          // 放在 welcome 之后异步推：握手必须 O(1)，而 listSessions 可能慢。
+          if (channel.clientKind === 'pet') {
+            void sendPetState(channel)
+          }
           return
         }
         case 'ping':
@@ -2595,6 +2647,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         case 'workspaces':
           jsonLine(channel, { type: 'workspaces', workspaces: workspaceList() })
+          return
+        /**
+         * `state`：给状态订阅者（宠物）的聚合视图。
+         *
+         * 为什么在服务端算：一个挂件只需要"现在在干什么"，但如果让客户端
+         * 自己算，它就得订阅几十条会话的原始事件流。服务端本来就有这些数据，
+         * 折叠一次比让每个客户端各折叠一次便宜得多。
+         *
+         * 相位由 `listSessions` 的 running / needsInput 直接得出——这是 Host
+         * 已经算好的投影，不需要我们再扫事件。
+         */
+        case 'state':
+          await sendPetState(channel)
           return
         case 'workspace/create':
           await createWorkspace(channel, message)

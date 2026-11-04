@@ -54,6 +54,15 @@ export interface Channel {
    */
   onLine?: (line: string) => void
   onClose?: () => void
+
+  /**
+   * 客户端身份。决定推送视图：
+   * - `app`：完整会话操作 + 原始事件流（手机、桌面 GUI）
+   * - `pet`：只读，订阅聚合 `state`（常驻挂件）
+   *
+   * CLI 恒为 `app`——它能做所有事，由 unix socket 的文件权限保护。
+   */
+  clientKind?: 'app' | 'pet'
 }
 
 /**
