@@ -196,6 +196,32 @@ async function probeHealth(port: number): Promise<{ ok: boolean; fingerprint?: s
 }
 
 /** 组装二维码载荷。与 App 的 `PairPayload.parse` 一一对应。 */
+/**
+ * 配对二维码的载荷。
+ *
+ * ## 为什么不用 base64(JSON)
+ *
+ * 二维码的密度直接决定能不能扫上：手机对着电脑屏幕拍，模块越小越难解。
+ * 原先用 base64(JSON)，光是把 JSON 转成 base64 就撑大 33%，再加上字段名
+ * `{"v":1,"name":"...","hosts":[...],...}`，158 字符 → **版本 9、53×53 模块**，
+ * 终端渲染出来 57 列×29 行。真机上手机几乎扫不动。
+ *
+ * 现在换成紧凑的竖线分隔格式（`hosts>port>code>fp>name`），同样三个地址
+ * 只要 63 字符 → 版本 5、37×37 模块，小了一半，扫码明显容易。
+ *
+ * ## 格式
+ *
+ * ```
+ * dshell-pair://<hosts>|<port>|<code>|<fp>|<name>
+ * ```
+ *  - `hosts` 用逗号分隔（IPv4 / 主机名，不含端口）
+ *  - 后四个字段固定位置；`fp` 和 `name` 可以为空，但要保留分隔符，这样
+ *    "第几段是什么"永远是确定的，不用靠猜
+ *  - 竖线和逗号不会出现在 IPv4 / 主机名 / 配对码里（码的字母表是
+ *    `ABCDEFGHJKMNPQRSTUVWXYZ23456789`），所以不需要转义
+ *
+ * 解析端仍然兼容旧的 base64(JSON)：手里的旧二维码还没过期时扫它照样能配对。
+ */
 export function pairPayload(input: {
   name: string
   hosts: readonly string[]
@@ -203,15 +229,14 @@ export function pairPayload(input: {
   code: string
   fingerprint: string
 }): string {
-  const body = {
-    v: 1,
-    name: input.name,
-    hosts: [...input.hosts],
-    port: input.port,
-    code: input.code,
-    fp: input.fingerprint,
-  }
-  return `dshell-pair://${Buffer.from(JSON.stringify(body), 'utf8').toString('base64url')}`
+  const parts = [
+    [...input.hosts].join(','),
+    String(input.port),
+    input.code,
+    input.fingerprint,
+    input.name,
+  ]
+  return `dshell-pair://${parts.join('|')}`
 }
 
 /** 跑一次配对流程。 */
@@ -266,6 +291,14 @@ export function printRemote(result: RemoteResult, options: RemoteOptions = { por
 }
 
 /** 供测试用：把二维码载荷解回结构。 */
+/**
+ * 解出配对载荷。两种格式都认：
+ *  - 紧凑格式（当前）：`hosts|port|code|fp|name`
+ *  - base64(JSON)（旧版）：手里的旧二维码还没过期时照样能用
+ *
+ * 判断依据是**能不能按紧凑格式解析出合法的端口和配对码**，而不是靠前缀
+ * 版本号——旧码没有版本号，靠"像不像 JSON"来分更容易写错。
+ */
 export function decodePayload(payload: string): {
   v: number
   name: string
@@ -275,20 +308,49 @@ export function decodePayload(payload: string): {
   fp: string
 } {
   const text = payload.startsWith('dshell-pair://') ? payload.slice('dshell-pair://'.length) : payload
-  const parsed = JSON.parse(Buffer.from(text, 'base64url').toString('utf8')) as {
-    v?: unknown
-    name?: unknown
-    hosts?: unknown
-    port?: unknown
-    code?: unknown
-    fp?: unknown
+
+  const compact = decodeCompact(text)
+  if (compact) return compact
+
+  // 旧格式：base64(JSON)
+  try {
+    const parsed = JSON.parse(Buffer.from(text, 'base64url').toString('utf8')) as {
+      v?: unknown
+      name?: unknown
+      hosts?: unknown
+      port?: unknown
+      code?: unknown
+      fp?: unknown
+    }
+    return {
+      v: typeof parsed.v === 'number' ? parsed.v : 0,
+      name: typeof parsed.name === 'string' ? parsed.name : '',
+      hosts: Array.isArray(parsed.hosts) ? (parsed.hosts as string[]) : [],
+      port: typeof parsed.port === 'number' ? parsed.port : 0,
+      code: typeof parsed.code === 'string' ? parsed.code : '',
+      fp: typeof parsed.fp === 'string' ? parsed.fp : '',
+    }
+  } catch {
+    return { v: 0, name: '', hosts: [], port: 0, code: '', fp: '' }
   }
-  return {
-    v: typeof parsed.v === 'number' ? parsed.v : 0,
-    name: typeof parsed.name === 'string' ? parsed.name : '',
-    hosts: Array.isArray(parsed.hosts) ? (parsed.hosts as string[]) : [],
-    port: typeof parsed.port === 'number' ? parsed.port : 0,
-    code: typeof parsed.code === 'string' ? parsed.code : '',
-    fp: typeof parsed.fp === 'string' ? parsed.fp : '',
-  }
+}
+
+/** 试解紧凑格式；不像的话返回 null，交给旧格式兜底。 */
+function decodeCompact(text: string): {
+  v: number
+  name: string
+  hosts: string[]
+  port: number
+  code: string
+  fp: string
+} | null {
+  // base64 里不会出现 `|`，所以有竖线就一定是紧凑格式
+  if (!text.includes('|')) return null
+  const [hostsPart = '', portPart = '', code = '', fp = '', name = ''] = text.split('|')
+  const port = Number.parseInt(portPart, 10)
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
+  if (code.length === 0) return null
+  const hosts = hostsPart.split(',').map((h) => h.trim()).filter((h) => h.length > 0)
+  if (hosts.length === 0) return null
+  return { v: 2, name, hosts, port, code, fp }
 }

@@ -87,12 +87,52 @@ test('配对载荷与 App 的 PairPayload 字段一一对应', () => {
   })
   assert.ok(payload.startsWith('dshell-pair://'), 'App 只认这个前缀')
   const decoded = decodePayload(payload)
-  assert.equal(decoded.v, 1)
+  assert.equal(decoded.v, 2)
   assert.equal(decoded.name, 'pc')
   assert.deepEqual(decoded.hosts, ['192.168.8.77', '10.0.0.5'])
   assert.equal(decoded.port, 8792)
   assert.equal(decoded.code, 'ABCD2345')
   assert.equal(decoded.fp, 'fp-1', 'App 读的是 fp 而不是 fingerprint')
+})
+
+test('载荷用紧凑格式，让二维码足够小能扫上', () => {
+  // 这是换格式的目的本身：base64(JSON) 把三个地址撑到 158 字符 → 版本 9，
+  // 终端里 57 列×29 行，真机几乎扫不动。紧凑格式只要 80 字符 → 版本 5。
+  const hosts = ['192.168.8.200', '10.13.0.1', '10.254.0.14']
+  const payload = pairPayload({ name: 'landasika', hosts, port: 8792, code: 'VDGAVTZE', fingerprint: 'abc' })
+  assert.ok(!payload.includes('base64'), '不该再有 base64 痕迹')
+  assert.ok(payload.length < 100, `紧凑载荷应短于 100 字符，实际 ${payload.length}`)
+  // 竖线分隔、逗号分主机；顺序固定 hosts|port|code|fp|name
+  assert.equal(payload, 'dshell-pair://192.168.8.200,10.13.0.1,10.254.0.14|8792|VDGAVTZE|abc|landasika')
+})
+
+test('载荷允许空指纹/空名字，但保留分隔符', () => {
+  // 位置必须确定：不能靠"这段有没有"来猜哪段是什么
+  const payload = pairPayload({ name: '', hosts: ['10.0.0.1'], port: 8792, code: 'ABCD2345', fingerprint: '' })
+  const d = decodePayload(payload)
+  assert.deepEqual(d.hosts, ['10.0.0.1'])
+  assert.equal(d.code, 'ABCD2345')
+  assert.equal(d.fp, '')
+  assert.equal(d.name, '')
+})
+
+test('仍然能解旧的 base64(JSON) 载荷', () => {
+  // 旧二维码还有 5 分钟有效期，升级不能让它当场失效
+  const json = JSON.stringify({
+    v: 1, name: 'pc', hosts: ['192.168.8.77'], port: 8792, code: 'ABCD2345', fp: 'x',
+  })
+  const old = 'dshell-pair://' + Buffer.from(json, 'utf8').toString('base64url')
+  const d = decodePayload(old)
+  assert.equal(d.v, 1)
+  assert.deepEqual(d.hosts, ['192.168.8.77'])
+  assert.equal(d.code, 'ABCD2345')
+})
+
+test('垃圾输入不会抛异常', () => {
+  for (const bad of ['dshell-pair://', 'dshell-pair://garbage!!!', 'dshell-pair://a|b|c']) {
+    const d = decodePayload(bad)
+    assert.deepEqual(d.hosts, [], `"${bad}" 应解析成空主机列表`)
+  }
 })
 
 test('虚拟网卡被排除，隧道网卡保留', () => {
