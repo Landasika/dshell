@@ -24,6 +24,12 @@ interface Options {
   workspaceId?: string
   cwd?: string
   create?: boolean
+  /** (remote) WebSocket 端口，默认 8792。 */
+  port?: number
+  /** (remote) 同时把二维码存成 PNG。 */
+  png?: string
+  /** (remote) 只打印配对码和地址，不画二维码。 */
+  quiet?: boolean
 }
 
 const HELP = `dshell ${packageVersion()}
@@ -41,6 +47,7 @@ Usage:
   dshell prompt <sessionId> <text...>
   dshell steer <sessionId> <text...>
   dshell cancel <sessionId>
+  dshell remote [--port 8792]        show a pairing QR code for the phone App
 
 Options:
   --socket <path>     override the control socket
@@ -48,6 +55,9 @@ Options:
   --verbose           print context and lifecycle events
   --resume <id>, -r   open a session directly in the TUI
   --no-color          disable ANSI colors
+  --port <n>          (remote) WebSocket port the Host listens on
+  --png <path>        (remote) also save the QR code as a PNG
+  --quiet             (remote) print the code and addresses only, no QR
   -p, --print         one-shot mode; prompt from args or stdin
   --output-format <f> text | json | stream-json (default: text)
   --json              shorthand for --output-format json
@@ -74,6 +84,9 @@ function parseArgs(argv: string[]): Options {
   let command: string | undefined
   const args: string[] = []
   let socket: string | undefined
+  let port: number | undefined
+  let png: string | undefined
+  let quiet = false
   let timeoutMs = 120_000
   let verbose = false
   let resume: string | undefined
@@ -169,6 +182,26 @@ function parseArgs(argv: string[]): Options {
       index += 1
       continue
     }
+    if (arg === '--port') {
+      const value = Number(argv[index + 1])
+      if (!Number.isInteger(value) || value <= 0 || value > 65535) {
+        throw new DshellError('BAD_REQUEST', '--port requires a port number (1-65535)')
+      }
+      port = value
+      index += 1
+      continue
+    }
+    if (arg === '--png') {
+      const value = argv[index + 1]
+      if (value === undefined) throw new DshellError('BAD_REQUEST', '--png requires a file path')
+      png = value
+      index += 1
+      continue
+    }
+    if (arg === '--quiet') {
+      quiet = true
+      continue
+    }
     if (arg === '--timeout') {
       const value = Number(argv[index + 1])
       if (!Number.isFinite(value) || value <= 0) {
@@ -201,6 +234,9 @@ function parseArgs(argv: string[]): Options {
     ...(workspaceId === undefined ? {} : { workspaceId }),
     ...(cwd === undefined ? {} : { cwd }),
     ...(create ? { create } : {}),
+    ...(port === undefined ? {} : { port }),
+    ...(png === undefined ? {} : { png }),
+    ...(quiet ? { quiet } : {}),
   }
 }
 
@@ -530,6 +566,17 @@ export async function main(argv: string[]): Promise<void> {
           outputFormat: options.outputFormat,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
+        })
+        return
+      }
+      case 'remote': {
+        const { prepareRemote, printRemote } = await import('./remote.js')
+        const port = options.port ?? 8792
+        const result = await prepareRemote({ port })
+        printRemote(result, {
+          port,
+          ...(options.png === undefined ? {} : { png: options.png }),
+          ...(options.quiet === true ? { quiet: true } : {}),
         })
         return
       }
