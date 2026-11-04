@@ -21,6 +21,10 @@ import {
   closeSync,
 } from 'node:fs'
 import { createServer, Socket, type Server } from 'node:net'
+import { createServer as createHttpServer, type Server as HttpServer } from 'node:http'
+
+import { UnixSocketChannel, type Channel } from './channel.js'
+import { acceptUpgrade, WebSocketChannel } from './websocket.js'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 
 import {
@@ -50,6 +54,7 @@ import {
 import { resolveDshHome, resolveSocketPath } from '../shared/paths.js'
 import { latestUserPreview } from '../shared/session-events.js'
 import { advanceModelSelection, readModelSelection, type ModelSelectionState } from '../shared/model-selection.js'
+import { DeviceStore, PairCodes } from './devices.js'
 import { ApprovalCoordinator } from './approval.js'
 import { openHistory, historyEvents, type HarnessHistoryOwner } from './harness-history.js'
 import {
@@ -85,6 +90,18 @@ export const inject = [
 
 export interface Config {
   socketPath?: string
+  /**
+   * WebSocket 监听端口，给手机 App 与桌面宠物用。
+   *
+   * 它们和 CLI 共用同一个中枢：订阅表、广播、审批协调都是同一份，所以
+   * 手机上点的审批桌面立刻能看到，多端天然同步。省略则不开放网络端口
+   * （只有本机 CLI 能用）。
+   */
+  wsPort?: number
+  /** WebSocket 绑定的地址。默认 0.0.0.0（手机要通过局域网连）。 */
+  wsHost?: string
+  /** 设备表路径；默认 `$DSH_HOME/dshell-ws/devices.json`。 */
+  deviceFile?: string
   /** Hard fail-closed deadline for an unanswered CLI approval. */
   approvalTimeoutMs?: number
   /**
@@ -369,20 +386,25 @@ function mappedError(error: unknown): ErrorMessage {
   return { type: 'error', code: 'INTERNAL', message }
 }
 
-const rpcContext = new AsyncLocalStorage<{ socket: Socket; rpcId?: string }>()
+const rpcContext = new AsyncLocalStorage<{ channel: Channel; rpcId?: string }>()
 const BROADCAST_TYPES = new Set(['event', 'stream', 'status', 'approval-request', 'approval-resolved', 'question/request', 'question/closed'])
-function jsonLine(socket: Socket, message: unknown): void {
-  if (socket.destroyed || !socket.writable) return
-  try {
-    const context = rpcContext.getStore()
-    const payload = message as { type?: string }
-    const outgoing = context?.socket === socket && context.rpcId && !BROADCAST_TYPES.has(payload.type ?? '')
-      ? { ...payload, rpcId: context.rpcId } : payload
-    if (socket.writableLength > 16 * 1024 * 1024) { socket.destroy(); return }
-    socket.write(JSON.stringify(outgoing) + '\n')
-  } catch {
-    // The peer may reset between the writable check and the write.
-  }
+/**
+ * 写一条消息给某个通道。
+ *
+ * 改造前这里直接操作 `net.Socket`（检查 destroyed/writable、16MB 积压、
+ * 手动加换行）。那些都属于传输细节，现在由 `Channel` 实现自己负责，
+ * 中枢只表达"发这条消息"。
+ *
+ * `rpcId` 回填逻辑不变：只有当前 RPC 的发起通道拿得到它，广播类型不回填
+ * （否则一次广播会把某个客户端的 rpcId 泄漏给所有人）。
+ */
+function jsonLine(channel: Channel, message: unknown): void {
+  if (!channel.alive) return
+  const context = rpcContext.getStore()
+  const payload = message as { type?: string }
+  const outgoing = context?.channel === channel && context.rpcId && !BROADCAST_TYPES.has(payload.type ?? '')
+    ? { ...payload, rpcId: context.rpcId } : payload
+  channel.write(outgoing)
 }
 
 /**
@@ -515,11 +537,20 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const socketPath = resolveSocketPath(config.socketPath)
   await prepareSocketPath(socketPath)
 
-  const clients = new Set<Socket>()
-  const watched = new Map<Socket, Set<string>>()
+  /**
+   * WebSocket 相关的凭据。
+   *
+   * unix socket 靠文件权限保护，网络端口没有这层保护——任何能访问端口的人
+   * 都能对会话发 prompt。所以 WS 客户端必须持 token，而 CLI 不需要。
+   */
+  const devices = new DeviceStore(config.deviceFile)
+  const pairCodes = new PairCodes()
+
+  const clients = new Set<Channel>()
+  const watched = new Map<Channel, Set<string>>()
   const handles = new Map<string, AgentHandleLike>()
   const resuming = new Map<string, Promise<AgentHandleLike>>()
-  const queues = new WeakMap<Socket, Promise<void>>()
+  const queues = new WeakMap<Channel, Promise<void>>()
   const approvalTimeoutMs = config.approvalTimeoutMs ?? 120_000
   let closing = false
 
@@ -773,11 +804,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     finally { if (resuming.get(sessionId) === operation) resuming.delete(sessionId) }
   }
 
-  const sendError = (socket: Socket, error: ErrorMessage): void => {
-    jsonLine(socket, error)
+  const sendError = (channel: Channel, error: ErrorMessage): void => {
+    jsonLine(channel, error)
   }
 
-  const sessionAction = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const sessionAction = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const sessionId = typeof message.sessionId === 'string' ? message.sessionId : ''
     if (!sessionId) throw new Error('session action requires a sessionId')
     const controller = sessionController()
@@ -807,7 +838,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         await (message.pinned === false ? registry.unpinSession(sessionId) : registry.pinSession(sessionId))
         break
       default:
-        sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'physical deletion is unavailable; archive the session instead' })
+        sendError(channel, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'physical deletion is unavailable; archive the session instead' })
         return
     }
     if (message.type === 'session/pin') result = { ...result, pinned: message.pinned !== false }
@@ -818,11 +849,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       : message.type === 'session/archive' ? registry?.archiveSession
       : message.type === 'session/restore' ? registry?.unarchiveSession : registry?.pinSession
     if (!supported) {
-      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'Host does not support this session action' })
+      sendError(channel, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'Host does not support this session action' })
       return
     }
     sessionCache.clear()
-    jsonLine(socket, { type: 'session-updated', sessionId, action: String(message.type).slice(8), ...result })
+    jsonLine(channel, { type: 'session-updated', sessionId, action: String(message.type).slice(8), ...result })
   }
 
   const sessionController = (): SessionControllerLike | undefined => {
@@ -918,10 +949,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }))
   }
 
-  const forwardModelCatalog = async (socket: Socket): Promise<void> => {
+  const forwardModelCatalog = async (channel: Channel): Promise<void> => {
     const controller = sessionController()
     if (controller === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host mounts no session controller, so it cannot list models',
@@ -931,7 +962,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const catalog = await controller.modelCatalog()
     await annotateCatalogRoutes(catalog)
-    jsonLine(socket, { type: 'model-catalog', catalog })
+    jsonLine(channel, { type: 'model-catalog', catalog })
   }
 
   const parseSelection = (message: Record<string, unknown>): ModelSelection | undefined => {
@@ -944,11 +975,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     return { provider, model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
   }
 
-  const selectModel = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const selectModel = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const sessionId = typeof message.sessionId === 'string' ? message.sessionId : ''
     const selection = parseSelection(message)
     if (sessionId.length === 0 || selection === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'model/select needs sessionId, provider and model',
@@ -957,7 +988,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const controller = sessionController()
     if (controller === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host mounts no session controller, so it cannot switch models',
@@ -966,18 +997,18 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     const { selected } = await controller.selectModel({ sessionId, ...selection })
-    jsonLine(socket, { type: 'model-selected', sessionId, selected })
+    jsonLine(channel, { type: 'model-selected', sessionId, selected })
   }
 
-  const setDefaultModel = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const setDefaultModel = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const selection = parseSelection(message)
     if (selection === undefined) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'model/default needs provider and model' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'model/default needs provider and model' })
       return
     }
     const defaults = ctx.agentDefaultModel
     if (defaults?.saveSelection === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host cannot save a default model',
@@ -986,7 +1017,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     await defaults.saveSelection(selection)
-    jsonLine(socket, { type: 'model-selected', selected: selection, savedAsDefault: true })
+    jsonLine(channel, { type: 'model-selected', selected: selection, savedAsDefault: true })
   }
 
   /**
@@ -1076,10 +1107,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
   }
 
-  const listSkills = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const listSkills = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const registry = skillRegistry()
     if (registry === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'SKILLS_UNAVAILABLE',
         message: 'this Host has no skills registry',
@@ -1099,7 +1130,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       const summaries = await registry.list({ ...(cwd === undefined ? {} : { cwd }), ...(scope === undefined ? {} : { scope }) })
       skills = summaries.map(toSkillEntry)
     } catch (error) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'SKILLS_FAILED',
         message: errorText(error),
@@ -1107,7 +1138,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    jsonLine(socket, {
+    jsonLine(channel, {
       type: 'skills',
       ...(cwd === undefined ? {} : { cwd }),
       ...(scope === undefined ? {} : { scoped: true }),
@@ -1116,11 +1147,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
   }
 
-  const getSkill = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const getSkill = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const registry = skillRegistry()
     const name = typeof message.name === 'string' ? message.name.trim() : ''
     if (registry === undefined || name.length === 0) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'SKILLS_UNAVAILABLE',
         message: name.length === 0 ? 'skills/get needs a name' : 'this Host has no skills registry',
@@ -1133,7 +1164,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     try {
       const skill = await registry.get(name, { ...(cwd === undefined ? {} : { cwd }), ...(scope === undefined ? {} : { scope }) })
       if (skill === undefined) {
-        sendError(socket, {
+        sendError(channel, {
           type: 'error',
           code: 'SKILL_MISSING',
           message: `skill "${name}" is not loadable`,
@@ -1141,9 +1172,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         })
         return
       }
-      jsonLine(socket, { type: 'skill', name: skill.name, content: skill.content })
+      jsonLine(channel, { type: 'skill', name: skill.name, content: skill.content })
     } catch (error) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'SKILLS_FAILED',
         message: errorText(error),
@@ -1206,9 +1237,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * intended. A near-miss (indentation drift, quoting slip) refuses the write
    * and leaves the file untouched.
    */
-  const persistProviders = async (socket: Socket, file: string, after: string, expected: ProviderEntry[], before = providerText(file)): Promise<boolean> => {
+  const persistProviders = async (channel: Channel, file: string, after: string, expected: ProviderEntry[], before = providerText(file)): Promise<boolean> => {
     if (JSON.stringify(providerSignature(expected)) !== JSON.stringify(providerSignature(readProviderEntries(after)))) {
-      sendError(socket, { type: 'error', code: 'INTERNAL', message: 'edited configuration does not match the requested providers' })
+      sendError(channel, { type: 'error', code: 'INTERNAL', message: 'edited configuration does not match the requested providers' })
       return false
     }
     const editor = configEditor()
@@ -1235,7 +1266,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         })
       } catch (error) {
         if (/configuration changed; reload providers and retry/i.test(errorText(error))) {
-          sendError(socket, { type: 'error', code: 'CONFIG_CONFLICT', message: errorText(error) })
+          sendError(channel, { type: 'error', code: 'CONFIG_CONFLICT', message: errorText(error) })
           return false
         }
         throw error
@@ -1249,7 +1280,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     try {
       fd = openSync(lock, 'wx', 0o600)
       if (safeRead(file) !== before) {
-        sendError(socket, { type: 'error', code: 'CONFIG_CONFLICT', message: 'configuration changed; reload providers and retry' })
+        sendError(channel, { type: 'error', code: 'CONFIG_CONFLICT', message: 'configuration changed; reload providers and retry' })
         return false
       }
       writeFileSync(temporary, after, { mode: 0o600, flag: 'wx' })
@@ -1271,10 +1302,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
   }
 
-  const listProviders = (socket: Socket): void => {
+  const listProviders = (channel: Channel): void => {
     const file = providerFile()
     if (file === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host found no cordis.patch.yml to read providers from',
@@ -1282,7 +1313,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    jsonLine(socket, {
+    jsonLine(channel, {
       type: 'provider-list',
       file,
       writable: providerWritable(file),
@@ -1291,7 +1322,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
   }
 
-  const saveProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const saveProvider = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     const changes = typeof message.changes === 'object' && message.changes !== null
       ? message.changes as Record<string, unknown>
@@ -1299,12 +1330,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const apiKey = typeof message.apiKey === 'string' && message.apiKey.trim().length > 0 ? message.apiKey.trim() : undefined
     const fields = Object.keys(changes).filter(isProviderField)
     if (providerId.length === 0 || (fields.length === 0 && apiKey === undefined)) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/save needs providerId and at least one field or key' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'provider/save needs providerId and at least one field or key' })
       return
     }
     const file = providerFile()
     if (file === undefined || !providerWritable(file)) {
-      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: file === undefined ? 'this Host found no provider configuration' : `${file} is not writable` })
+      sendError(channel, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: file === undefined ? 'this Host found no provider configuration' : `${file} is not writable` })
       return
     }
     const before = providerText(file)
@@ -1313,7 +1344,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     let ownerPrefix: string | undefined
     const store = apiKey === undefined ? undefined : credentialStore()
     if (apiKey !== undefined && store === undefined) {
-      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host has no credential store' })
+      sendError(channel, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host has no credential store' })
       return
     }
     let after = before
@@ -1335,12 +1366,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       }
     } catch (error) {
       if (ref !== undefined) await store?.unset(ref).catch(() => undefined)
-      if (error instanceof ProviderEditError) { sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message }); return }
+      if (error instanceof ProviderEditError) { sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: error.message }); return }
       throw error
     }
     let committed = false
     try {
-      committed = after === before || await persistProviders(socket, file, after, readProviderEntries(after), before)
+      committed = after === before || await persistProviders(channel, file, after, readProviderEntries(after), before)
       if (!committed) return
     } finally {
       if (!committed && ref !== undefined) await store?.unset(ref).catch(() => undefined)
@@ -1349,15 +1380,15 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       && !readProviderEntries(after).some(row => row.id !== providerId && row.apiKeyEnv === detail.apiKeyEnv)) {
       await store?.unset(detail.apiKeyEnv).catch(() => undefined)
     }
-    jsonLine(socket, { type: 'provider-saved', file, providerId, fields, ...(ref === undefined ? {} : { ref }), source: providerSource(), providers: providerRows() })
+    jsonLine(channel, { type: 'provider-saved', file, providerId, fields, ...(ref === undefined ? {} : { ref }), source: providerSource(), providers: providerRows() })
   }
 
-  const updateProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const updateProvider = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     const field = typeof message.field === 'string' ? message.field : ''
     const value = typeof message.value === 'string' ? message.value : ''
     if (providerId.length === 0 || !isProviderField(field)) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'provider/update needs providerId and one of baseURL, apiKeyEnv, displayName',
@@ -1366,7 +1397,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const file = providerFile()
     if (file === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host found no cordis.patch.yml to write providers to',
@@ -1375,7 +1406,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     if (!providerWritable(file)) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: `${file} is not writable`,
@@ -1384,7 +1415,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     if (field === 'baseURL' && !/^https?:\/\/[^\s]+$/.test(value.trim())) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'baseURL must be an absolute http(s) URL',
@@ -1392,7 +1423,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     if (field === 'apiKeyEnv' && !/^[A-Z][A-Z0-9_]*$/.test(value.trim())) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'apiKeyEnv must be an upper-case environment variable name',
@@ -1405,7 +1436,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       after = setProviderField(before, providerId, field, value)
     } catch (error) {
       if (error instanceof ProviderEditError) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: error.message })
         return
       }
       throw error
@@ -1418,9 +1449,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         else edited[field] = value.trim()
         return edited
       })
-      if (!await persistProviders(socket, file, after, expected, before)) return
+      if (!await persistProviders(channel, file, after, expected, before)) return
     }
-    jsonLine(socket, {
+    jsonLine(channel, {
       type: 'provider-updated',
       file,
       providerId,
@@ -1448,12 +1479,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * Host's credential store and `apiKeyEnv` in the patch file is pointed at
    * the reference that reads it back. The secret itself never lands in YAML.
    */
-  const storeProviderKey = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const storeProviderKey = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     const value = typeof message.value === 'string' ? message.value.trim() : ''
     const store = credentialStore()
     if (providerId.length === 0 || value.length === 0) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'provider/api-key needs providerId and the key value',
@@ -1461,7 +1492,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     if (store === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host has no credential store',
@@ -1471,7 +1502,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const file = providerFile()
     if (file === undefined || !providerWritable(file)) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: file === undefined
@@ -1489,7 +1520,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     await store.set(ref, value)
     let committed = false
     try {
-      committed = after === before || await persistProviders(socket, file, after, expected, before)
+      committed = after === before || await persistProviders(channel, file, after, expected, before)
       if (!committed) return
     } finally {
       if (!committed) await store.unset(ref)
@@ -1498,7 +1529,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (detail.apiKeyEnv?.startsWith('DSHELL_' + owner + '_') && !readProviderEntries(after).some(row => row.id !== providerId && row.apiKeyEnv === detail.apiKeyEnv)) {
       await store.unset(detail.apiKeyEnv).catch(() => undefined)
     }
-    jsonLine(socket, {
+    jsonLine(channel, {
       type: 'provider-key-stored',
       credentialsFile: '~/.dsh/.credentials.yaml',
       ref,
@@ -1513,17 +1544,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * Anthropic spelling). Discovery is adoption, not sync: the reply is
    * candidate ids for the draft — `cordis.patch.yml` stays authoritative.
    */
-  const discoverProviderModels = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const discoverProviderModels = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const baseURL = typeof message.baseURL === 'string' ? message.baseURL.trim() : ''
     const api = typeof message.api === 'string' && message.api.length > 0 ? message.api : undefined
     const apiKey = typeof message.apiKey === 'string' && message.apiKey.length > 0 ? message.apiKey : undefined
     const llm = llmDiscovery()
     if (baseURL.length === 0 || !/^https?:\/\/[^\s]+$/.test(baseURL)) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/discover needs an absolute http(s) baseURL' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'provider/discover needs an absolute http(s) baseURL' })
       return
     }
     if (llm === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host exposes no model discovery',
@@ -1543,22 +1574,22 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           ...(typeof model.maxTokens === 'number' ? { maxTokens: model.maxTokens } : {}),
         })
       }
-      jsonLine(socket, { type: 'provider-discovered', models })
+      jsonLine(channel, { type: 'provider-discovered', models })
     } catch (error) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error instanceof Error ? error.message : String(error) })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: error instanceof Error ? error.message : String(error) })
     }
   }
 
   /** Diff one configured provider's model list against its upstream listing. */
-  const syncPlan = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const syncPlan = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     const llm = llmDiscovery()
     if (providerId.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/sync-plan needs providerId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'provider/sync-plan needs providerId' })
       return
     }
     if (llm === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host exposes no model discovery',
@@ -1568,12 +1599,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const file = providerFile()
     if (file === undefined) {
-      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host found no cordis.patch.yml to read providers from' })
+      sendError(channel, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host found no cordis.patch.yml to read providers from' })
       return
     }
     const detail = readProviderDetail(providerText(file), providerId)
     if (detail.baseURL === undefined) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: `provider ${providerId} declares no baseURL to list models from` })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: `provider ${providerId} declares no baseURL to list models from` })
       return
     }
     try {
@@ -1586,24 +1617,24 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       const declared = new Set(detail.modelIds)
       const added = [...upstream].filter((id) => !declared.has(id)).sort()
       const removed = detail.modelIds.filter((id) => !upstream.has(id))
-      jsonLine(socket, { type: 'provider-sync-plan', providerId, added, removed, kept: declared.size - removed.length })
+      jsonLine(channel, { type: 'provider-sync-plan', providerId, added, removed, kept: declared.size - removed.length })
     } catch (error) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error instanceof Error ? error.message : String(error) })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: error instanceof Error ? error.message : String(error) })
     }
   }
 
   /** Apply a sync: adopt new ids, optionally drop the gone ones. */
-  const syncApply = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const syncApply = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     const add = Array.isArray(message.add) ? message.add.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
     const remove = Array.isArray(message.remove) ? message.remove.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
     const file = providerFile()
     if (providerId.length === 0 || (add.length === 0 && remove.length === 0)) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/sync-apply needs providerId and something to change' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'provider/sync-apply needs providerId and something to change' })
       return
     }
     if (file === undefined || !providerWritable(file)) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: file === undefined ? 'this Host found no cordis.patch.yml to write providers to' : `${file} is not writable`,
@@ -1616,17 +1647,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       after = syncProviderModels(before, providerId, add, remove)
     } catch (error) {
       if (error instanceof ProviderEditError) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: error.message })
         return
       }
       throw error
     }
     const expected = providerRows().map(row => row.id !== providerId ? row : { ...row, models: readProviderDetail(after, providerId).modelIds.length })
-    if (after !== before && !await persistProviders(socket, file, after, expected, before)) return
-    jsonLine(socket, { type: 'provider-sync-applied', file, providerId, providers: providerRows() })
+    if (after !== before && !await persistProviders(channel, file, after, expected, before)) return
+    jsonLine(channel, { type: 'provider-sync-applied', file, providerId, providers: providerRows() })
   }
 
-  const createProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const createProvider = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     const baseURL = typeof message.baseURL === 'string' ? message.baseURL.trim() : ''
     const apiKeyEnv = typeof message.apiKeyEnv === 'string' ? message.apiKeyEnv.trim() : ''
@@ -1639,7 +1670,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           .filter((model) => model.length > 0)
       : []
     if (providerId.length === 0 || baseURL.length === 0 || models.length === 0) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'provider/create needs providerId, baseURL and at least one model id',
@@ -1647,16 +1678,16 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     if (!/^https?:\/\/[^\s]+$/.test(baseURL)) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'baseURL must be an absolute http(s) URL' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'baseURL must be an absolute http(s) URL' })
       return
     }
     if (apiKeyEnv.length > 0 && !/^[A-Z][A-Z0-9_]*$/.test(apiKeyEnv)) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'apiKeyEnv must be an upper-case environment variable name' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'apiKeyEnv must be an upper-case environment variable name' })
       return
     }
     const file = providerFile()
     if (file === undefined || !providerWritable(file)) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: file === undefined ? 'this Host found no cordis.patch.yml' : `${file} is not writable`,
@@ -1677,7 +1708,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
     } catch (error) {
       if (error instanceof ProviderEditError) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: error.message })
         return
       }
       throw error
@@ -1689,19 +1720,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
       ...(displayName.length === 0 ? {} : { displayName }),
     }
-    if (!await persistProviders(socket, file, after, [...providerRows(), entry], before)) return
-    jsonLine(socket, { type: 'provider-created', file, providerId, providers: providerRows() })
+    if (!await persistProviders(channel, file, after, [...providerRows(), entry], before)) return
+    jsonLine(channel, { type: 'provider-created', file, providerId, providers: providerRows() })
   }
 
-  const deleteProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const deleteProvider = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
     if (providerId.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/delete needs providerId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'provider/delete needs providerId' })
       return
     }
     const file = providerFile()
     if (file === undefined || !providerWritable(file)) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: file === undefined ? 'this Host found no cordis.patch.yml' : `${file} is not writable`,
@@ -1715,19 +1746,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       after = removeProvider(before, providerId)
     } catch (error) {
       if (error instanceof ProviderEditError) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: error.message })
         return
       }
       throw error
     }
     const expected = providerRows().filter((row) => row.id !== providerId)
-    if (!await persistProviders(socket, file, after, expected, before)) return
-    jsonLine(socket, { type: 'provider-deleted', file, providerId, providers: providerRows() })
+    if (!await persistProviders(channel, file, after, expected, before)) return
+    jsonLine(channel, { type: 'provider-deleted', file, providerId, providers: providerRows() })
   }
 
-  const restartHost = async (socket: Socket): Promise<void> => {
+  const restartHost = async (channel: Channel): Promise<void> => {
     if (process.versions.electron !== undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'the Host runs inside Electron, so it cannot re-exec itself',
@@ -1737,7 +1768,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const argv = process.argv.slice(1)
     if (argv.length === 0) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'the Host cannot infer how it was launched',
@@ -1748,7 +1779,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     try {
       accessSync(process.execPath, fsConstants.X_OK)
     } catch {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'INTERNAL',
         message: `could not re-exec the Host: ${process.execPath} is not executable`,
@@ -1756,7 +1787,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    jsonLine(socket, { type: 'host-restarting', pid: process.pid, argv })
+    jsonLine(channel, { type: 'host-restarting', pid: process.pid, argv })
     // Close BEFORE spawning the replacement: Node's server.close() removes
     // the socket file at this path, so closing after the spawn races the
     // replacement's own bind and can delete its freshly-created socket
@@ -1778,39 +1809,39 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     process.exit(0)
   }
 
-  const historyCuts = new Map<Socket, Map<string, number>>()
+  const historyCuts = new Map<Channel, Map<string, number>>()
 
-  const watch = (socket: Socket, sessionId: string): Set<string> => {
-    let sessions = watched.get(socket)
+  const watch = (channel: Channel, sessionId: string): Set<string> => {
+    let sessions = watched.get(channel)
     if (sessions === undefined) {
       sessions = new Set()
-      watched.set(socket, sessions)
+      watched.set(channel, sessions)
     }
     sessions.add(sessionId)
     return sessions
   }
 
-  const unwatch = (socket: Socket, sessionId?: string): void => {
+  const unwatch = (channel: Channel, sessionId?: string): void => {
     if (sessionId === undefined) {
-      watched.delete(socket)
+      watched.delete(channel)
       return
     }
-    const sessions = watched.get(socket)
+    const sessions = watched.get(channel)
     if (sessions === undefined) return
     sessions.delete(sessionId)
-    if (sessions.size === 0) watched.delete(socket)
+    if (sessions.size === 0) watched.delete(channel)
   }
 
-  const watchersFor = (sessionId: string): Socket[] => {
-    const result: Socket[] = []
-    for (const [socket, sessions] of watched) {
-      if (!socket.destroyed && sessions.has(sessionId)) result.push(socket)
+  const watchersFor = (sessionId: string): Channel[] => {
+    const result: Channel[] = []
+    for (const [channel, sessions] of watched) {
+      if (channel.alive && sessions.has(sessionId)) result.push(channel)
     }
     return result
   }
 
   const broadcast = (sessionId: string, message: unknown): void => {
-    for (const socket of watchersFor(sessionId)) jsonLine(socket, message)
+    for (const watcher of watchersFor(sessionId)) jsonLine(watcher, message)
   }
 
   const approvals = new ApprovalCoordinator({
@@ -2030,9 +2061,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const disposeQuestion = ctx.on('user-questions/request', handleQuestion as never, { global: true, prepend: true })
 
   /** Refuse an answer whose request already settled (a second TUI window). */
-  const lateQuestionAnswer = (socket: Socket, callId: string): boolean => {
+  const lateQuestionAnswer = (channel: Channel, callId: string): boolean => {
     if (!settledAsks.has(callId)) return false
-    sendError(socket, {
+    sendError(channel, {
       type: 'error',
       code: 'QUESTION_NOT_PENDING',
       message: `question ${callId} was already answered`,
@@ -2040,9 +2071,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     return true
   }
 
-  const attach = async (socket: Socket, sessionId: unknown): Promise<void> => {
+  const attach = async (channel: Channel, sessionId: unknown): Promise<void> => {
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'attach requires a sessionId',
@@ -2050,11 +2081,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
 
-    if (socket.destroyed) return
+    if (!channel.alive) return
     // Subscribe before reading: an event emitted between the read and the
     // subscription would otherwise be lost. The client buffers messages
     // until `attached`, then dedupes them by seq.
-    watch(socket, sessionId)
+    watch(channel, sessionId)
     let snapshot: { session: SessionHeader; events: SessionEvent[] }
     let hasMore = false
     let modelSelection: ModelSelection | undefined
@@ -2069,8 +2100,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         const selection = openingEvents.reduce(advanceModelSelection, {} as ModelSelectionState)
         modelSelection = readModelSelection(projection?.next ?? projection?.lastUsed) ?? selection.pending ?? selection.lastUsed
         modelSelectionLastUsed = readModelSelection(projection?.lastUsed) ?? selection.lastUsed
-        historyCuts.get(socket)?.set(sessionId, opening.cursor)
-        if (!historyCuts.has(socket)) historyCuts.set(socket, new Map([[sessionId, opening.cursor]]))
+        historyCuts.get(channel)?.set(sessionId, opening.cursor)
+        if (!historyCuts.has(channel)) historyCuts.set(channel, new Map([[sessionId, opening.cursor]]))
         // The owner budgets messages, which can contain thousands of tool or
         // telemetry events. Bound our transport in events as well.
         hasMore = opening.hasMore || openingEvents.length > snapshot.events.length
@@ -2083,21 +2114,21 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         hasMore = all.events.length > 500
       }
     } catch (error) {
-      unwatch(socket, sessionId)
+      unwatch(channel, sessionId)
       throw error
     }
     for (const pending of questionRequests.values()) if (pending.sessionId === sessionId) holdQuestion(pending)
     const status = ctx.agents.get(sessionId)?.status ?? (openTurn(snapshot.events) ? 'running' : 'idle')
-    jsonLine(socket, {
+    jsonLine(channel, {
       type: 'attached', sessionId, header: snapshot.session,
-      cursor: historyCuts.get(socket)?.get(sessionId) ?? snapshot.events.at(-1)?.seq ?? -1,
+      cursor: historyCuts.get(channel)?.get(sessionId) ?? snapshot.events.at(-1)?.seq ?? -1,
       events: snapshot.events, hasMore, status,
       ...(modelSelection === undefined ? {} : { modelSelection }),
       ...(modelSelectionLastUsed === undefined ? {} : { modelSelectionLastUsed }),
       approvals: approvals.snapshot(sessionId),
       questions: [...questionRequests.values()].filter(p => p.sessionId === sessionId).map(p => p.message),
     })
-    jsonLine(socket, { type: 'status', sessionId, status })
+    jsonLine(channel, { type: 'status', sessionId, status })
   }
 
   /** True when the newest turn event in a snapshot is a `turn/start`. */
@@ -2110,16 +2141,16 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     return false
   }
 
-  const history = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const history = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'session/history requires a sessionId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'session/history requires a sessionId' })
       return
     }
     const limit = typeof message.limit === 'number' && Number.isFinite(message.limit)
       ? Math.min(200, Math.max(1, Math.floor(message.limit))) : 50
     const before = typeof message.before === 'number' && Number.isSafeInteger(message.before) ? message.before : undefined
     const controller = sessionController()
-    const throughSeq = historyCuts.get(socket)?.get(message.sessionId)
+    const throughSeq = historyCuts.get(channel)?.get(message.sessionId)
     let events: SessionEvent[], hasMore: boolean
     if (controller?.page && throughSeq !== undefined) {
       const page = await controller.page({ address: { kind: 'session', sessionId: message.sessionId }, throughSeq,
@@ -2135,13 +2166,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const reply: HistoryMessage = { type: 'history', sessionId: message.sessionId, events,
       cursor: events[0]?.seq ?? -1, hasMore }
-    jsonLine(socket, reply)
+    jsonLine(channel, reply)
   }
 
-  const createWorkspace = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const createWorkspace = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const registry = ctx.workspaceRegistry
     if (registry === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host has no workspace registry',
@@ -2149,17 +2180,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     if (typeof message.path !== 'string' || message.path.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'workspace/create requires a path' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'workspace/create requires a path' })
       return
     }
     await registry.create(message.path, typeof message.title === 'string' ? message.title : undefined)
-    jsonLine(socket, { type: 'workspaces', workspaces: workspaceList() })
+    jsonLine(channel, { type: 'workspaces', workspaces: workspaceList() })
   }
 
-  const createSession = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const createSession = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     const registry = ctx.workspaceRegistry
     if (registry === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'UNSUPPORTED_CAPABILITY',
         message: 'this Host has no workspace registry, so dshell cannot create a session',
@@ -2174,14 +2205,14 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : { cwd: typeof message.cwd === 'string' ? message.cwd : process.cwd() }),
       })
       const snapshot = await ctx.sessionQuery.readSession(created.sessionId)
-      jsonLine(socket, { type: 'session-created', sessionId: created.sessionId, header: snapshot.session, ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : {}) })
+      jsonLine(channel, { type: 'session-created', sessionId: created.sessionId, header: snapshot.session, ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : {}) })
       return
     }
     let workspace: WorkspaceLike | undefined
     if (typeof message.workspaceId === 'string' && message.workspaceId.length > 0) {
       workspace = registry.get(message.workspaceId)
       if (workspace === undefined) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: `unknown workspace: ${message.workspaceId}` })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: `unknown workspace: ${message.workspaceId}` })
         return
       }
     } else {
@@ -2205,7 +2236,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
     handles.set(sessionId, handle)
     await workspace.attachSession?.(sessionId).catch(() => undefined)
-    watch(socket, sessionId)
+    watch(channel, sessionId)
     const snapshot = await ctx.sessionQuery.readSession(sessionId)
     const reply: SessionCreatedMessage = {
       type: 'session-created',
@@ -2213,12 +2244,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       header: snapshot.session,
       workspaceId: workspace.id,
     }
-    jsonLine(socket, reply)
+    jsonLine(channel, reply)
   }
 
-  const prompt = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const prompt = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'prompt requires a sessionId',
@@ -2231,7 +2262,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const content: PromptContentPart[] = []
     for (const raw of rawContent) {
       if (typeof raw !== 'object' || raw === null) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'prompt content parts must be objects' })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'prompt content parts must be objects' })
         return
       }
       const part = raw as Record<string, unknown>
@@ -2252,11 +2283,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         content.push({ type: 'file', receiptId: part.receiptId })
         continue
       }
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: `unsupported prompt content part: ${String(part.type)}` })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: `unsupported prompt content part: ${String(part.type)}` })
       return
     }
     if (content.length === 0 || !content.some(part => part.type !== 'text' || part.text.trim().length > 0)) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'prompt requires text or an attachment',
@@ -2265,7 +2296,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     const mode = message.mode === undefined ? 'queue' : message.mode
     if (mode !== 'queue' && mode !== 'steer') {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: `unsupported prompt mode: ${String(message.mode)}`,
@@ -2273,10 +2304,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
 
-    if (socket.destroyed) return
+    if (!channel.alive) return
     const agent = await liveAgent(message.sessionId)
-    if (socket.destroyed) return
-    watch(socket, message.sessionId)
+    if (!channel.alive) return
+    watch(channel, message.sessionId)
     const requestId = typeof message.requestId === 'string' && message.requestId.length > 0
       ? message.requestId
       : `dshell-${randomUUID()}`
@@ -2284,13 +2315,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (message.requireIdle === true) {
       const snapshot = agent.status === undefined ? await ctx.sessionQuery.readSession(message.sessionId) : undefined
       if (agent.status === 'running' || (snapshot && openTurn(snapshot.events)) || (agent.inbox?.nextTurn.length ?? 0) > 0 || (agent.inbox?.nextStep.length ?? 0) > 0) {
-        sendError(socket, { type: 'error', code: 'SESSION_ACTIVE', message: 'print requires an idle session; use --new or wait for the current turn' })
+        sendError(channel, { type: 'error', code: 'SESSION_ACTIVE', message: 'print requires an idle session; use --new or wait for the current turn' })
         return
       }
     }
     const controller = sessionController()
     if (content.some(part => part.type !== 'text') && controller?.prompt === undefined) {
-      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host cannot admit image or file prompt content' })
+      sendError(channel, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host cannot admit image or file prompt content' })
       return
     }
     if (message.requireIdle === true) activePrompt.set(message.sessionId, requestId)
@@ -2307,7 +2338,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       if (activePrompt.get(message.sessionId) === requestId) activePrompt.delete(message.sessionId)
       throw error
     }
-    jsonLine(socket, { type: 'accepted', sessionId: message.sessionId, requestId, mode })
+    jsonLine(channel, { type: 'accepted', sessionId: message.sessionId, requestId, mode })
   }
 
   /**
@@ -2335,20 +2366,20 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
   }
 
-  const cancel = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const cancel = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'session/cancel requires a sessionId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'session/cancel requires a sessionId' })
       return
     }
     // Stop the parent's turn first — the user is watching it stop. The
     // subagent sweep can wait behind the session list without delaying it.
     const agent = ctx.agents.get(message.sessionId)
     if (typeof message.requestId === 'string' && activePrompt.get(message.sessionId) !== message.requestId) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'the requested prompt does not own the active turn' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'the requested prompt does not own the active turn' })
       return
     }
     if (message.continueQueued === true && message.killSubagents === true) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'cannot continue the queue while stopping the whole session' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'cannot continue the queue while stopping the whole session' })
       return
     }
     if (agent !== undefined) {
@@ -2370,7 +2401,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       } else agent.cancel({ kind: 'user' })
     }
     const subagents = message.killSubagents === true ? await cancelSubagents(message.sessionId) : 0
-    jsonLine(socket, {
+    jsonLine(channel, {
       type: 'cancelled',
       sessionId: message.sessionId,
       ...(subagents > 0 ? { subagentsCancelled: subagents } : {}),
@@ -2384,60 +2415,60 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     return [...inbox.nextTurn, ...inbox.nextStep].find((message) => message.id === requestId)
   }
 
-  const queueEdit = (socket: Socket, message: Record<string, unknown>): void => {
+  const queueEdit = (channel: Channel, message: Record<string, unknown>): void => {
     if (typeof message.sessionId !== 'string' || typeof message.requestId !== 'string' || typeof message.text !== 'string') {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'queue/edit needs sessionId, requestId and text' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'queue/edit needs sessionId, requestId and text' })
       return
     }
     const agent = ctx.agents.get(message.sessionId)
     const pending = agent === undefined ? undefined : queuedMessage(agent, message.requestId)
     if (agent === undefined || agent.inbox === undefined || pending === undefined) {
-      sendError(socket, { type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'that prompt is no longer queued' })
+      sendError(channel, { type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'that prompt is no longer queued' })
       return
     }
     if (message.text.trim().length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'a queued prompt cannot be empty' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'a queued prompt cannot be empty' })
       return
     }
     agent.inbox.replace(message.requestId, { ...pending, content: [{ type: 'text', text: message.text }] })
-    jsonLine(socket, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'edit' })
+    jsonLine(channel, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'edit' })
   }
 
-  const queueRemove = (socket: Socket, message: Record<string, unknown>): void => {
+  const queueRemove = (channel: Channel, message: Record<string, unknown>): void => {
     if (typeof message.sessionId !== 'string' || typeof message.requestId !== 'string') {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'queue/remove needs a sessionId and requestId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'queue/remove needs a sessionId and requestId' })
       return
     }
     const agent = ctx.agents.get(message.sessionId)
     const pending = agent === undefined ? undefined : queuedMessage(agent, message.requestId)
     if (agent === undefined || agent.inbox === undefined || pending === undefined) {
-      sendError(socket, { type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'that prompt is no longer queued' })
+      sendError(channel, { type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'that prompt is no longer queued' })
       return
     }
     agent.inbox.remove(message.requestId)
-    jsonLine(socket, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'remove' })
+    jsonLine(channel, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'remove' })
   }
 
-  const answerApproval = (socket: Socket, message: Record<string, unknown>): void => {
+  const answerApproval = (channel: Channel, message: Record<string, unknown>): void => {
     if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'approval/answer requires requestId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'approval/answer requires requestId' })
       return
     }
     if (message.outcome !== 'allowed-once' && message.outcome !== 'rejected') {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'approval outcome must be allowed-once or rejected' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'approval outcome must be allowed-once or rejected' })
       return
     }
     const sessionId = approvals.sessionOf(message.requestId)
     if (sessionId === undefined) {
-      sendError(socket, {
+      sendError(channel, {
         type: 'error',
         code: 'APPROVAL_NOT_PENDING',
         message: `approval "${message.requestId}" is not pending`,
       })
       return
     }
-    if (watched.get(socket)?.has(sessionId) !== true) {
-      sendError(socket, {
+    if (watched.get(channel)?.has(sessionId) !== true) {
+      sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
         message: 'this client is not watching the approval session',
@@ -2453,28 +2484,28 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * source kind is `user-question-reply`, so the plugin uses exactly that
    * channel — the same one the Web UI's late answers take.
    */
-  const answerQuestion = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const answerQuestion = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires a sessionId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires a sessionId' })
       return
     }
     if (typeof message.callId !== 'string' || message.callId.length === 0) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires a callId' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires a callId' })
       return
     }
     if (!Array.isArray(message.answers)) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires an answers array' })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'question/answer requires an answers array' })
       return
     }
     const answers: { id: string; selected: string[]; custom?: string }[] = []
     for (const raw of message.answers) {
       if (typeof raw !== 'object' || raw === null) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'each answer must be an object' })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'each answer must be an object' })
         return
       }
       const answer = raw as Record<string, unknown>
       if (typeof answer.id !== 'string' || !Array.isArray(answer.selected)) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'each answer requires id and selected' })
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'each answer requires id and selected' })
         return
       }
       const selected = answer.selected.filter((item): item is string => typeof item === 'string')
@@ -2482,40 +2513,40 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       answers.push({ id: answer.id, selected, ...(custom === undefined ? {} : { custom }) })
     }
 
-    if (socket.destroyed) return
+    if (!channel.alive) return
     const pending = questionRequests.get(message.callId)
     if (pending) {
-      if (pending.sessionId !== message.sessionId || !watched.get(socket)?.has(message.sessionId) || !validAnswers(pending.questions, answers)) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'answer does not match the pending session and complete question batch' })
+      if (pending.sessionId !== message.sessionId || !watched.get(channel)?.has(message.sessionId) || !validAnswers(pending.questions, answers)) {
+        sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'answer does not match the pending session and complete question batch' })
         return
       }
       settleQuestion(message.callId, 'answered', answers)
     } else {
-      if (lateQuestionAnswer(socket, message.callId)) return
+      if (lateQuestionAnswer(channel, message.callId)) return
       const owner = questionService()
       if (!owner?.answer) {
-        sendError(socket, { type: 'error', code: 'QUESTION_NOT_PENDING', message: 'this question has no live request or continued-question owner' })
+        sendError(channel, { type: 'error', code: 'QUESTION_NOT_PENDING', message: 'this question has no live request or continued-question owner' })
         return
       }
       const agent = await liveAgent(message.sessionId)
       if (!owner.answer(agent, message.callId, { answers })) {
-        sendError(socket, { type: 'error', code: 'QUESTION_NOT_PENDING', message: 'question is no longer answerable' })
+        sendError(channel, { type: 'error', code: 'QUESTION_NOT_PENDING', message: 'question is no longer answerable' })
         return
       }
     }
-    jsonLine(socket, {
+    jsonLine(channel, {
       type: 'question-answered',
       sessionId: message.sessionId,
       callId: message.callId,
     })
   }
 
-  const dispatch = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const dispatch = async (channel: Channel, message: Record<string, unknown>): Promise<void> => {
     try {
       switch (message.type) {
         case 'hello': {
           if (message.protocol !== PROTOCOL_VERSION) {
-            sendError(socket, {
+            sendError(channel, {
               type: 'error',
               code: 'PROTOCOL_MISMATCH',
               message: `protocol ${String(message.protocol)} is not supported; expected ${PROTOCOL_VERSION}`,
@@ -2523,7 +2554,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             })
             return
           }
-          jsonLine(socket, {
+          jsonLine(channel, {
             type: 'welcome',
             protocol: PROTOCOL_VERSION,
             pluginVersion: packageVersion(),
@@ -2553,45 +2584,45 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           return
         }
         case 'ping':
-          jsonLine(socket, { type: 'pong', time: Date.now() })
+          jsonLine(channel, { type: 'pong', time: Date.now() })
           return
         case 'list':
         case 'session/list':
-          jsonLine(socket, {
+          jsonLine(channel, {
             type: 'sessions',
             sessions: await listSessions(typeof message.workspaceId === 'string' ? message.workspaceId : undefined, message.includeArchived === true),
           })
           return
         case 'workspaces':
-          jsonLine(socket, { type: 'workspaces', workspaces: workspaceList() })
+          jsonLine(channel, { type: 'workspaces', workspaces: workspaceList() })
           return
         case 'workspace/create':
-          await createWorkspace(socket, message)
+          await createWorkspace(channel, message)
           return
         case 'session/create':
-          await createSession(socket, message)
+          await createSession(channel, message)
           return
         case 'session/history':
-          await history(socket, message)
+          await history(channel, message)
           return
         case 'attach':
-          await attach(socket, message.sessionId)
+          await attach(channel, message.sessionId)
           return
         case 'watch':
-          if (typeof message.sessionId === 'string') watch(socket, message.sessionId)
+          if (typeof message.sessionId === 'string') watch(channel, message.sessionId)
           return
         case 'unwatch':
-          unwatch(socket, typeof message.sessionId === 'string' ? message.sessionId : undefined)
+          unwatch(channel, typeof message.sessionId === 'string' ? message.sessionId : undefined)
           return
         case 'detach':
-          unwatch(socket, typeof message.sessionId === 'string' ? message.sessionId : undefined)
-          jsonLine(socket, {
+          unwatch(channel, typeof message.sessionId === 'string' ? message.sessionId : undefined)
+          jsonLine(channel, {
             type: 'detached',
             ...(typeof message.sessionId === 'string' ? { sessionId: message.sessionId } : {}),
           })
           return
         case 'prompt':
-          await prompt(socket, message)
+          await prompt(channel, message)
           return
         case 'session/delete':
         case 'session/rename':
@@ -2599,86 +2630,86 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         case 'session/restore':
         case 'session/pin':
         case 'session/fork':
-          await sessionAction(socket, message)
+          await sessionAction(channel, message)
           return
         case 'session/cancel':
-          await cancel(socket, message)
+          await cancel(channel, message)
           return
         case 'queue/edit':
-          queueEdit(socket, message)
+          queueEdit(channel, message)
           return
         case 'queue/remove':
-          queueRemove(socket, message)
+          queueRemove(channel, message)
           return
         case 'approval/answer':
-          answerApproval(socket, message)
+          answerApproval(channel, message)
           return
         case 'question/answer':
-          await answerQuestion(socket, message)
+          await answerQuestion(channel, message)
           return
         case 'model/catalog':
-          await forwardModelCatalog(socket)
+          await forwardModelCatalog(channel)
           return
         case 'model/select':
-          await selectModel(socket, message)
+          await selectModel(channel, message)
           return
         case 'model/default':
-          await setDefaultModel(socket, message)
+          await setDefaultModel(channel, message)
           return
         case 'skills/list':
-          await listSkills(socket, message)
+          await listSkills(channel, message)
           return
         case 'skills/get':
-          await getSkill(socket, message)
+          await getSkill(channel, message)
           return
         case 'provider/list':
-          listProviders(socket)
+          listProviders(channel)
           return
         case 'agents/list':
-          jsonLine(socket, agentRoster())
+          jsonLine(channel, agentRoster())
           return
         case 'provider/update':
-          await updateProvider(socket, message)
+          await updateProvider(channel, message)
           return
         case 'provider/save':
-          await saveProvider(socket, message)
+          await saveProvider(channel, message)
           return
         case 'provider/api-key':
-          await storeProviderKey(socket, message)
+          await storeProviderKey(channel, message)
           return
         case 'provider/discover':
-          await discoverProviderModels(socket, message)
+          await discoverProviderModels(channel, message)
           return
         case 'provider/sync-plan':
-          await syncPlan(socket, message)
+          await syncPlan(channel, message)
           return
         case 'provider/sync-apply':
-          await syncApply(socket, message)
+          await syncApply(channel, message)
           return
         case 'provider/create':
-          await createProvider(socket, message)
+          await createProvider(channel, message)
           return
         case 'provider/delete':
-          await deleteProvider(socket, message)
+          await deleteProvider(channel, message)
           return
         case 'host/restart':
-          await restartHost(socket)
+          await restartHost(channel)
           return
         default:
-          sendError(socket, {
+          sendError(channel, {
             type: 'error',
             code: 'BAD_REQUEST',
             message: `unknown message type: ${String(message.type)}`,
           })
       }
     } catch (error) {
-      sendError(socket, mappedError(error))
+      sendError(channel, mappedError(error))
     }
   }
 
-  const handleLine = async (socket: Socket, line: string): Promise<void> => {
+  const handleLine = async (channel: Channel, line: string): Promise<void> => {
     if (Buffer.byteLength(line, 'utf8') > 8 * 1024 * 1024) {
-      socket.destroy()
+      channel.close()
       return
     }
     let message: Record<string, unknown>
@@ -2689,28 +2720,35 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       if (typeof message.type !== 'string') throw new Error('expected a message type')
       if (message.rpcId !== undefined && (typeof message.rpcId !== 'string' || message.rpcId.length < 1 || message.rpcId.length > 128)) throw new Error('invalid RPC identity')
     } catch (error) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: errorText(error) })
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: errorText(error) })
       return
     }
-    await rpcContext.run({ socket, rpcId: message.rpcId as string | undefined }, () => dispatch(socket, message))
+    await rpcContext.run({ channel, rpcId: message.rpcId as string | undefined }, () => dispatch(channel, message))
   }
 
-  const enqueue = (socket: Socket, line: string): void => {
-    const previous = queues.get(socket) ?? Promise.resolve()
+  const enqueue = (channel: Channel, line: string): void => {
+    const previous = queues.get(channel) ?? Promise.resolve()
     const next = previous
-      .then(() => handleLine(socket, line))
-      .catch((error: unknown) => sendError(socket, mappedError(error)))
-    queues.set(socket, next)
+      .then(() => handleLine(channel, line))
+      .catch((error: unknown) => sendError(channel, mappedError(error)))
+    queues.set(channel, next)
     void next.finally(() => {
-      if (queues.get(socket) === next) queues.delete(socket)
+      if (queues.get(channel) === next) queues.delete(channel)
     })
   }
 
-  const cleanupSocket = (socket: Socket): void => {
-    clients.delete(socket)
-    historyCuts.delete(socket)
-    unwatch(socket)
-    queues.delete(socket)
+  /**
+   * 一条连接断开后的清理。
+   *
+   * 与传输无关：从客户端集合、订阅表、历史游标、串行队列里移除，然后重新
+   * 评估审批与人提问的等待者。CLI 断开和手机断开走的是同一条路径——
+   * 这正是"多端同步"能成立的前提：中枢不知道也不关心你从哪种传输来的。
+   */
+  const cleanupChannel = (channel: Channel): void => {
+    clients.delete(channel)
+    historyCuts.delete(channel)
+    unwatch(channel)
+    queues.delete(channel)
     approvals.watchersChanged()
     for (const [callId, pending] of questionRequests) {
       if (watchersFor(pending.sessionId).length > 0) continue
@@ -2720,29 +2758,144 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
   }
 
-  const server = createServer((socket) => {
-    clients.add(socket)
-    socket.setEncoding('utf8')
-    let buffer = ''
-    socket.on('data', (chunk: string) => {
-      buffer += chunk
-      for (;;) {
-        const newline = buffer.indexOf('\n')
-        if (newline < 0) break
-        const line = buffer.slice(0, newline)
-        buffer = buffer.slice(newline + 1)
-        if (Buffer.byteLength(line, 'utf8') > 8 * 1024 * 1024) { socket.destroy(); return }
-        if (line.trim().length > 0) enqueue(socket, line)
+  /** 把一条新通道接入中枢：登记、给读写回调、断开时清理。 */
+  const registerChannel = (channel: Channel): void => {
+    clients.add(channel)
+    if (channel instanceof WebSocketChannel) {
+      // WS 客户端要声明自己是 app 还是 pet；中枢据此决定推送视图
+      channel.onHello = (kind) => {
+        channel.clientKind = kind
       }
-      if (Buffer.byteLength(buffer, 'utf8') > 8 * 1024 * 1024) socket.destroy()
-    })
-    socket.on('close', () => cleanupSocket(socket))
-    socket.on('error', () => cleanupSocket(socket))
+    }
+    // 由通道实现自己解析行；中枢只收到完整的行
+    channel.onLine = (line: string) => enqueue(channel, line)
+    channel.onClose = () => cleanupChannel(channel)
+  }
+
+  /** CLI：unix socket。行为与改造前一致。 */
+  const server = createServer((socket) => {
+    registerChannel(new UnixSocketChannel(socket))
   })
 
   server.on('error', (error) => {
     console.error(`[dshell-host] socket error: ${errorText(error)}`)
   })
+
+  /**
+   * WebSocket 入口：手机 App 与桌面宠物。
+   *
+   * **它与 unix socket 共享同一个中枢**——同一个 `clients`、同一张 `watched`、
+   * 同一个 `ApprovalCoordinator`。这是"多端同步"的全部秘密：中枢不区分
+   * 客户端从哪种传输来，只按订阅表广播。
+   *
+   * 鉴权在 upgrade 阶段做：连接建立时就校验 token，未通过直接 401 断开，
+   * 不留一个"连上了但什么都不能做"的半死连接。
+   */
+  /**
+   * 校验一条 WS 升级请求。
+   *
+   * token 可以走 `Authorization: Bearer` 或 `?token=`——后者是为了兼容
+   * Android 客户端现有的连接方式，它一直用 URL 传。
+   */
+  const authorizeWs = (req: { headers: Record<string, string | string[] | undefined>; url?: string }): { ok: true; kind: 'app' | 'pet' } | { ok: false; status: number } => {
+    const header = req.headers.authorization
+    let token = ''
+    if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
+      token = header.slice(7).trim()
+    } else {
+      try {
+        token = new URL(req.url ?? '/', 'http://placeholder').searchParams.get('token') ?? ''
+      } catch {
+        token = ''
+      }
+    }
+    if (devices.verify(token) === undefined) return { ok: false, status: 401 }
+    const kind = new URL(req.url ?? '/', 'http://placeholder').searchParams.get('client') === 'pet' ? 'pet' : 'app'
+    return { ok: true, kind }
+  }
+
+  const wsServer: HttpServer | undefined = config.wsPort === undefined
+    ? undefined
+    : createHttpServer((req, res) => {
+        const sendJson = (status: number, value: unknown): void => {
+          res.writeHead(status, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(value))
+        }
+        if (req.url?.startsWith('/api/health')) {
+          sendJson(200, { ok: true, plugin: 'dshell-host', protocol: PROTOCOL_VERSION })
+          return
+        }
+        /**
+         * 签发配对码。**只开给回环地址**——否则局域网里任何能访问端口的人
+         * 都能自助配对，token 就形同虚设。本机用户（含 SSH 登录）随时能取，
+         * 不必重启 Host。
+         */
+        if (req.url?.startsWith('/api/pair/code') === true && req.method === 'POST') {
+          const remote = req.socket.remoteAddress ?? ''
+          const fromLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+          if (!fromLoopback) {
+            sendJson(403, { error: 'LOOPBACK_ONLY' })
+            return
+          }
+          const code = pairCodes.issue()
+          console.error(`[dshell-host] 配对码 ${code}（5 分钟内有效）`)
+          sendJson(200, { code, expiresAt: Date.now() + 5 * 60 * 1000 })
+          return
+        }
+        /** 用配对码换长期 token。码用掉即删，一个码换不出两份凭据。 */
+        if (req.url?.startsWith('/api/pair/claim') === true && req.method === 'POST') {
+          const chunks: Buffer[] = []
+          req.on('data', (chunk: Buffer) => chunks.push(chunk))
+          req.on('end', () => {
+            let body: { code?: unknown; name?: unknown }
+            try {
+              body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { code?: unknown; name?: unknown }
+            } catch {
+              sendJson(400, { error: 'BAD_CODE' })
+              return
+            }
+            if (!pairCodes.claim(String(body.code ?? '').trim().toUpperCase())) {
+              sendJson(404, { error: 'CODE_NOT_FOUND_OR_EXPIRED' })
+              return
+            }
+            const name = typeof body.name === 'string' && body.name.length > 0 ? body.name : 'client'
+            const token = devices.issue(name)
+            sendJson(201, { deviceId: DeviceStore.hash(token).slice(0, 16), token })
+            console.error(`[dshell-host] 已配对 ${name}`)
+          })
+          return
+        }
+        sendJson(404, { error: 'NOT_FOUND' })
+      })
+
+  wsServer?.on('upgrade', (req, socket) => {
+    const authorized = authorizeWs(req)
+    if (!authorized.ok) {
+      // 401 而不是静默关闭：客户端要能区分"token 失效"和"网络不通"
+      socket.write(`HTTP/1.1 ${authorized.status} Unauthorized\r\nConnection: close\r\n\r\n`)
+      socket.destroy()
+      return
+    }
+    if (!acceptUpgrade(req, socket)) return
+    const channel = new WebSocketChannel(socket)
+    channel.clientKind = authorized.kind
+    registerChannel(channel)
+  })
+
+  wsServer?.on('error', (error: NodeJS.ErrnoException) => {
+    // 端口冲突不该拖垮整个 dsh：显式报错并只关掉这个入口
+    if (error.code === 'EADDRINUSE') {
+      console.error(`[dshell-host] WebSocket 端口 ${String(config.wsPort)} 已被占用，对外服务未启用。`)
+      return
+    }
+    console.error(`[dshell-host] WebSocket error: ${errorText(error)}`)
+  })
+
+  if (wsServer !== undefined) {
+    wsServer.listen(config.wsPort, config.wsHost ?? '0.0.0.0', () => {
+      console.error(`[dshell-host] WebSocket 已监听 ws://${config.wsHost ?? '0.0.0.0'}:${String(config.wsPort)}/ws`)
+    })
+  }
 
   const disposeSessionEvent = ctx.on('session/event', (session: { id: string }, event: SessionEvent) => {
     noteAskCall(session.id, event)
@@ -2841,12 +2994,15 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // shutdown, host-restarting — flush before the connection drops; a
     // stalled peer gets destroyed once closeServer's bound gives up.
     const live = [...clients]
-    for (const socket of live) socket.end()
+    // Channel.close() 负责先发关闭帧再断开；CLI 的 socket 实现等价于原来的 end()+destroy()
+    for (const peer of live) peer.close()
     clients.clear()
     watched.clear()
     await closeServer(server)
-    for (const socket of live) {
-      if (!socket.destroyed) socket.destroy()
+    // WS 监听必须一起关：否则卸载插件（或测试结束）后端口仍被占着，
+    // 进程也退不出去——这是个真实的句柄泄漏，不是测试环境特有的。
+    if (wsServer !== undefined) {
+      await new Promise<void>((resolve) => wsServer.close(() => resolve()))
     }
     for (const handle of handles.values()) {
       await handle.dispose().catch(() => {})
