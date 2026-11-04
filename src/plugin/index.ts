@@ -54,7 +54,7 @@ import {
 import { resolveDshHome, resolveSocketPath } from '../shared/paths.js'
 import { latestUserPreview } from '../shared/session-events.js'
 import { advanceModelSelection, readModelSelection, type ModelSelectionState } from '../shared/model-selection.js'
-import { DeviceStore, PairCodes } from './devices.js'
+import { DeviceStore, PairCodes, hostName } from './devices.js'
 import { ApprovalCoordinator } from './approval.js'
 import { openHistory, historyEvents, type HarnessHistoryOwner } from './harness-history.js'
 import {
@@ -2925,7 +2925,16 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             }
             const name = typeof body.name === 'string' && body.name.length > 0 ? body.name : 'client'
             const token = devices.issue(name)
-            sendJson(201, { deviceId: DeviceStore.hash(token).slice(0, 16), token })
+            /**
+             * 回带 `server` 段：App 用它显示"已连接到哪台机器"并在换机时提醒。
+             * `fingerprint` 取设备表文件的持久标识——同一台机器重装 dsh 后会变，
+             * 正是 App 需要的"这还是不是原来那台"的判断依据。
+             */
+            sendJson(201, {
+              deviceId: DeviceStore.hash(token).slice(0, 16),
+              token,
+              server: { name: hostName(), fingerprint: devices.fingerprint },
+            })
             console.error(`[dshell-host] 已配对 ${name}`)
           })
           return

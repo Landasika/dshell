@@ -23,12 +23,22 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { dirname, join } from 'node:path'
+import { hostname } from 'node:os'
 
 import { resolveDshHome } from '../shared/paths.js'
 
 /** 去掉易混的 I/L/O/0/1——用户要从屏幕上抄这个码。 */
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 const PAIR_TTL_MS = 5 * 60 * 1000
+
+/** 本机名，用于让 App 显示"连到哪台机器"。取不到时退回 hostname 的兜底。 */
+export function hostName(): string {
+  try {
+    return hostname()
+  } catch {
+    return 'dshell'
+  }
+}
 
 export interface DeviceRecord {
   /** token 的 sha256（hex）。**不存明文**。 */
@@ -47,6 +57,8 @@ export interface PairClaim {
 export class DeviceStore {
   private readonly file: string
   private devices = new Map<string, DeviceRecord>()
+  /** 本机持久标识：设备表首次创建时生成，之后不变。App 用它判断"还是不是这台机器"。 */
+  private fingerprintValue = ''
 
   constructor(file?: string) {
     this.file = file ?? join(resolveDshHome(), 'dshell-ws', 'devices.json')
@@ -55,6 +67,34 @@ export class DeviceStore {
 
   static hash(token: string): string {
     return createHash('sha256').update(token).digest('hex')
+  }
+
+  /**
+   * 本机指纹。稳定即可——它的用途是让 App 发现"换机器了"，不是防伪。
+   * 存在设备表同目录下，删掉设备表就等于重新认一台机器（符合预期）。
+   */
+  get fingerprint(): string {
+    if (this.fingerprintValue !== '') return this.fingerprintValue
+    const sidecar = join(dirname(this.file), 'fingerprint')
+    try {
+      const existing = readFileSync(sidecar, 'utf8').trim()
+      if (existing.length > 0) {
+        this.fingerprintValue = existing
+        return existing
+      }
+    } catch {
+      // 还没有，下面生成
+    }
+    const created = randomBytes(12).toString('hex')
+    try {
+      const dir = dirname(this.file)
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writeFileSync(sidecar, created, { mode: 0o600 })
+    } catch {
+      // 写不进去也不影响本次连接，只是个展示用标识
+    }
+    this.fingerprintValue = created
+    return created
   }
 
   private load(): void {
