@@ -491,6 +491,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let offBackendDisconnect: (() => void) | undefined
   let modelChange: { sessionId: string; generation: number; selection: ModelSelection; recovering: boolean; overlay: Overlay | null } | undefined
   let savingModelDefault = false
+  let cancellingHandle: SessionHandle | undefined
   let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
   let lastTurnFailure: string | undefined
   /** Call id already announced as waiting behind another panel. */
@@ -608,14 +609,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
    * them is Ctrl-C's part of the split (it quits and takes the children down).
    */
   const cancelRunningTurn = async (): Promise<void> => {
-    toast('cancelling the turn…')
-    schedule()
-    try {
-      await state.handle?.cancel(false)
-    } catch (error) {
-      toast(`cancel failed: ${errorText(error)}`)
-      schedule()
-    }
+    await cancel()
   }
 
   /** Ctrl-C while running: stop the turn and its subagents, then leave. */
@@ -731,6 +725,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const message = (data.message ?? data) as Record<string, unknown>
       const id = message.id
       if (typeof id === 'string' && id.length > 0) started.add(id)
+      const source = message.source as Record<string, unknown> | undefined
+      if (typeof source?.rpcId === 'string') started.add(source.rpcId)
     }
     const now = Date.now()
     state.queued = state.queued.filter((entry) => {
@@ -761,10 +757,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return at !== undefined && Date.now() - at < 5_000
     }
     for (const item of state.inbox.nextStep) {
+      if (item.rpcId !== undefined) seen.add(item.rpcId)
       if (hidden(item.id)) continue
       push({ requestId: item.id, text: state.queueText.get(item.id) ?? item.text, at: 0, mode: 'steer', local: false })
     }
     for (const item of state.inbox.nextTurn) {
+      if (item.rpcId !== undefined) seen.add(item.rpcId)
       if (hidden(item.id)) continue
       push({ requestId: item.id, text: state.queueText.get(item.id) ?? item.text, at: 0, mode: 'queue', local: false })
     }
@@ -1127,38 +1125,24 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const cancel = async (): Promise<void> => {
-    if (state.handle === undefined) return
-    // The Host drops its inbox together with the aborted turn, so keep our own
-    // copy and hand it back right away: the queued prompts then start as soon
-    // as the abort settles, which is what Ctrl-C should mean.
-    const pendingById = new Map<string, string>()
-    for (const entry of state.queued) pendingById.set(entry.requestId, entry.text)
-    for (const item of [...state.inbox.nextStep, ...state.inbox.nextTurn]) {
-      if (!pendingById.has(item.id)) pendingById.set(item.id, item.text)
-    }
-    const pending = [...pendingById.values()]
-    state.queued = []
-    state.inbox = { nextTurn: [], nextStep: [] }
-    try {
-      await state.handle.cancel()
-      state.status = 'cancelling'
-      toast(
-        pending.length === 0
-          ? 'cancel requested; the Host decides when the turn stops'
-          : `cancelled this turn; ${String(pending.length)} queued prompt${pending.length === 1 ? ' continues' : 's continue'}`,
-      )
-    } catch (error) {
-      state.error = errorText(error)
-    }
-    for (const text of pending) {
-      try {
-        const receipt = await state.handle.send(expandAttachments(text), { mode: 'queue' })
-        state.queued.push({ requestId: receipt.requestId, text, at: Date.now(), mode: 'queue' })
-      } catch (error) {
-        state.error = errorText(error)
-      }
-    }
+    const handle = state.handle
+    if (handle === undefined || cancellingHandle === handle) return
+    const generation = sessionGeneration
+    cancellingHandle = handle
+    toast('stopping this turn · pending prompts will continue…')
     schedule()
+    try {
+      await handle.cancel(false, undefined, { continueQueued: true })
+      if (state.quitting || state.handle !== handle || sessionGeneration !== generation) return
+      toast('stop requested · pending prompts continue when this turn stops')
+    } catch (error) {
+      if (state.quitting || state.handle !== handle || sessionGeneration !== generation) return
+      state.error = errorText(error)
+      toast(`stop not confirmed: ${errorText(error)}`)
+    } finally {
+      if (cancellingHandle === handle) cancellingHandle = undefined
+      schedule()
+    }
   }
 
   const answerApproval = async (outcome: 'allowed-once' | 'rejected'): Promise<void> => {
@@ -4102,7 +4086,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       body.push(`${paint(theme, 'text', pad('ctrl+g', 15))} subagents · ${paint(theme, 'text', 'double esc')} rewind prompt`)
       body.push(`${paint(theme, 'text', pad('shift+tab', 15))} approval mode: ask ↔ allow all (or /mode)`)
       body.push(`${paint(theme, 'text', pad('end / esc', 15))} jump to bottom while scrolled up`)
-      body.push(`${paint(theme, 'text', pad('esc', 15))} cancel this turn · ${paint(theme, 'text', 'ctrl-c')} quit + kill subagents · ${paint(theme, 'text', 'ctrl-z')} detach`)
+      body.push(`${paint(theme, 'text', pad('esc', 15))} stop this turn; queued prompts continue · ${paint(theme, 'text', 'ctrl-c')} quit + kill subagents · ${paint(theme, 'text', 'ctrl-z')} detach`)
       body.push('', paint(theme, 'muted', 'The TUI never owns the Agent: quitting only closes this view.'))
       return panelRule(theme, 'help & shortcuts', body, width)
     }

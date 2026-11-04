@@ -55,6 +55,8 @@ export interface DshellCapabilities {
   createSession: boolean
   /** A running turn can be cancelled. */
   cancel: boolean
+  /** Stopping the current turn can preserve and start pending inbox work. */
+  continueQueued?: boolean
   /** A prompt can be steered into the current step. */
   steer: boolean
   /** Older history can be loaded incrementally. */
@@ -203,6 +205,11 @@ export interface SendReceipt {
   mode?: 'queue' | 'steer'
 }
 
+export interface CancelOptions {
+  /** Preserve existing pending messages and wake the next turn without resubmitting them. */
+  continueQueued?: boolean
+}
+
 /**
  * One open session. The handle owns a subscription, not the Host-side Agent:
  * disposing it must never stop a turn that the Host is still running.
@@ -217,7 +224,7 @@ export interface SessionHandle {
 
   send(input: PromptInput, options?: SendOptions): Promise<SendReceipt>
   /** Cancel the running turn; `killSubagents` also aborts its live subagents. */
-  cancel(killSubagents?: boolean, requestId?: string): Promise<void>
+  cancel(killSubagents?: boolean, requestId?: string, options?: CancelOptions): Promise<void>
   /** Delete one prompt still waiting in the Host inbox. */
   removeQueued(requestId: string): Promise<void>
   /** Rewrite one prompt still waiting in the Host inbox. */

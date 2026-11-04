@@ -83,7 +83,7 @@ async function journey(t, options = {}) {
         buffer = buffer.slice(newline + 1)
         if (request.type === 'hello') {
           reply(socket, request, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test', socketPath,
-            capabilities: ['rpc-id', 'models', 'attach', 'list', 'workspaces', 'prompt', 'history', 'cancel'], sessions: [] })
+            capabilities: ['rpc-id', 'models', 'attach', 'list', 'workspaces', 'prompt', 'history', 'cancel', ...(options.continueQueued ? ['cancel-continue'] : [])], sessions: [] })
         } else if (request.type === 'workspaces') reply(socket, request, { type: 'workspaces', workspaces: [] })
         else if (request.type === 'session/list') reply(socket, request, { type: 'sessions', sessions: [...events.keys()].map(sessionId => ({ sessionId, cwd: directory })) })
         else if (request.type === 'attach') {
@@ -114,7 +114,7 @@ async function journey(t, options = {}) {
           }
           if (options.hold) pending.push(finish)
           else finish()
-        }
+        } else options.command?.(request, { emit, reply: message => reply(socket, request, message) })
       }
     })
   })
@@ -310,8 +310,9 @@ test('a slow model receipt preserves a different panel opened while waiting', as
   assert.ok(ui.output.lines.some(line => line?.includes('help & shortcuts')), 'late completion must preserve the active panel')
 })
 
-async function fakeJourney(t, { events = [], columns = 100, rows = 30 } = {}) {
+async function fakeJourney(t, { events = [], columns = 100, rows = 30, setup } = {}) {
   const backend = new FakeBackend([{ sessionId: 's1', cwd: '/tmp', events }])
+  setup?.(backend)
   await backend.connect()
   const input = new Input()
   const output = new Output()
@@ -403,4 +404,79 @@ test('lost model receipt, another frontend selection, simultaneous socket failur
   assert.ok(ui.output.lines.some(line => line?.includes('恢复草稿 👩🏽‍💻')), 'unsent draft must survive reconnect and resize')
   assert.ok(ui.output.cursor)
   assert.equal(ui.backend.handleCount, 1)
+})
+
+for (const gesture of ['escape', '/cancel']) test(`${gesture} stops the current turn and starts the existing queue without resubmitting it`, async t => {
+  const ui = await fakeJourney(t)
+  ui.backend.emit('s1', { type: 'turn/start', seq: 0, data: { turn: 1 } })
+  const handle = await ui.backend.openSession('s1')
+  t.after(() => handle.dispose())
+  ui.input.push('next question\u001bq')
+  await until(() => ui.backend.queuedPrompts.length === 1, 'Alt-Q queues the first question')
+  const first = ui.backend.queuedPrompts[0]
+  const second = await handle.send('third question', { mode: 'queue' })
+  ui.input.push(gesture === 'escape' ? '\u001b' : '/cancel\r')
+  await until(() => handle.snapshot().events.some(event => event.type === 'user/message' && event.data.message.id === first.requestId), 'first queued question starts')
+  const delivered = handle.snapshot().events.filter(event => event.type === 'user/message').map(event => event.data.message.id)
+  assert.deepEqual(delivered, [first.requestId])
+  assert.equal(ui.backend.queuedPrompts.some(entry => entry.requestId === second.requestId), true)
+  assert.equal(ui.backend.lastCancelKilledSubagents, false)
+  assert.equal(handle.snapshot().status, 'running')
+})
+
+test('repeated Escape during slow cancellation stops once and preserves the draft', async t => {
+  let release
+  let cancels = 0
+  const gate = new Promise(resolve => { release = resolve })
+  const ui = await fakeJourney(t, { setup(backend) {
+    const open = backend.openSession.bind(backend)
+    backend.openSession = async id => {
+      const handle = await open(id)
+      const cancel = handle.cancel.bind(handle)
+      handle.cancel = async (...args) => { cancels += 1; await gate; return cancel(...args) }
+      return handle
+    }
+  } })
+  t.after(() => release())
+  ui.backend.emit('s1', { type: 'turn/start', seq: 0, data: { turn: 1 } })
+  const handle = await ui.backend.openSession('s1')
+  t.after(() => handle.dispose())
+  const next = await handle.send('pending next question', { mode: 'queue' })
+  ui.input.push('unsent draft')
+  ui.input.push('\u001b[27u'.repeat(5))
+  await until(() => cancels === 1, 'first stop request')
+  await pause(80)
+  assert.equal(cancels, 1)
+  release()
+  await until(() => handle.snapshot().events.some(event => event.type === 'user/message' && event.data.message.id === next.requestId), 'queue continues after slow stop')
+  assert.ok(ui.output.lines.some(line => line?.includes('unsent draft')))
+})
+
+test('a Host-generated message identity shows one queued row and removes it when Escape starts that message', async t => {
+  let message
+  let cancels = 0
+  const ui = await journey(t, { running: true, continueQueued: true, command(request, { emit, reply }) {
+    if (request.type === 'prompt') {
+      message = { id: `owner-${request.requestId}`, role: 'user', source: { kind: 'user', rpcId: request.requestId },
+        content: [{ type: 'text', text: 'identity-sensitive question' }] }
+      emit('s1', 'agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message] })
+      reply({ type: 'accepted', sessionId: 's1', requestId: request.requestId, mode: 'queue' })
+    } else if (request.type === 'session/cancel') {
+      cancels += 1
+      assert.equal(request.continueQueued, true)
+      emit('s1', 'turn/end', { reason: { kind: 'aborted', reason: { kind: 'user' } } })
+      emit('s1', 'turn/start', { turn: 2 })
+      emit('s1', 'agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] })
+      emit('s1', 'user/message', message)
+      reply({ type: 'cancelled', sessionId: 's1' })
+    }
+  } })
+  ui.input.push('identity-sensitive question\u001bq')
+  await until(() => ui.output.lines.some(line => line?.includes('◷ queued')), 'pending row visible')
+  await pause(80)
+  assert.equal(ui.output.lines.filter(line => line?.includes('◷ queued')).length, 1, 'local receipt and durable inbox represent one prompt')
+  ui.input.push('\u001b')
+  await until(() => cancels === 1, 'Escape reaches the Host')
+  await until(() => !ui.output.lines.some(line => line?.includes('◷ queued')), 'started prompt leaves the queue immediately')
+  assert.ok(ui.output.lines.some(line => line?.includes('identity-sensitive question')), 'the prompt remains visible in the transcript')
 })

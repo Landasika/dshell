@@ -21,6 +21,7 @@ export const CAPABILITIES = [
   'create-session',
   'history',
   'cancel',
+  'cancel-continue',
   'steer',
   'approval',
   'questions',
@@ -530,7 +531,7 @@ export type ClientPayload =
   | { type: 'session/pin'; sessionId: string; pinned: boolean }
   | { type: 'session/fork'; sessionId: string }
   | { type: 'session/history'; sessionId: string; before?: number; limit?: number }
-  | { type: 'session/cancel'; sessionId: string; requestId?: string }
+  | { type: 'session/cancel'; sessionId: string; requestId?: string; killSubagents?: boolean; continueQueued?: boolean }
   | { type: 'queue/edit'; sessionId: string; requestId: string; text: string }
   | { type: 'queue/remove'; sessionId: string; requestId: string }
   | {

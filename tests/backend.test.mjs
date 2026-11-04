@@ -523,6 +523,29 @@ test('SocketBackend reports unsupported capabilities clearly', async (t) => {
   await backend.disconnect()
 })
 
+test('queue-preserving cancellation refuses an old Host and surfaces cancellation errors', async t => {
+  for (const supported of [false, true]) await t.test(supported ? 'Host rejects stop' : 'old Host lacks support', async t => {
+    const commands = []
+    const server = await socketServer((message, socket) => {
+      if (message.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test',
+        socketPath: 'test.sock', sessions: [], capabilities: ['attach', 'cancel', ...(supported ? ['cancel-continue'] : [])] })
+      else if (message.type === 'attach') write(socket, { type: 'attached', sessionId: 's1', header: { id: 's1' }, cursor: -1, events: [] })
+      else if (message.type === 'session/cancel') {
+        commands.push(message)
+        write(socket, { type: 'error', code: 'BAD_REQUEST', message: 'the active turn has changed' })
+      }
+    })
+    const backend = new SocketBackend(server.socketPath)
+    t.after(async () => { await backend.disconnect(); await server.close() })
+    await backend.connect()
+    const handle = await backend.openSession('s1')
+    await assert.rejects(handle.cancel(false, undefined, { continueQueued: true }),
+      supported ? /active turn has changed/ : /cannot stop a turn and continue/)
+    assert.equal(commands.length, supported ? 1 : 0, 'old Hosts must never receive a destructive fallback cancel')
+    if (supported) assert.equal(commands[0].continueQueued, true)
+  })
+})
+
 test('SocketBackend reads the model catalog and forwards selections', async (t) => {
   const catalog = {
     default: { provider: 'relay', model: 'relay-flash' },

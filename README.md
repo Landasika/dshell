@@ -14,7 +14,7 @@
   <img alt="node" src="https://img.shields.io/badge/node-%5E22.19_%7C_%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.2-4d6bfe?style=flat-square">
   <a href="https://github.com/Landasika/dshell/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/Landasika/dshell/ci.yml?branch=main&style=flat-square&label=ci"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-262_passing-2ea043?style=flat-square">
+  <img alt="tests" src="https://img.shields.io/badge/tests-272_passing-2ea043?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-linux-FCC624?style=flat-square&logo=linux&logoColor=black">
 </p>
 
@@ -224,7 +224,7 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Ctrl-R` | search prompts sent in this session |
 | `Ctrl-B` | session panel |
 | `Ctrl-G` | subagents (roster + read-only transcript) |
-| `Esc` (turn running) | cancel this turn — subagents keep running, TUI stays; outranks Esc's other duties (scroll-to-tail, close menu, clear draft) |
+| `Esc` (turn running) | stop this turn and continue queued prompts in order; subagents keep running, TUI stays; outranks Esc's other duties (scroll-to-tail, close menu, clear draft) |
 | `Esc` (idle) | close menu / clear draft / jump to tail; `Esc` `Esc` rewinds to a previous prompt |
 | `Ctrl-C` (panel open) | close the panel / dismiss a pending question — never quits, so an ask cannot be aborted by reflex |
 | `Ctrl-C` `Ctrl-C` | quit — the first press only warns, the second (within 2s) leaves; if a turn runs it is cancelled **with its subagents**. Any other key in between disarms it |
@@ -285,7 +285,7 @@ change an answer behind your back. `Esc` leaves the ask pending for the Web UI.
 | `/workspaces` | switch workspace |
 | `/new` | create a session |
 | `/attach <id>` | attach by id |
-| `/cancel` | cancel the running turn |
+| `/cancel` | stop the running turn and continue queued prompts in order |
 | `/continue` | resume a task the Host restart interrupted (also happens automatically on reconnect: once per interrupted turn, ≤3 per TUI run) |
 | `/clear` | clear the local transcript view |
 | `/reconnect` | reattach the current session |
@@ -472,7 +472,7 @@ that the confirmation offers.
 pnpm install
 pnpm typecheck   # tsc --noEmit
 pnpm lint        # alias of typecheck
-pnpm test        # build + node --test (262 tests)
+pnpm test        # build + node --test (272 tests)
 ./scripts/ci.sh  # full local gate, including a clean pack/install
 ```
 

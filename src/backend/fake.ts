@@ -15,6 +15,7 @@ import type {
 import { adaptSessionEvent, adaptSessionEvents, type SessionEvent } from './events.js'
 import {
   BackendError,
+  type CancelOptions,
   type AgentRoster,
   type CreateSessionOptions,
   type DshellBackend,
@@ -40,6 +41,7 @@ const CAPABILITIES: DshellCapabilities = {
   workspaces: true,
   createSession: true,
   cancel: true,
+  continueQueued: true,
   steer: true,
   paging: true,
   approvals: true,
@@ -506,6 +508,20 @@ export class FakeBackend implements DshellBackend {
     return true
   }
 
+  /** Wake retained inbox input after stopping the current turn. */
+  continueQueued(sessionId: string): void {
+    if (!this.queuedPrompts.some(entry => entry.sessionId === sessionId)) return
+    const session = this.requireSession(sessionId)
+    this.emit(sessionId, { type: 'turn/start', seq: session.cursor + 1,
+      data: { turn: session.events.filter(event => event.type === 'turn/start').length + 1 } })
+    while (this.deliverSteer(sessionId)) {}
+    const index = this.queuedPrompts.findIndex(entry => entry.sessionId === sessionId && entry.mode === 'queue')
+    if (index >= 0) {
+      const [next] = this.queuedPrompts.splice(index, 1)
+      if (next !== undefined) this.deliverEntry(next)
+    }
+  }
+
   /** Remove one queued prompt; returns false when it already started. */
   removeQueued(sessionId: string, requestId: string): boolean {
     const index = this.queuedPrompts.findIndex((entry) => entry.sessionId === sessionId && entry.requestId === requestId)
@@ -801,17 +817,19 @@ class FakeSessionHandle implements SessionHandle {
     }
   }
 
-  async cancel(killSubagents = false): Promise<void> {
+  async cancel(killSubagents = false, _requestId?: string, options: CancelOptions = {}): Promise<void> {
     this.assertOpen()
     this.backend.lastCancelKilledSubagents = killSubagents
     if (this.session.status !== 'running') return
-    // A cancel drops the inbox with the aborted turn, like the Host does.
-    this.backend.dropQueued(this.id)
+    if (!options.continueQueued) this.backend.dropQueued(this.id)
     this.append({
       type: 'turn/end',
       seq: this.session.cursor + 1,
       data: { reason: { kind: 'cancelled' } },
     })
+    if (options.continueQueued) {
+      this.backend.continueQueued(this.id)
+    }
   }
 
   async loadOlder(): Promise<boolean> {

@@ -1,6 +1,7 @@
 export type {
   ConversationBackend,
   SessionHandle,
+  CancelOptions,
   SessionView,
   SessionSummary,
   SessionAction,

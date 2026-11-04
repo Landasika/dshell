@@ -104,7 +104,7 @@ interface UserMessageLike {
 interface InboxLike {
   nextTurn: readonly UserMessageLike[]
   nextStep: readonly UserMessageLike[]
-  remove(id: string): void
+  remove(id: string): boolean | void
   replace(id: string, message: UserMessageLike): void
 }
 
@@ -114,7 +114,7 @@ interface AgentLike {
   session: { id: string }
   followup(message: UserMessageLike): void
   steer(message: UserMessageLike): void
-  cancel(cause: { kind: 'user' }): void
+  cancel(cause: { kind: 'user' }, options?: { keepInbox?: boolean }): void
   inbox?: InboxLike
 }
 
@@ -239,6 +239,7 @@ interface AgentDefaultModelLike {
 }
 
 interface SessionControllerLike extends HarnessHistoryOwner {
+  cancel?(request: { sessionId: string }): { accepted: true } | Promise<{ accepted: true }>
   rename?(request: { sessionId: string; title: string }): Promise<{ title: string; seq: number }>
   fork?(request: { sessionId: string; atSeq?: number }): Promise<{ sessionId: string }>
   modelCatalog(): Promise<ModelCatalog>
@@ -2346,7 +2347,28 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'the requested prompt does not own the active turn' })
       return
     }
-    if (agent !== undefined) agent.cancel({ kind: 'user' })
+    if (message.continueQueued === true && message.killSubagents === true) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'cannot continue the queue while stopping the whole session' })
+      return
+    }
+    if (agent !== undefined) {
+      if (message.continueQueued === true) {
+        const controller = sessionController()
+        if (controller?.cancel) await controller.cancel({ sessionId: message.sessionId })
+        else agent.cancel({ kind: 'user' }, { keepInbox: true })
+        // Cancellation parks retained work. Re-enqueue the last item at the
+        // same tail position to wake the driver, preserving every identity,
+        // attachment and FIFO position. A wake after abort is latched by the
+        // owner until the old turn converges; no polling or new prompt is needed.
+        const inbox = agent.inbox
+        const queued = inbox?.nextTurn.at(-1)
+        const next = queued ?? inbox?.nextStep.at(-1)
+        if (next !== undefined && inbox?.remove(next.id) !== false) {
+          if (queued !== undefined) agent.followup(next)
+          else agent.steer(next)
+        }
+      } else agent.cancel({ kind: 'user' })
+    }
     const subagents = message.killSubagents === true ? await cancelSubagents(message.sessionId) : 0
     jsonLine(socket, {
       type: 'cancelled',
@@ -2580,7 +2602,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           await sessionAction(socket, message)
           return
         case 'session/cancel':
-          cancel(socket, message)
+          await cancel(socket, message)
           return
         case 'queue/edit':
           queueEdit(socket, message)

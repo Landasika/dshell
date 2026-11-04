@@ -7,14 +7,14 @@ DSH versions and platforms in this table.
 
 | dshell | DSH | dshell protocol | Node | OS | Status |
 | --- | --- | --- | --- | --- | --- |
-| `0.5.2` | `0.2.1-rc.2` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Contract and isolated Host model switching tested; user Host deployment pending** |
+| `0.5.2` | `0.2.1-rc.2` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Contract, isolated Host model switching and queue continuation tested; user Host deployment pending** |
 | `0.2.0` | `0.2.1-rc.3` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Partially tested** (see below) |
 | `0.2.0` | `0.2.1-rc.2` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Tested** |
 | `0.1.0` | `0.2.1-rc.2` | 2 | `^22.19.0 \|\| >=24.0.0` | Linux x64 | **Tested** |
 
 ### 0.5.2 user journey verification (2026-11-04)
 
-The regression suite includes 262 tests, with 19 TUI user journeys covering
+The regression suite includes 272 tests, with 23 TUI user journeys covering
 lost model receipts, repeated confirmation, concurrent frontend changes,
 reconnect races, draft recovery, history scrolling and 20×6 terminals.
 An isolated real rc.2 Host passed 40 sequential model switches and a separate
@@ -23,6 +23,14 @@ without an unexpected disconnect. Reattach restored the durable selection.
 These control-only checks did not invoke an LLM, and the original trigger for
 the user's reported disconnect has not been reproduced. See the
 [full verification record](./reviews/2026-11-04-user-journeys.md).
+
+Esc and `/cancel` now stop the current turn, retain pending messages and wake
+the next turn on the Host. An isolated rc.2 Host with a local streaming model
+stub verified both gestures: one aborted active request followed by two
+completed queued requests, in FIFO order with original Host message IDs.
+The `cancel-continue` capability is required; an older loaded plugin produces
+an explicit upgrade/restart message before sending a destructive cancel.
+See the [queue cancellation verification](./reviews/2026-11-04-queue-cancel.md).
 
 ### 0.2.1-rc.3 verification record (2026-10-29)
 
@@ -128,6 +136,6 @@ The release workflow and `scripts/verify-pack.sh` verify:
 - no `.p0`, `.cache`, `docs/development`, or credentials are packed;
 - a clean `npm install` of the tarball exposes the `dshell` bin and the
   `dshell-host` plugin export;
-- `pnpm test` (262 tests), typecheck, and lint pass.
+- `pnpm test` (272 tests), typecheck, and lint pass.
 
 See [`docs/dev/06-compatibility-release.md`](./dev/06-compatibility-release.md).

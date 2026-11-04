@@ -36,6 +36,7 @@ import { advanceModelSelection, readModelSelection, sameModelSelection, type Mod
 import { adaptSessionEvent, adaptSessionEvents, type SessionEvent } from './events.js'
 import {
   BackendError,
+  type CancelOptions,
   type CreateSessionOptions,
   type DshellBackend,
   type DshellCapabilities,
@@ -105,6 +106,7 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     workspaces: has('workspaces'),
     createSession: has('create-session'),
     cancel: has('cancel'),
+    continueQueued: has('cancel-continue'),
     steer: has('steer'),
     paging: has('history'),
     approvals: has('approval'),
@@ -689,8 +691,12 @@ export class SocketSessionHandle implements SessionHandle {
     } catch (error) { throw mapError(error) }
   }
 
-  async cancel(killSubagents = false, requestId?: string): Promise<void> {
+  async cancel(killSubagents = false, requestId?: string, options: CancelOptions = {}): Promise<void> {
     this.assertOpen()
+    if (options.continueQueued && !this.connection.welcome.capabilities.includes('cancel-continue')) {
+      throw new BackendError('UNSUPPORTED_CAPABILITY', 'this Host cannot stop a turn and continue its queue',
+        'restart the Host to load the current dshell-host plugin')
+    }
     // Wait for the Host's acknowledgement (bounded): a client that quits on
     // Ctrl-C must not race its own cancel — the turn should already be
     // stopping before the process goes away.
@@ -701,11 +707,13 @@ export class SocketSessionHandle implements SessionHandle {
           sessionId: this.id,
           ...(requestId === undefined ? {} : { requestId }),
           ...(killSubagents ? { killSubagents: true } : {}),
+          ...(options.continueQueued ? { continueQueued: true } : {}),
         },
         (candidate) => candidate.type === 'cancelled',
         3_000,
       )
-    } catch {
+    } catch (error) {
+      if (options.continueQueued) throw mapError(error)
       // The cancel was sent; a slow or absent reply must not block quitting.
     }
   }

@@ -125,7 +125,7 @@ function createFakeCtx(services = {}) {
 
 /** An agent with a real, manipulable inbox — enough for queue commands. */
 function makeAgent(sessionId) {
-  const state = { cancelled: 0 }
+  const state = { cancelled: 0, cancelOptions: undefined }
   const sent = []
   const sentMessages = []
   const inbox = {
@@ -151,8 +151,13 @@ function makeAgent(sessionId) {
     inbox,
     followup: record('followup'),
     steer: record('steer'),
-    cancel() {
+    cancel(_cause, options) {
       state.cancelled += 1
+      state.cancelOptions = options
+      if (!options?.keepInbox) {
+        inbox.nextTurn = []
+        inbox.nextStep = []
+      }
     },
   }
   return { agent, state, inbox, sent, sentMessages }
@@ -517,7 +522,79 @@ test('session/cancel cancels the agent without unrelated replies (DS-001)', asyn
     `session/cancel must produce only its ack, got ${JSON.stringify(replies)}`,
   )
   assert.equal(unit.state.cancelled, 1)
-  assert.equal([...unit.inbox.nextTurn, ...unit.inbox.nextStep].length, 1, 'cancel itself does not edit the inbox')
+  assert.equal([...unit.inbox.nextTurn, ...unit.inbox.nextStep].length, 0, 'an explicit full stop still clears pending work')
+})
+
+test('cancel with continueQueued preserves the queue order, message identities and attachments and wakes it once', async t => {
+  const harness = await startHarness(t)
+  const unit = makeAgent('s1')
+  harness.agents.set('s1', unit.agent)
+  const queued = ['q1', 'q2', 'q3'].map(id => ({ id, role: 'user', source: { kind: 'user', rpcId: id }, content: [
+    { type: 'text', text: id }, { type: 'image', mediaType: 'image/png', data: 'image-data' },
+  ] }))
+  const steering = { id: 'steer', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'pending steer' }] }
+  unit.inbox.nextTurn.push(...queued)
+  unit.inbox.nextStep.push(steering)
+  unit.agent.followup = message => {
+    unit.sentMessages.push({ mode: 'followup', message })
+    unit.inbox.nextTurn.push(message)
+  }
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  const welcome = await client.next()
+  assert.ok(welcome.capabilities.includes('cancel-continue'))
+  client.send({ type: 'session/cancel', sessionId: 's1', continueQueued: true })
+  assert.equal((await client.next()).type, 'cancelled')
+  assert.equal(unit.state.cancelled, 1)
+  assert.deepEqual(unit.state.cancelOptions, { keepInbox: true })
+  assert.deepEqual(unit.inbox.nextTurn, queued, 'the same messages must retain FIFO order')
+  assert.deepEqual(unit.inbox.nextStep, [steering])
+  assert.equal(unit.sentMessages.length, 1, 'only one wake is needed for the driver to drain the queue')
+  assert.equal(unit.sentMessages[0].message, queued[2], 'waking must reuse the same message object, including attachments')
+})
+
+test('cancel continues steering-only input without inserting an artificial user prompt', async t => {
+  const harness = await startHarness(t)
+  const unit = makeAgent('s1')
+  harness.agents.set('s1', unit.agent)
+  const steering = ['s1', 's2'].map(id => ({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: id }] }))
+  unit.inbox.nextStep.push(...steering)
+  unit.agent.steer = message => { unit.sentMessages.push({ message }); unit.inbox.nextStep.push(message) }
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/cancel', sessionId: 's1', continueQueued: true })
+  assert.equal((await client.next()).type, 'cancelled')
+  assert.deepEqual(unit.inbox.nextStep, steering)
+  assert.equal(unit.sentMessages[0].message, steering[1])
+  assert.equal(unit.inbox.nextTurn.length, 0)
+})
+
+test('continuing cancellation delegates to the owner and reports owner failure without waking or clearing the queue', async t => {
+  const ownerCalls = []
+  const harness = await startHarness(t, {}, { sessionController: {
+    modelCatalog: async () => ({}),
+    cancel: async request => { ownerCalls.push(request); throw new Error('owner rejected cancellation') },
+  } })
+  const unit = makeAgent('s1')
+  harness.agents.set('s1', unit.agent)
+  const pending = { id: 'q1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'keep me' }] }
+  unit.inbox.nextTurn.push(pending)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/cancel', sessionId: 's1', continueQueued: true, rpcId: 'stop-owner' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'error')
+  assert.equal(reply.rpcId, 'stop-owner')
+  assert.match(reply.message, /owner rejected/)
+  assert.deepEqual(ownerCalls, [{ sessionId: 's1' }])
+  assert.deepEqual(unit.inbox.nextTurn, [pending])
+  assert.equal(unit.state.cancelled, 0)
+  assert.equal(unit.sentMessages.length, 0)
 })
 
 test('queue commands reject unknown, empty, and consumed items with a single error', async (t) => {
