@@ -521,19 +521,40 @@ function crc32(buffer: Buffer): number {
  *
  * 用两个半块字符（`▀`/`▄`/`█`）把上下两行合成一行，这样二维码在终端里
  * 是"方"的——直接用单字符会让高宽比变成 2:1，摄像头扫不出来。
+ *
+ * ## 必须显式指定黑白，不能靠终端配色
+ *
+ * 半块字符画的是**前景色**，空格露出**背景色**。所以二维码的"黑块"究竟是
+ * 屏幕上的黑还是白，取决于终端主题：
+ *
+ *  - 浅色终端（白底黑字）→ 黑块显示为黑 → 正色码 → 能扫
+ *  - 深色终端（黑底白字）→ 黑块显示为**白** → 反色码 → **zxing 默认解不出**
+ *
+ * 实测：同一张码，浅色终端能解，深色终端 `NotFoundException`。
+ * 而绝大多数终端是深色的，等于默认发了一个扫不上的码。
+ *
+ * 所以这里用 ANSI 把前景锁成黑、背景锁成白：不管终端主题是什么，
+ * 屏幕上永远是白底黑块的正色码。这正是用户反馈"完全扫不上"的真正原因——
+ * 和二维码大小无关（改小尺寸前后一样扫不上）。
+ *
+ * @param forceColor 传 false 可关掉 ANSI（用于测试/不支持颜色的场合）
  */
-export function renderTerminal(qr: QrMatrix, quiet = 2): string {
+export function renderTerminal(qr: QrMatrix, quiet = 2, forceColor = true): string {
+  // 30 = 黑字，107 = 亮白底（用亮白而不是普通白，避免某些终端把 47 显示成灰）
+  const fg = forceColor ? '\u001b[30m' : ''
+  const bg = forceColor ? '\u001b[107m' : ''
+  const reset = forceColor ? '\u001b[0m' : ''
   const lines: string[] = []
   const dark = (row: number, col: number): boolean =>
     row >= 0 && col >= 0 && row < qr.size && col < qr.size && qr.dark(row, col)
   for (let row = -quiet; row < qr.size + quiet; row += 2) {
-    let line = ''
+    let line = forceColor ? bg + fg : ''
     for (let col = -quiet; col < qr.size + quiet; col += 1) {
       const top = dark(row, col)
       const bottom = dark(row + 1, col)
       line += top && bottom ? '█' : top ? '▀' : bottom ? '▄' : ' '
     }
-    lines.push(line)
+    lines.push(forceColor ? line + reset : line)
   }
   return lines.join('\n')
 }
