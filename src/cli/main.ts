@@ -30,6 +30,14 @@ interface Options {
   png?: string
   /** (remote) 只打印配对码和地址，不画二维码。 */
   quiet?: boolean
+  /** (install) 目标 profile 名。 */
+  profile?: string
+  /** (install) 只报告，不写文件。 */
+  dryRun?: boolean
+  /** (install) 不碰 systemd。 */
+  noService?: boolean
+  /** (install) 只建服务。 */
+  serviceOnly?: boolean
 }
 
 const HELP = `dshell ${packageVersion()}
@@ -48,6 +56,7 @@ Usage:
   dshell steer <sessionId> <text...>
   dshell cancel <sessionId>
   dshell remote [--port 8792]        show a pairing QR code for the phone App
+  dshell install [--profile dshell]  install the plugin + host service into a profile
 
 Options:
   --socket <path>     override the control socket
@@ -58,6 +67,10 @@ Options:
   --port <n>          (remote) WebSocket port the Host listens on
   --png <path>        (remote) also save the QR code as a PNG
   --quiet             (remote) print the code and addresses only, no QR
+  --profile <name>    (install) target profile, default 'dshell'
+  --dry-run           (install) report what would change, write nothing
+  --no-service        (install) only touch the profile, leave systemd alone
+  --service-only      (install) only create the systemd unit
   -p, --print         one-shot mode; prompt from args or stdin
   --output-format <f> text | json | stream-json (default: text)
   --json              shorthand for --output-format json
@@ -87,6 +100,10 @@ function parseArgs(argv: string[]): Options {
   let port: number | undefined
   let png: string | undefined
   let quiet = false
+  let profile: string | undefined
+  let dryRun = false
+  let noService = false
+  let serviceOnly = false
   let timeoutMs = 120_000
   let verbose = false
   let resume: string | undefined
@@ -182,6 +199,25 @@ function parseArgs(argv: string[]): Options {
       index += 1
       continue
     }
+    if (arg === '--profile') {
+      const value = argv[index + 1]
+      if (value === undefined) throw new DshellError('BAD_REQUEST', '--profile requires a name')
+      profile = value
+      index += 1
+      continue
+    }
+    if (arg === '--dry-run') {
+      dryRun = true
+      continue
+    }
+    if (arg === '--no-service') {
+      noService = true
+      continue
+    }
+    if (arg === '--service-only') {
+      serviceOnly = true
+      continue
+    }
     if (arg === '--port') {
       const value = Number(argv[index + 1])
       if (!Number.isInteger(value) || value <= 0 || value > 65535) {
@@ -237,6 +273,10 @@ function parseArgs(argv: string[]): Options {
     ...(port === undefined ? {} : { port }),
     ...(png === undefined ? {} : { png }),
     ...(quiet ? { quiet } : {}),
+    ...(profile === undefined ? {} : { profile }),
+    ...(dryRun ? { dryRun } : {}),
+    ...(noService ? { noService } : {}),
+    ...(serviceOnly ? { serviceOnly } : {}),
   }
 }
 
@@ -567,6 +607,18 @@ export async function main(argv: string[]): Promise<void> {
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
         })
+        return
+      }
+      case 'install': {
+        const { runInstall, printInstall } = await import('./install.js')
+        const result = await runInstall({
+          ...(options.profile === undefined ? {} : { profile: options.profile }),
+          ...(options.port === undefined ? {} : { port: options.port }),
+          ...(options.dryRun === true ? { dryRun: true } : {}),
+          ...(options.noService === true ? { noService: true } : {}),
+          ...(options.serviceOnly === true ? { serviceOnly: true } : {}),
+        })
+        printInstall(result, options.dryRun === true)
         return
       }
       case 'remote': {
