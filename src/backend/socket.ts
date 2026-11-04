@@ -17,19 +17,23 @@ import type {
   ProviderSyncAppliedMessage,
   ProviderDeletedMessage,
   ProviderField,
+  PromptContentPart,
   ProviderListMessage,
   ProviderUpdatedMessage,
+  ProviderSavedMessage,
   QuestionAnswer,
   QueueUpdatedMessage,
   ServerMessage,
   SessionCreatedMessage,
-  SessionEvent,
+  SessionEvent as WireSessionEvent,
   SessionHeader,
   SessionsMessage,
   SkillMessage,
   SkillsMessage,
 } from '../protocol/index.js'
 import { isStreamStart, streamChunkParts } from './stream.js'
+import { advanceModelSelection, readModelSelection, sameModelSelection, type ModelSelectionState } from '../shared/model-selection.js'
+import { adaptSessionEvent, adaptSessionEvents, type SessionEvent } from './events.js'
 import {
   BackendError,
   type CreateSessionOptions,
@@ -37,6 +41,7 @@ import {
   type DshellCapabilities,
   type NewProviderSpec,
   type ProviderList,
+  type PromptInput,
   type AgentRoster,
   type SendOptions,
   type SkillCatalog,
@@ -44,6 +49,8 @@ import {
   type SessionHandle,
   type SessionSummary,
   type SessionView,
+  type SessionAction,
+  type SessionActionResult,
   type WorkspaceSummary,
 } from './types.js'
 
@@ -92,7 +99,9 @@ function capabilitiesFrom(welcome: { capabilities?: readonly string[] } | null):
     list: has('list'),
     attach: has('attach'),
     prompt: has('prompt'),
+    promptContent: has('prompt-content'),
     streaming: has('stream'),
+    turnCorrelation: has('turn-correlation'),
     workspaces: has('workspaces'),
     createSession: has('create-session'),
     cancel: has('cancel'),
@@ -125,6 +134,8 @@ export class SocketBackend implements DshellBackend {
     this.socketPath = socketPath
   }
 
+  get handleCount(): number { return this.handles.size }
+
   get connected(): boolean {
     return this.control !== null
   }
@@ -145,6 +156,7 @@ export class SocketBackend implements DshellBackend {
 
   async selectModel(sessionId: string, selection: ModelSelection): Promise<ModelSelection> {
     const connection = this.requireControl()
+    const views = [...this.handles].filter(handle => handle.id === sessionId).map(handle => ({ handle, cursor: handle.snapshot().cursor }))
     try {
       const message = await connection.request<ModelSelectedMessage>(
         {
@@ -157,6 +169,7 @@ export class SocketBackend implements DshellBackend {
         (candidate) => candidate.type === 'model-selected',
         25_000,
       )
+      for (const { handle, cursor } of views) handle.confirmModelSelection(message.selected, cursor)
       return message.selected
     } catch (error) {
       throw mapError(error)
@@ -225,7 +238,7 @@ export class SocketBackend implements DshellBackend {
         (candidate) => candidate.type === 'provider-list',
         15_000,
       )
-      return { file: message.file, writable: message.writable, providers: message.providers }
+      return { file: message.file, writable: message.writable, ...(message.source === undefined ? {} : { source: message.source }), providers: message.providers }
     } catch (error) {
       throw mapError(error)
     }
@@ -240,6 +253,30 @@ export class SocketBackend implements DshellBackend {
         15_000,
       )
       return { file: message.file, writable: true, providers: message.providers }
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  async saveProvider(
+    providerId: string,
+    changes: Partial<Record<ProviderField, string>>,
+    apiKey?: string,
+  ): Promise<ProviderList & { ref?: string }> {
+    const connection = this.requireControl()
+    try {
+      const message = await connection.request<ProviderSavedMessage>(
+        { type: 'provider/save', providerId, changes, ...(apiKey === undefined ? {} : { apiKey }) },
+        (candidate) => candidate.type === 'provider-saved',
+        15_000,
+      )
+      return {
+        file: message.file,
+        writable: true,
+        ...(message.source === undefined ? {} : { source: message.source }),
+        providers: message.providers,
+        ...(message.ref === undefined ? {} : { ref: message.ref }),
+      }
     } catch (error) {
       throw mapError(error)
     }
@@ -415,14 +452,14 @@ export class SocketBackend implements DshellBackend {
     return capabilitiesFrom(this.control?.welcome ?? null)
   }
 
-  async listSessions(workspaceId?: string): Promise<SessionSummary[]> {
+  async listSessions(workspaceId?: string, includeArchived = false): Promise<SessionSummary[]> {
     const connection = this.requireControl()
     let message: SessionsMessage
     try {
       // A shared DSH home can hold hundreds of sessions; enumeration plus
       // title snapshots is allowed to take a while before it reports empty.
       message = await connection.request<SessionsMessage>(
-        { type: 'session/list', ...(workspaceId === undefined ? {} : { workspaceId }) },
+        { type: 'session/list', ...(workspaceId === undefined ? {} : { workspaceId }), ...(includeArchived ? { includeArchived: true } : {}) },
         (candidate) => candidate.type === 'sessions',
         25_000,
       )
@@ -435,6 +472,27 @@ export class SocketBackend implements DshellBackend {
     }))
     if (workspaceId === undefined) return sessions
     return sessions.filter((session) => session.workspaceId === workspaceId)
+  }
+
+  async sessionAction(action: SessionAction, sessionId: string, value?: string | boolean): Promise<SessionActionResult> {
+    const connection = this.requireControl()
+    const type = action === 'rename' ? 'session/rename' : action === 'archive' ? 'session/archive'
+      : action === 'restore' ? 'session/restore' : action === 'pin' ? 'session/pin' : 'session/fork'
+    const message = await connection.request(
+      action === 'rename'
+        ? { type: 'session/rename', sessionId, title: typeof value === 'string' ? value : '' }
+        : action === 'pin'
+          ? { type: 'session/pin', sessionId, pinned: value !== false }
+          : action === 'archive'
+            ? { type: 'session/archive', sessionId }
+            : action === 'restore'
+              ? { type: 'session/restore', sessionId }
+              : { type: 'session/fork', sessionId },
+      candidate => candidate.type === 'session-updated' && candidate.sessionId === sessionId,
+      15_000,
+    )
+    if (message.type !== 'session-updated') throw new BackendError('INTERNAL', 'invalid session action reply')
+    return { sessionId: message.newSessionId ?? message.sessionId, ...(message.title === undefined ? {} : { title: message.title }) }
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -482,7 +540,7 @@ export class SocketBackend implements DshellBackend {
     } catch (error) {
       throw mapError(error)
     }
-    const handle = new SocketSessionHandle(sessionId, connection)
+    const handle = new SocketSessionHandle(sessionId, connection, () => this.handles.delete(handle))
     try {
       await handle.start()
     } catch (error) {
@@ -511,14 +569,17 @@ export class SocketSessionHandle implements SessionHandle {
   private readonly events: SessionEvent[] = []
   private cursor = -1
   private status: SessionView['status'] = 'unknown'
+  private modelState: ModelSelectionState = {}
+  private modelSelectionSeq = -1
   private streamText = ''
   private streamReasoning = ''
+  private readonly approvalRequests = new Map<string, NonNullable<SessionView['pendingApproval']>>()
+  private readonly questionRequests = new Map<string, NonNullable<SessionView['pendingAsk']>>()
+  private disconnected = false
+  private offClose: (() => void) | null = null
   private pendingApproval: SessionView['pendingApproval']
   private pendingAsk: SessionView['pendingAsk']
-  private pendingHistory: {
-    resolve: (hasMore: boolean) => void
-    reject: (error: Error) => void
-  } | null = null
+  private historyLoading: Promise<boolean> | null = null
   private pendingApprovalAnswer: string | null = null
   private pendingQuestionAnswer: string | null = null
   private hasMoreHistory = true
@@ -532,7 +593,7 @@ export class SocketSessionHandle implements SessionHandle {
     reject: (error: Error) => void
   } | null = null
 
-  constructor(sessionId: string, connection: HostConnection) {
+  constructor(sessionId: string, connection: HostConnection, private readonly onDispose: () => void = () => {}) {
     this.id = sessionId
     this.connection = connection
     this.header = { id: sessionId }
@@ -544,6 +605,14 @@ export class SocketSessionHandle implements SessionHandle {
       this.readyReject = reject
     })
     this.off = this.connection.onMessage((message) => this.receive(message))
+    this.offClose = this.connection.onClose?.(() => {
+      if (this.disposed) return
+      this.disconnected = true
+      const error = new BackendError('HOST_NOT_RUNNING', 'session connection closed')
+      this.readyReject?.(error)
+      this.pendingAccepted?.reject(error)
+      this.emit()
+    }) ?? null
     this.connection.send({ type: 'attach', sessionId: this.id })
     try {
       await withTimeout(attached, 10_000, `timed out attaching to ${this.id}`)
@@ -564,8 +633,14 @@ export class SocketSessionHandle implements SessionHandle {
   }
 
   snapshot(): SessionView {
+    const modelSelection = this.modelState.pending ?? this.modelState.lastUsed
     return {
       sessionId: this.id,
+      ...(modelSelection === undefined ? {} : { modelSelection: { ...modelSelection } }),
+      hasMoreHistory: this.hasMoreHistory,
+      connected: !this.disconnected,
+      pendingApprovals: [...this.approvalRequests.values()],
+      pendingAsks: [...this.questionRequests.values()],
       header: { ...this.header },
       // The events array is append/rebuild-only and every event object is
       // treated as immutable downstream, so views can share it instead of
@@ -584,33 +659,37 @@ export class SocketSessionHandle implements SessionHandle {
     }
   }
 
-  async send(text: string, options: SendOptions = {}): Promise<SendReceipt> {
+  /** A newer durable selection wins over a late acknowledgement from another connection. */
+  confirmModelSelection(selection: ModelSelection, afterSeq: number): void {
+    if (this.disposed || this.modelSelectionSeq > afterSeq) return
+    this.modelState = { ...this.modelState, pending: { ...selection } }
+    this.emit()
+  }
+
+  async send(input: PromptInput, options: SendOptions = {}): Promise<SendReceipt> {
     this.assertOpen()
-    if (text.trim().length === 0) {
+    const content: PromptContentPart[] = typeof input === 'string' ? [{ type: 'text', text: input }] : input.map(part => ({ ...part }))
+    if (content.length === 0 || !content.some(part => part.type !== 'text' || part.text.trim().length > 0)) {
       throw new BackendError('BAD_REQUEST', 'prompt must not be empty')
+    }
+    if (content.some(part => part.type !== 'text') && !this.connection.welcome?.capabilities.includes('prompt-content')) {
+      throw new BackendError('UNSUPPORTED_CAPABILITY', 'this Host does not accept image or file prompt content')
     }
     if (this.pendingAccepted !== null) {
       throw new BackendError('BAD_REQUEST', 'a prompt is already awaiting acceptance')
     }
-    const accepted = new Promise<SendReceipt>((resolve, reject) => {
-      this.pendingAccepted = { resolve, reject }
-    })
     try {
-      this.connection.send({
-        type: 'prompt',
-        sessionId: this.id,
-        text,
-        mode: options.mode ?? 'queue',
-        requestId: randomUUID(),
-      })
-      return await withTimeout(accepted, 10_000, 'timed out waiting for prompt acceptance')
-    } catch (error) {
-      this.pendingAccepted = null
-      throw mapError(error)
-    }
+      const receipt = await this.connection.request({
+        type: 'prompt', sessionId: this.id, content, mode: options.mode ?? 'queue',
+        requestId: options.requestId ?? randomUUID(),
+        ...(options.requireIdle ? { requireIdle: true } : {}),
+      }, candidate => candidate.type === 'accepted', 10_000)
+      if (receipt.type !== 'accepted') throw new BackendError('INTERNAL', 'invalid prompt receipt')
+      return { requestId: receipt.requestId, mode: receipt.mode }
+    } catch (error) { throw mapError(error) }
   }
 
-  async cancel(killSubagents = false): Promise<void> {
+  async cancel(killSubagents = false, requestId?: string): Promise<void> {
     this.assertOpen()
     // Wait for the Host's acknowledgement (bounded): a client that quits on
     // Ctrl-C must not race its own cancel — the turn should already be
@@ -620,6 +699,7 @@ export class SocketSessionHandle implements SessionHandle {
         {
           type: 'session/cancel',
           sessionId: this.id,
+          ...(requestId === undefined ? {} : { requestId }),
           ...(killSubagents ? { killSubagents: true } : {}),
         },
         (candidate) => candidate.type === 'cancelled',
@@ -632,25 +712,18 @@ export class SocketSessionHandle implements SessionHandle {
 
   async removeQueued(requestId: string): Promise<void> {
     this.assertOpen()
-    this.connection.send({ type: 'queue/remove', sessionId: this.id, requestId })
-    await this.awaitQueueUpdate(requestId, 'remove')
+    try {
+      await this.connection.request({ type: 'queue/remove', sessionId: this.id, requestId },
+        candidate => candidate.type === 'queue-updated' && candidate.requestId === requestId && candidate.action === 'remove', 10_000)
+    } catch (error) { throw mapError(error) }
   }
 
   async editQueued(requestId: string, text: string): Promise<void> {
     this.assertOpen()
-    this.connection.send({ type: 'queue/edit', sessionId: this.id, requestId, text })
-    await this.awaitQueueUpdate(requestId, 'edit')
-  }
-
-  private async awaitQueueUpdate(requestId: string, action: 'edit' | 'remove'): Promise<void> {
     try {
-      await this.connection.waitFor<QueueUpdatedMessage>(
-        (candidate) => candidate.type === 'queue-updated' && candidate.requestId === requestId && candidate.action === action,
-        10_000,
-      )
-    } catch (error) {
-      throw mapError(error)
-    }
+      await this.connection.request({ type: 'queue/edit', sessionId: this.id, requestId, text },
+        candidate => candidate.type === 'queue-updated' && candidate.requestId === requestId && candidate.action === 'edit', 10_000)
+    } catch (error) { throw mapError(error) }
   }
 
   async loadOlder(limit = 50): Promise<boolean> {
@@ -658,14 +731,15 @@ export class SocketSessionHandle implements SessionHandle {
     if (!this.hasMoreHistory) return false
     const oldest = this.events[0]?.seq
     if (oldest === undefined) return false
-    if (this.pendingHistory !== null) {
-      throw new BackendError('BAD_REQUEST', 'a history page is already loading')
-    }
-    const result = new Promise<boolean>((resolve, reject) => {
-      this.pendingHistory = { resolve, reject }
-    })
-    this.connection.send({ type: 'session/history', sessionId: this.id, before: oldest, limit })
-    return await withTimeout(result, 10_000, 'timed out loading older history')
+    if (this.historyLoading !== null) return await this.historyLoading
+    const operation = (async (): Promise<boolean> => {
+      const page = await this.connection.request({ type: 'session/history', sessionId: this.id, before: oldest, limit },
+        candidate => candidate.type === 'history' && candidate.sessionId === this.id, 10_000)
+      return page.type === 'history' && page.hasMore
+    })()
+    this.historyLoading = operation
+    try { return await operation } catch (error) { throw mapError(error) }
+    finally { if (this.historyLoading === operation) this.historyLoading = null }
   }
 
   async answerApproval(
@@ -689,7 +763,11 @@ export class SocketSessionHandle implements SessionHandle {
       throw new BackendError('BAD_REQUEST', 'a question answer is already pending')
     }
     this.pendingQuestionAnswer = callId
-    this.connection.send({ type: 'question/answer', sessionId: this.id, callId, answers })
+    try {
+      await this.connection.request({ type: 'question/answer', sessionId: this.id, callId, answers },
+        candidate => candidate.type === 'question-answered' && candidate.callId === callId, 10_000)
+    } catch (error) { throw mapError(error) }
+    finally { this.pendingQuestionAnswer = null }
   }
 
   dispose(): void {
@@ -697,9 +775,17 @@ export class SocketSessionHandle implements SessionHandle {
     this.disposed = true
     this.off?.()
     this.off = null
+    this.offClose?.()
+    this.offClose = null
     this.listeners.clear()
     this.readyReject?.(new BackendError('SESSION_DISPOSED', 'session handle was disposed'))
+    this.pendingAccepted?.reject(new BackendError('SESSION_DISPOSED', 'session handle was disposed'))
     this.connection.close()
+    this.events.length = 0
+    this.buffered.length = 0
+    this.approvalRequests.clear()
+    this.questionRequests.clear()
+    this.onDispose()
   }
 
   private receive(message: ServerMessage): void {
@@ -722,18 +808,29 @@ export class SocketSessionHandle implements SessionHandle {
   private applyAttached(message: AttachedMessage): void {
     this.header = message.header
     this.events.length = 0
-    this.events.push(...message.events)
+    this.modelState = {}
+    this.modelSelectionSeq = -1
+    for (const event of adaptSessionEvents(message.events)) this.events.push(event)
     this.cursor = message.cursor
     // Attaching in the middle of a turn must not look idle: the tail of the
     // log says whether the last turn is still open. (A current Host also sends
     // an explicit status right after `attached`.)
-    this.status = lastTurnOpen(message.events) ? 'running' : 'idle'
-    for (const event of message.events) this.noteEvent(event)
+    this.status = message.status === 'running' || lastTurnOpen(this.events) ? 'running' : 'idle'
+    this.hasMoreHistory = message.hasMore ?? true
+    for (const event of this.events) this.noteEvent(event)
+    const selected = readModelSelection(message.modelSelection)
+    if (selected !== undefined) {
+      const lastUsed = readModelSelection(message.modelSelectionLastUsed)
+      this.modelState = lastUsed === undefined ? { ...this.modelState, pending: selected }
+        : { lastUsed, ...(sameModelSelection(selected, lastUsed) ? {} : { pending: selected }) }
+    }
+    for (const approval of message.approvals ?? []) this.applyMessage(approval)
+    for (const question of message.questions ?? []) this.applyMessage(question)
   }
 
   private applyMessage(message: ServerMessage): void {
     if (message.type === 'event' && message.sessionId === this.id) {
-      const event = message.event
+      const event = adaptSessionEvent(message.event)
       if (event.seq <= this.cursor) return
       this.events.push(event)
       this.cursor = event.seq
@@ -767,13 +864,12 @@ export class SocketSessionHandle implements SessionHandle {
     }
     if (message.type === 'history' && message.sessionId === this.id) {
       const known = new Set(this.events.map((event) => event.seq))
-      const older = message.events.filter((event) => !known.has(event.seq))
-      this.events.unshift(...older)
+      const older = adaptSessionEvents(message.events).filter((event) => !known.has(event.seq))
+      const merged = [...older, ...this.events]
+      this.events.length = 0
+      for (const event of merged) this.events.push(event)
       this.events.sort((left, right) => left.seq - right.seq)
       this.hasMoreHistory = message.hasMore
-      const pending = this.pendingHistory
-      this.pendingHistory = null
-      pending?.resolve(message.hasMore)
       this.emit()
       return
     }
@@ -785,12 +881,15 @@ export class SocketSessionHandle implements SessionHandle {
         ...(message.callId === undefined ? {} : { callId: message.callId }),
         ...(message.reason === undefined ? {} : { reason: message.reason }),
       }
+      this.approvalRequests.set(message.requestId, this.pendingApproval)
+      this.pendingApproval = this.approvalRequests.values().next().value
       this.status = 'running'
       this.emit()
       return
     }
     if (message.type === 'approval-resolved' && message.sessionId === this.id) {
-      if (this.pendingApproval?.requestId === message.requestId) this.pendingApproval = undefined
+      this.approvalRequests.delete(message.requestId)
+      this.pendingApproval = this.approvalRequests.values().next().value
       this.pendingApprovalAnswer = null
       this.emit()
       return
@@ -803,11 +902,14 @@ export class SocketSessionHandle implements SessionHandle {
         timed: message.timed,
         ...(message.timeoutMs === undefined ? {} : { timeoutMs: message.timeoutMs }),
       }
+      this.questionRequests.set(message.callId, this.pendingAsk)
+      this.pendingAsk = this.questionRequests.values().next().value
       this.emit()
       return
     }
     if (message.type === 'question/closed' && message.sessionId === this.id) {
-      if (this.pendingAsk?.callId === message.callId) this.pendingAsk = undefined
+      this.questionRequests.delete(message.callId)
+      this.pendingAsk = this.questionRequests.values().next().value
       this.emit()
       return
     }
@@ -825,15 +927,13 @@ export class SocketSessionHandle implements SessionHandle {
       if (this.pendingQuestionAnswer !== null) {
         this.pendingQuestionAnswer = null
       }
-      if (this.pendingHistory !== null) {
-        this.pendingHistory.reject(error)
-        this.pendingHistory = null
-      }
     }
   }
 
   private noteEvent(event: SessionEvent): void {
     const data = (event.data ?? {}) as Record<string, unknown>
+    this.modelState = advanceModelSelection(this.modelState, event)
+    if (event.type === 'model/selection') this.modelSelectionSeq = event.seq
     if (event.type === 'session/title' && typeof data.title === 'string' && data.title.length > 0) {
       this.header = { ...this.header, title: data.title }
     }
@@ -853,10 +953,10 @@ export class SocketSessionHandle implements SessionHandle {
     // Only the Host's `approval-request` message carries an answerable id.
     // The durable `approval/asked` event has its own id and may be replayed
     // from history; using it would send an answer for an already-dead request.
-    if (event.type === 'approval/decided') this.pendingApproval = undefined
+    // Answerable interaction state is owned by the live snapshot/delta, not historical events.
     if (event.type === 'tool/result') {
       const message = (data.message ?? {}) as Record<string, unknown>
-      if (this.pendingAsk?.callId === message.toolCallId) this.pendingAsk = undefined
+      // question/closed is authoritative; a timed pending result remains answerable.
     }
   }
 

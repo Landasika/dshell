@@ -1,4 +1,4 @@
-import { displayWidth, sanitizeText } from './width.js'
+import { displayWidth, graphemes, sanitizeText } from './width.js'
 
 /** Editable composer state. `cursor` is a UTF-16 offset, always on a boundary. */
 export interface EditorState {
@@ -17,17 +17,21 @@ export function createEditor(text = ''): EditorState {
 }
 
 function previousBoundary(text: string, index: number): number {
-  if (index <= 0) return 0
-  const code = text.charCodeAt(index - 1)
-  if (code >= 0xdc00 && code <= 0xdfff && index >= 2) return index - 2
-  return index - 1
+  let at = 0, previous = 0
+  for (const cluster of graphemes(text)) {
+    if (at >= index) break
+    previous = at
+    at += cluster.length
+  }
+  return previous
 }
-
 function nextBoundary(text: string, index: number): number {
-  if (index >= text.length) return text.length
-  const code = text.charCodeAt(index)
-  if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length) return index + 2
-  return index + 1
+  let at = 0
+  for (const cluster of graphemes(text)) {
+    at += cluster.length
+    if (at > index) return at
+  }
+  return text.length
 }
 
 export function insertText(state: EditorState, raw: string): EditorState {
@@ -52,7 +56,16 @@ function moveVertical(state: EditorState, direction: -1 | 1): EditorState {
   if (target === position.line) return state
   let offset = 0
   for (let index = 0; index < target; index += 1) offset += (lines[index]?.length ?? 0) + 1
-  return { ...state, cursor: offset + Math.min(position.column, lines[target]?.length ?? 0) }
+  const source = lines[position.line] ?? ''
+  const wanted = displayWidth(source.slice(0, position.column))
+  let cells = 0, column = 0
+  for (const cluster of graphemes(lines[target] ?? '')) {
+    const next = cells + displayWidth(cluster)
+    if (next > wanted) break
+    cells = next
+    column += cluster.length
+  }
+  return { ...state, cursor: offset + column }
 }
 
 /** Apply one editing key. Enter/Tab/Escape and app actions are handled elsewhere. */
@@ -161,7 +174,7 @@ function wrapComposerLine(paragraph: string, width: number): string[] {
   let current = ''
   let currentWidth = 0
   let pending = 0
-  for (const char of paragraph) {
+  for (const char of graphemes(paragraph)) {
     if (char === ' ') {
       pending += 1
       continue

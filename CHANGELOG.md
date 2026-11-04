@@ -3,6 +3,132 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [0.5.2] — 2026-11-04
+
+A full audit of the CLI, print path, socket protocol, Host plugin, configuration
+writing and TUI interaction model. The findings and their reproductions are in
+[`docs/reviews/`](docs/reviews/2026-11-04-full-audit.md); the landing record is
+[`2026-11-04-implementation.md`](docs/reviews/2026-11-04-implementation.md).
+
+### Added
+
+- Session actions the Host owns, instead of dshell editing the session store:
+  `/rename`, `/archive`, `/pin`, `/fork`, and `/archived` to browse and restore.
+  The protocol advertises `session-rename`, `session-archive`, `session-pin`
+  and `session-fork`, and the summary carries `archived` and `pinned`.
+
+- `SessionSummary.preview`: the first line of the latest real user prompt,
+  collapsed to one line and clipped to 60 characters. It is derived from the
+  durable tail with a 24-row / 1.5s batch budget and a five-minute cache, so it
+  cannot slow the session list down.
+
+- A typed prompt contract — `PromptContentPart` — so a prompt can carry text,
+  an image (`image/png`, `jpeg`, `webp`, `gif`) or a file receipt. The Host
+  owner remains the only side that admits the bytes.
+
+- Provider rows report where they came from (`ProviderConfigSource`:
+  `config-editor` or `file`, with `inherited` / `overridden`), so the editor can
+  tell you when the value you see is not the one in the file you are editing.
+
+- A tool-renderer registry (`tool-renderers.ts`) with a fallback for tools
+  dshell has never heard of, instead of every unfamiliar tool folding to a bare
+  name.
+
+- Per-session UI state on disk: the draft, the approval mode and the folded
+  paste state survive a restart.
+
+- Pending interaction state is replayed on attach. `AttachedMessage` can now
+  carry `status`, `approvals`, `questions` and `hasMore`, so a reconnect shows
+  the panel that was actually open instead of waiting for the next event.
+
+### Changed
+
+- `print` (`-p` / `--print`) attributes its output to the request it sent. It
+  used to collect every assistant message after the cursor and stop at any
+  `turn/end`, so a reused session could return the previous turn's answer as
+  this run's success. It now follows prompt → admitted user message → turn,
+  waits for that turn's terminal state, and only cleans up its own request. A
+  busy session is reported instead of being hijacked. A relative `--cwd` is
+  normalised on the client, and a session created without one no longer falls
+  back to the Host's own working directory.
+
+- Requests carry an `rpcId` (`rpc-id`), and responses and errors are matched by
+  it. A timed-out request used to leave its connection open, so a late reply
+  could be accepted as the answer to the next request of the same type. Reads
+  that can be re-asked are retried; a Host that does not advertise `rpc-id`
+  has its connection rebuilt after a timeout.
+
+- Configuration writing goes through the Host's `configEditor` first. The file
+  fallback keeps the lock, checks the revision, writes atomically and shows the
+  diff before committing. Provider fields and their secret save as one
+  transaction: a conflict is a stable `CONFIG_CONFLICT`, a failure rolls the new
+  key back, and on success only the dshell-owned key is retired.
+
+- The `llm-pi-ai` provider block is read and written as YAML (CST) instead of
+  line patterns. The old reader took the first four-space `providers:` it found
+  and could edit another plugin's block; the writer rebuilt from `models:` to
+  the end of the provider, so removing a model also deleted the sibling fields
+  that followed it.
+
+- A prompt that lands on a session another client is writing is no longer an
+  immediate failure in the interaction path; the answer is validated against
+  the session, call, batch and options first, and the first valid answer wins.
+
+### Fixed
+
+- Question cards keep the upstream `detail` and `intent`. A plan review arrives
+  as `detail: args.plan` with `intent.kind = plan-review`, and dshell dropped
+  both, so the plan being approved was never on screen. The body now scrolls in
+  its own area before you decide.
+
+- `session/delete` no longer deletes anything. It returns
+  `physical deletion is unavailable; archive the session instead`; archiving is
+  reversible and the session store is never edited by a client.
+
+- `storeProviderKey` no longer collides across providers: `a-b` and `a.b` used
+  to normalise to the same `A_B_API_KEY` reference, so the second save silently
+  overwrote the first. The reference is namespaced, an existing binding is kept,
+  and validation happens before `store.set` so a rejected write leaves no
+  credential behind.
+
+- Input frames are capped at 8 MiB on both ends, with write-buffer backpressure,
+  so a hostile or broken peer cannot grow the Host's memory without bound.
+
+- Editing, selecting and copying step by grapheme cluster (`Intl.Segmenter`),
+  so combining marks, ZWJ sequences and flags are no longer split.
+
+- The composer and the question wizard scroll in their own viewport on a small
+  terminal instead of pushing the transcript off screen.
+
+- The startup session list keeps one source of truth and keeps its selection by
+  `sessionId`, so a background refresh no longer moves the cursor.
+
+- Session history is paged by the Host owner (`harness-history.ts`), attach
+  takes a bounded tail page, and the TUI pages in more as you scroll. Disposing
+  a handle unregisters it and releases its history and waiters on every backend
+  — socket, fake and replay.
+
+- A custom relay is no longer priced with DeepSeek's official rates: only the
+  `deepseek` and `deepseek-api` providers get `DEEPSEEK_PRICES`, everything else
+  reports unpriced tokens.
+
+- Herdr reports `blocked` while an approval or a question is waiting, not only
+  `working` / `idle`.
+
+### Internal
+
+- Harness events are adapted at the boundary (`backend/events.ts`,
+  `shared/session-events.ts`). Frontends consume dshell's own event vocabulary
+  and an unknown event degrades to a diagnostic instead of leaking through.
+
+- `ConversationBackend` and `AdministrationBackend` are separate contracts, and
+  `ReplayBackend` implements the read-only one so the conversation contract can
+  be verified without a DSH Host. `./backend` exports the stable surface.
+
+## [0.5.1] — 2026-11-03
+
+Skipped: no release was cut for this number.
+
 ## [0.5.0] — 2026-11-03
 
 ### Added
@@ -647,3 +773,4 @@ First V1 candidate for Linux.
 [0.4.2]: https://github.com/Landasika/dshell/releases/tag/v0.4.2
 [0.4.3]: https://github.com/Landasika/dshell/releases/tag/v0.4.3
 [0.5.0]: https://github.com/Landasika/dshell/releases/tag/v0.5.0
+[0.5.2]: https://github.com/Landasika/dshell/releases/tag/v0.5.2

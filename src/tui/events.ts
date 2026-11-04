@@ -1,11 +1,16 @@
-import type { AskedQuestion, SessionEvent } from '../protocol/index.js'
+import type { AskedQuestion } from '../protocol/index.js'
+import type { SessionEvent } from '../backend/events.js'
+import { contentText, dataOf, isInjectedContext } from '../shared/session-events.js'
 import { renderDiff, renderMarkdown } from './markdown.js'
 import { BRAND_ICON, BRAND_NAME } from './brand.js'
 import { paint, paintBand, type Theme } from './theme.js'
 import { eventTime, formatDuration } from './metrics.js'
+import { renderToolCall, toolDisplayLabel } from './tool-renderers.js'
 import { displayWidth, pad, sanitizeText, truncate, wrapText } from './width.js'
 
 type Json = Record<string, any>
+
+export { contentText, dataOf, isInjectedContext } from '../shared/session-events.js'
 
 export type BlockKind =
   | 'user'
@@ -46,20 +51,6 @@ function clockLabel(time: number): string {
 
 function shortAgent(id: string): string {
   return id.length <= 8 ? id : id.slice(0, 8)
-}
-
-function dataOf(event: SessionEvent): Json {
-  return (event.data ?? {}) as Json
-}
-
-function contentText(content: unknown): string {
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter((part): part is { type: string; text?: string } => {
-      return typeof part === 'object' && part !== null && typeof (part as { type?: unknown }).type === 'string'
-    })
-    .map((part) => (part.type === 'text' ? part.text ?? '' : ''))
-    .join('')
 }
 
 function reasoningText(content: unknown): string {
@@ -148,118 +139,9 @@ export function turnFailureMessage(events: readonly SessionEvent[]): string | un
   return undefined
 }
 
-export function isInjectedContext(text: string): boolean {
-  return (
-    text.startsWith('<system-reminder>') ||
-    text.startsWith('Current runtime context.') ||
-    text.startsWith('Time sampled while preparing') ||
-    text.startsWith('The approval policy changed') ||
-    text.startsWith('Session context compacted') ||
-    text.startsWith('Current DSH file policy:')
-  )
-}
-
-function toolArguments(raw: unknown): Json {
-  if (typeof raw === 'string') {
-    try {
-      return JSON.parse(raw) as Json
-    } catch {
-      return { input: raw }
-    }
-  }
-  return typeof raw === 'object' && raw !== null ? (raw as Json) : {}
-}
-
 /** One-line summary of a tool call, tuned for the common DSH tools. */
 export function summarizeTool(name: string, rawArguments: unknown): string {
-  const args = toolArguments(rawArguments)
-  if (name === 'bash') {
-    const command = typeof args.command === 'string' ? args.command : ''
-    const description = typeof args.description === 'string' ? args.description : ''
-    return truncate(description.length > 0 ? `${description} · ${command}` : command, 180)
-  }
-  if (name === 'write' || name === 'read' || name === 'edit' || name === 'apply_patch') {
-    const path = typeof args.file_path === 'string'
-      ? args.file_path
-      : typeof args.path === 'string'
-        ? args.path
-        : ''
-    return truncate(path, 180)
-  }
-  if (name === 'ask_user_question') {
-    // The raw `questions=[{…}]` dump is unreadable; lead with what was asked.
-    const questions = askedQuestions(args)
-    const first = questions[0]
-    if (first === undefined) return ''
-    const options = first.options?.map((option) => option.label).join(' / ') ?? ''
-    const more = questions.length > 1 ? ` (+${String(questions.length - 1)} more)` : ''
-    return truncate(options.length > 0 ? `${first.question} · ${options}${more}` : `${first.question}${more}`, 180)
-  }
-  const compact = Object.entries(args)
-    .slice(0, 3)
-    .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`)
-    .join(' ')
-  return truncate(compact, 180)
-}
-
-/** Claude-Code-style labels for the tools dshell knows by name. */
-const TOOL_LABELS: Record<string, string> = {
-  bash: 'Bash',
-  read: 'Read',
-  read_image: 'Image',
-  write: 'Write',
-  edit: 'Edit',
-  apply_patch: 'Patch',
-  grep: 'Grep',
-  glob: 'Glob',
-  task: 'Task',
-  web_fetch: 'Fetch',
-  web_search: 'Search',
-  todo: 'Todo',
-  ask_user_question: 'Ask',
-  skill: 'Skill',
-  subagent: 'Agent',
-}
-
-/** The single argument that identifies a call, the way Claude Code shows it. */
-function primaryArgument(name: string, args: Record<string, unknown>): string {
-  const pick = (keys: readonly string[]): string => {
-    for (const key of keys) {
-      const value = args[key]
-      if (typeof value === 'string' && value.trim().length > 0) return value
-    }
-    return ''
-  }
-  switch (name) {
-    case 'bash':
-      return pick(['command', 'cmd'])
-    case 'read':
-    case 'read_image':
-    case 'write':
-    case 'edit':
-    case 'apply_patch':
-      return pick(['file_path', 'path', 'file'])
-    case 'grep':
-    case 'glob':
-      return pick(['pattern', 'query', 'glob'])
-    case 'web_fetch':
-      return pick(['url'])
-    case 'web_search':
-      return pick(['query', 'q'])
-    case 'task':
-    case 'skill':
-      return pick(['description', 'name', 'prompt'])
-    case 'ask_user_question': {
-      const first = Array.isArray(args.questions) ? (args.questions[0] as { question?: unknown }) : undefined
-      return typeof first?.question === 'string' ? first.question : ''
-    }
-    case 'todo':
-      return ''
-    default: {
-      const first = Object.values(args).find((value) => typeof value === 'string' && value.trim().length > 0)
-      return typeof first === 'string' ? first : ''
-    }
-  }
+  return renderToolCall(name, rawArguments).summary
 }
 
 /**
@@ -267,11 +149,7 @@ function primaryArgument(name: string, args: Record<string, unknown>): string {
  * Long commands keep their head and end in an ellipsis at render time.
  */
 export function toolSignature(name: string, rawArguments: unknown): string {
-  const args = toolArguments(rawArguments)
-  const label = TOOL_LABELS[name] ?? `${name.slice(0, 1).toUpperCase()}${name.slice(1)}`
-  const primary = primaryArgument(name, args).replace(/\s+/g, ' ').trim()
-  if (primary.length === 0) return label
-  return `${label}(${truncate(primary, 300)})`
+  return renderToolCall(name, rawArguments).signature
 }
 
 /**
@@ -283,7 +161,7 @@ export function toolSignature(name: string, rawArguments: unknown): string {
 export function toolLabel(block: Block): string {
   if (block.headline !== undefined && block.headline.length > 0) return block.headline
   const name = block.toolName ?? block.title ?? 'tool'
-  return TOOL_LABELS[name] ?? name
+  return toolDisplayLabel(name)
 }
 
 /** The question rows of an `ask_user_question` call, for the detail panel. */
@@ -393,6 +271,8 @@ function askedQuestions(argumentsJson: unknown): AskedQuestion[] {
     out.push({
       id: question.id,
       question: question.question,
+      ...(typeof question.detail === 'string' ? { detail: question.detail } : {}),
+      ...(typeof question.intent === 'object' && question.intent !== null ? { intent: question.intent as AskedQuestion['intent'] } : {}),
       ...(typeof header === 'string' && header.length > 0 ? { header } : {}),
       ...(multi === true ? { multiSelect: true } : {}),
       ...(options !== undefined && options.length > 0 ? { options } : {}),
@@ -445,8 +325,8 @@ export function pendingQuestions(events: readonly SessionEvent[]): PendingAsk | 
       }
     }
   }
-  if (newest.length === 0 || !open.has(newest)) return undefined
-  return { callId: newest, questions: open.get(newest) ?? [] }
+  const pending = [...open.entries()].at(-1)
+  return pending === undefined ? undefined : { callId: pending[0], questions: pending[1] }
 }
 
 export function buildBlocks(events: readonly SessionEvent[], verbose = false): Block[] {

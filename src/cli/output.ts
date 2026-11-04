@@ -1,4 +1,6 @@
-import type { AttachedMessage, SessionEvent, SessionSummary, WorkspaceSummary } from '../protocol/index.js'
+import type { AttachedMessage, SessionSummary, WorkspaceSummary } from '../protocol/index.js'
+import type { SessionEvent } from '../backend/events.js'
+import { adaptSessionEvent } from '../backend/events.js'
 
 type JsonObject = Record<string, any>
 
@@ -138,5 +140,5 @@ export function printAttached(attached: AttachedMessage, verbose = false): void 
   console.log(
     `\n[attached] ${attached.sessionId} cursor=${attached.cursor} history=${attached.events.length}`,
   )
-  for (const event of attached.events) printEvent(event, verbose)
+  for (const event of attached.events) printEvent(adaptSessionEvent(event), verbose)
 }

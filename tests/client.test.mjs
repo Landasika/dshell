@@ -291,3 +291,40 @@ test('a failing command does not disturb concurrent or stream waiters (DS-006)',
 function serverSocketOf(server, connection) {
   return server.lastSocket
 }
+
+test('RPC correlation isolates a timed-out reply and error from the next request', async t => {
+  for (const lateType of ['workspaces', 'error']) await t.test(lateType, async t => {
+    let first
+    const server = await socketServer((request, socket) => {
+      if (request.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test',
+        capabilities: ['rpc-id'], socketPath: 'test.sock', sessions: [] })
+      else if (request.type === 'workspaces' && !first) first = request
+      else if (request.type === 'workspaces') {
+        write(socket, lateType === 'error'
+          ? { type: 'error', rpcId: first.rpcId, code: 'INTERNAL', message: 'late failure' }
+          : { type: 'workspaces', rpcId: first.rpcId, workspaces: [{ id: 'stale' }] })
+        setTimeout(() => write(socket, { type: 'workspaces', rpcId: request.rpcId, workspaces: [{ id: 'current' }] }), 20)
+      }
+    })
+    const connection = await HostConnection.connect(server.socketPath)
+    t.after(async () => { connection.close(); await server.close() })
+    await assert.rejects(connection.request({ type: 'workspaces' }, message => message.type === 'workspaces', 60), /timed out/)
+    const next = await connection.request({ type: 'workspaces' }, message => message.type === 'workspaces', 1000)
+    assert.equal(next.workspaces[0].id, 'current')
+    assert.notEqual(next.rpcId, first.rpcId)
+  })
+})
+
+test('a legacy Host timeout closes the ambiguous connection before the next command', async t => {
+  let commands = 0
+  const server = await socketServer((request, socket) => {
+    if (request.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test',
+      capabilities: [], socketPath: 'test.sock', sessions: [] })
+    else commands += 1
+  })
+  const connection = await HostConnection.connect(server.socketPath)
+  t.after(async () => { connection.close(); await server.close() })
+  await assert.rejects(connection.request({ type: 'workspaces' }, message => message.type === 'workspaces', 60), /timed out/)
+  await assert.rejects(connection.request({ type: 'workspaces' }, message => message.type === 'workspaces', 1000), /closed/)
+  assert.equal(commands, 1, 'an uncorrelated late reply must never answer a second command')
+})

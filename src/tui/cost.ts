@@ -11,7 +11,7 @@
  * Peak hours (Beijing time, Mon-Fri 09:00-12:00 / 14:00-18:00) use the peak
  * rate; everything else uses the idle rate. This is an estimate, never a bill.
  */
-import type { SessionEvent } from '../protocol/index.js'
+import type { SessionEvent } from '../backend/events.js'
 
 export interface UsageTotals {
   input: number
@@ -58,8 +58,11 @@ export const DEEPSEEK_PRICES: Readonly<Record<string, Price>> = {
   'deepseek-flash': { inputMiss: 1.0, inputHit: 0.02, output: 4.0 },
 }
 
-export function priceForModel(model: string | undefined): Price | undefined {
+const OFFICIAL_DEEPSEEK_PROVIDERS = new Set(['deepseek', 'deepseek-api'])
+
+export function priceForModel(model: string | undefined, provider?: string): Price | undefined {
   if (model === undefined) return undefined
+  if (provider !== undefined && !OFFICIAL_DEEPSEEK_PROVIDERS.has(provider.toLowerCase())) return undefined
   let best: Price | undefined
   let bestLength = 0
   for (const [prefix, price] of Object.entries(DEEPSEEK_PRICES)) {
@@ -176,7 +179,7 @@ export function estimateSessionCost(events: readonly SessionEvent[]): SessionCos
     }
     addTotals(spend.tokens, usage)
 
-    const price = priceForModel(model)
+    const price = priceForModel(model, provider)
     if (price === undefined) {
       unpricedTokens += usage.total
       continue

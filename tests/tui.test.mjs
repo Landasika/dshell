@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -10,6 +10,8 @@ import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from '
 import { renderMarkdown, renderDiff } from '../dist/tui/markdown.js'
 import { centerBlock, panelRule } from '../dist/tui/chrome.js'
 import { askAnswerLines, askQuestionLines, buildBlocks, pendingQuestions, prettyFailureMessage, renderBlocks, renderTranscript, summarizeTool, toolLabel, turnFailureMessage } from '../dist/tui/events.js'
+import { registerToolRenderer } from '../dist/tui/tool-renderers.js'
+import { SessionStateStore } from '../dist/tui/session-state.js'
 import { composerLines, createEditor, editKey, insertText, lineCol } from '../dist/tui/editor.js'
 import { KeyParser } from '../dist/tui/keys.js'
 import { fileCandidates, latestSessionTitle } from '../dist/tui/app.js'
@@ -83,7 +85,7 @@ test('pendingQuestions tracks open, timed, answered, and aborted asks', () => {
       callId: 'q1',
       arguments: JSON.stringify({
         questions: [
-          { id: 'pkg', question: 'which name?', multi_select: false, options: [{ label: 'A', description: 'first' }, { label: 'B' }] },
+          { id: 'pkg', question: 'which name?', detail: 'A long body that explains what the plan changes.', intent: { kind: 'plan-review', approve: 'apply' }, multi_select: false, options: [{ label: 'A', description: 'first' }, { label: 'B' }] },
           { id: 'note', question: 'anything else?', multiSelect: true },
         ],
       }),
@@ -108,6 +110,8 @@ test('pendingQuestions tracks open, timed, answered, and aborted asks', () => {
   const open = pendingQuestions([call(1)])
   assert.equal(open?.callId, 'q1')
   assert.equal(open?.questions[0]?.question, 'which name?')
+  assert.equal(open?.questions[0]?.detail, 'A long body that explains what the plan changes.')
+  assert.equal(open?.questions[0]?.intent?.kind, 'plan-review')
   assert.equal(open?.questions[0]?.options?.[0]?.label, 'A')
   assert.equal(open?.questions[0]?.multiSelect, undefined)
   assert.equal(open?.questions[1]?.multiSelect, true)
@@ -1089,6 +1093,24 @@ test('tool output is truncated and summarizeTool uses common arguments', () => {
   assert.match(summarizeTool('bash', '{"command":"echo hi","description":"Echo"}'), /Echo/)
 })
 
+test('tool renderer registry extends labels and summaries without changing the reducer', () => {
+  const unregister = registerToolRenderer('deploy_preview', {
+    label: 'Preview',
+    primary: ({ arguments: args }) => String(args.environment ?? ''),
+    summary: ({ arguments: args }) => `deploy ${String(args.environment ?? '')}`,
+  })
+  try {
+    const [block] = buildBlocks([{ type: 'tool/call', seq: 1, data: { name: 'deploy_preview', callId: 'd1', arguments: { environment: 'staging' } } }])
+    assert.equal(block.headline, 'Preview(staging)')
+    assert.equal(block.body, 'deploy staging')
+    assert.equal(toolLabel(block), 'Preview(staging)')
+  } finally {
+    unregister()
+  }
+  const [fallback] = buildBlocks([{ type: 'tool/call', seq: 2, data: { name: 'future_tool', callId: 'f1', arguments: { target: 'x' } } }])
+  assert.equal(fallback.headline, 'Future_tool(x)')
+})
+
 test('editor supports unicode boundaries, history, and multiline composers', () => {
   let editor = createEditor('😀a')
   editor = { ...editor, cursor: 0 }
@@ -1160,7 +1182,7 @@ test('completion finds slash commands and @ files', () => {
   assert.equal(completionContext('/attach '), null)
   assert.deepEqual(
     completionFor('/', []).items.map((item) => item.label).slice(0, 3),
-    ['/help', '/sessions', '/workspaces'],
+    ['/help', '/sessions', '/archived'],
   )
   const sessions = completionFor('/se', []).items
   assert.equal(sessions.length, 1)
@@ -1624,6 +1646,8 @@ test('session cost folds durable usage, peak/idle rates, and unpriced models', (
   assert.equal(isPeakHour(Date.UTC(2026, 9, 27, 4, 0)), false)
   assert.equal(isPeakHour(Date.UTC(2026, 9, 24, 2, 0)), false)
   assert.ok(priceForModel('deepseek-v4.1-flash'))
+  assert.ok(priceForModel('deepseek-v4.1-flash', 'deepseek'))
+  assert.equal(priceForModel('deepseek-v4.1-flash', 'deepseek-relay'), undefined)
   assert.equal(priceForModel('unknown-model'), undefined)
   assert.deepEqual(parseUsage({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 3 }), { input: 10, output: 5, cacheRead: 3, cacheWrite: 0, total: 18 })
   assert.equal(formatCostCny(0.0042), '¥0.0042')
@@ -1660,6 +1684,14 @@ test('session cost folds durable usage, peak/idle rates, and unpriced models', (
   ])
   assert.equal(replayed.tokens.total, 3_000_000)
   assert.equal(replayed.pricedTokens, 3_000_000)
+
+  const relay = estimateSessionCost([
+    { type: 'request/context', seq: 1, time: idle, data: { provider: 'deepseek-relay', model: 'deepseek-v4.1-flash' } },
+    { type: 'assistant/message', seq: 2, time: idle, data: { usage } },
+  ])
+  assert.equal(relay.cost, undefined)
+  assert.equal(relay.pricedTokens, 0)
+  assert.equal(relay.unpricedTokens, 3_000_000)
 })
 
 test('usage rail carries model route, cwd, git, agents and cache', () => {
@@ -2914,7 +2946,7 @@ test('provider editor pastes a field value and stores a raw sk- key', async () =
   // A paste from a password manager carries a trailing newline; the field
   // must accept it, and a sk- value is a secret, not an env name.
   input.push('\u001b[200~sk-relay-secret-123\n\u001b[201~')
-  await waitFor(() => output.text.includes('sk-relay-secret-123'))
+  await waitFor(() => output.text.includes('sk-••••23'))
   input.push('\r')
   await new Promise((resolve) => setTimeout(resolve, 20))
   input.push('s')
@@ -2925,7 +2957,7 @@ test('provider editor pastes a field value and stores a raw sk- key', async () =
   const row = (await backend.providerList()).providers.find((entry) => entry.id === 'relay')
   assert.equal(row.apiKeyEnv, 'RELAY_API_KEY', 'the patch file carries the reference, not the secret')
   assert.equal(backend.storedKeys.get('RELAY_API_KEY'), 'sk-relay-secret-123')
-  assert.equal(output.text.includes('sk-relay-secret-123'), true, 'the paste landed in the field')
+  assert.equal(output.text.includes('sk-relay-secret-123'), false, 'raw secrets are never rendered back to the terminal')
 
   input.push('\u0003')
   input.push('\u0004')
@@ -4557,6 +4589,82 @@ test('shift+tab flips the approval mode shown on the composer rule, and allow al
   }
 })
 
+test('session UI state persists drafts, folded paste content, and approval mode atomically', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'dshell-state-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'state.json')
+  const store = await SessionStateStore.open(path)
+  store.set('s1', {
+    draft: 'draft [Pasted text #1 · 12 chars]',
+    approvalMode: 'auto',
+    attachments: [{ kind: 'text', placeholder: '[Pasted text #1 · 12 chars]', text: 'full content' }],
+  })
+  await store.flush()
+  const restored = await SessionStateStore.open(path)
+  assert.equal(restored.get('s1')?.draft, 'draft [Pasted text #1 · 12 chars]')
+  assert.equal(restored.get('s1')?.approvalMode, 'auto')
+  assert.equal(restored.get('s1')?.attachments[0]?.text, 'full content')
+  const onDisk = JSON.parse(await readFile(path, 'utf8'))
+  assert.equal(onDisk.version, 1)
+  assert.equal(onDisk.sessions.s1.attachments[0].kind, 'text')
+})
+
+test('a second TUI restores the same session draft and allow-all mode', async (t) => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+  const directory = await mkdtemp(join(tmpdir(), 'dshell-tui-state-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const statePath = join(directory, 'state.json')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 30
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+  const waitFor = async (output, predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate(stripAnsi(output.text))) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(stripAnsi(output.text).slice(-700))}`)
+  }
+
+  const firstBackend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await firstBackend.connect()
+  const firstInput = new FakeInput(), firstOutput = new FakeOutput()
+  const first = runTui(firstBackend, { cwd: '/work', resume: 's1', color: false, input: firstInput, output: firstOutput, statePath })
+  await waitFor(firstOutput, text => text.includes('idle'), 'first attach')
+  firstInput.push('keep this ')
+  firstInput.push('\u001b[200~' + 'pasted body\n'.repeat(8) + '\u001b[201~')
+  firstInput.push('\u001b[Z')
+  await waitFor(firstOutput, text => text.includes('allow all') && text.includes('[Pasted text #1'), 'saved draft')
+  firstInput.push('\u001a')
+  assert.equal(await first, 0)
+  await firstBackend.disconnect()
+
+  const secondBackend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await secondBackend.connect()
+  const secondInput = new FakeInput(), secondOutput = new FakeOutput()
+  const second = runTui(secondBackend, { cwd: '/work', resume: 's1', color: false, input: secondInput, output: secondOutput, statePath })
+  await waitFor(secondOutput, text => text.includes('idle') && text.includes('keep this') && text.includes('[Pasted text #1') && text.includes('allow all'), 'restored session UI state')
+  secondInput.push('\u001b[Z')
+  secondInput.push('\u0003')
+  secondInput.push('\u0004')
+  await Promise.race([second, new Promise((resolve) => setTimeout(resolve, 1500))])
+  await secondBackend.disconnect()
+})
+
 test('an ask that arrives behind a panel is announced, then surfaces when the panel closes', async () => {
   const { EventEmitter } = await import('node:events')
   const { runTui } = await import('../dist/tui/app.js')
@@ -4619,6 +4727,72 @@ test('an ask that arrives behind a panel is announced, then surfaces when the pa
     // semantics), the second quits from the empty composer.
     input.push('\u0003')
     input.push('\u0003')
+    await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
+    await backend.disconnect()
+  }
+})
+
+test('multiple approvals and questions can be cycled without hiding older pending work', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { runTui } = await import('../dist/tui/app.js')
+  const { FakeBackend } = await import('../dist/backend/index.js')
+
+  class FakeInput extends EventEmitter {
+    isTTY = true
+    setRawMode() {}
+    setEncoding() {}
+    resume() {}
+    pause() {}
+    push(chunk) { this.emit('data', chunk) }
+  }
+  class FakeOutput extends EventEmitter {
+    isTTY = true
+    columns = 100
+    rows = 32
+    text = ''
+    write(chunk) { this.text += chunk; return true }
+  }
+
+  const input = new FakeInput()
+  const output = new FakeOutput()
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
+  await backend.connect()
+  const app = runTui(backend, { cwd: '/work', resume: 's1', color: false, input, output })
+  const plain = () => stripAnsi(output.text)
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 300; index += 1) {
+      if (predicate()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    throw new Error(`timed out waiting for ${label}; got ${JSON.stringify(plain().slice(-700))}`)
+  }
+
+  try {
+    await waitFor(() => plain().includes('idle'), 'attach')
+    backend.askApproval('s1', { requestId: 'a1', sessionId: 's1', toolName: 'bash', reason: 'first approval' })
+    backend.askApproval('s1', { requestId: 'a2', sessionId: 's1', toolName: 'edit', reason: 'second approval' })
+    await waitFor(() => plain().includes('approval required · 1/2') && plain().includes('first approval'), 'first approval')
+    input.push(']')
+    await waitFor(() => plain().includes('approval required · 2/2') && plain().includes('second approval'), 'second approval')
+    input.push('r')
+    await waitFor(() => plain().includes('approval required') && plain().includes('first approval'), 'remaining approval')
+    output.text = ''
+    input.push('r')
+    await waitFor(() => plain().includes('rejected') && !plain().includes('approval required'), 'approvals settled')
+
+    output.text = ''
+    backend.askQuestion('s1', 'q1', [{ id: 'first', question: 'first question?', options: [{ label: 'A' }] }])
+    backend.askQuestion('s1', 'q2', [{ id: 'second', question: 'second question?', options: [{ label: 'B' }] }])
+    await waitFor(() => plain().includes('the model asks · 1/2') && plain().includes('first question?'), 'first question')
+    input.push(']')
+    await waitFor(() => plain().includes('the model asks · 2/2') && plain().includes('second question?'), 'second question')
+    input.push('1')
+    await waitFor(() => plain().includes('first question?') && plain().includes('the model asks'), 'remaining question')
+    input.push('1')
+    await waitFor(() => backend.answeredQuestions.length === 2, 'both answers')
+    assert.deepEqual(backend.answeredQuestions.map(item => item.callId).sort(), ['q1', 'q2'])
+  } finally {
+    input.push('\u0004')
     await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
     await backend.disconnect()
   }

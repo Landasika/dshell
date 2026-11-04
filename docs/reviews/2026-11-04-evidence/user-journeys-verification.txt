@@ -1,0 +1,63 @@
+User journey and extreme-scenario verification
+Date: 2026-11-04
+Package: @landasika/dshell@0.5.2
+Environment: Linux x64, Node v24.21.0, pnpm 11.27.1
+
+pnpm typecheck: passed
+pnpm test:
+ℹ tests 262
+ℹ suites 0
+ℹ pass 262
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 22350.118291
+
+19 user journey scenarios (real runTui; SocketBackend over Unix sockets for transport faults):
+- one model confirmation survives a lost receipt and restores the committed model
+- holding Enter during a slow model switch submits only once
+- a model reply for an old session cannot change the newly attached session
+- a model selection from another frontend refreshes the usage rail immediately
+- a rejected model switch keeps the connection usable and can succeed on the next action
+- an old in-flight request cannot consume a model chosen for the next request
+- a late model receipt cannot overwrite a newer durable choice from another frontend
+- long-session attach restores the owner model selection outside the visible history page
+- reattaching an inherited model does not pin it over later request headers
+- a view-only socket failure reattaches and repeated failures leave one live handle
+- quitting during reconnect prevents any later background connection
+- switching sessions during reconnect cannot take the user back to the disconnected session
+- an explicit reconnect reopens the control connection as well as the session view
+- a slow model receipt preserves a different panel opened while waiting
+- history search scrolls the selected prompt into view beyond the first page
+- long question text can be read completely with PageDown
+- a 20 by 6 terminal keeps the composer and custom question answer cursor visible
+- quitting while the first attach is pending disposes its late handle
+- lost model receipt, another frontend selection, simultaneous socket failures and resize preserve the current model and draft
+
+Real isolated DSH 0.2.1-rc.2 Host, temporary DSH_HOME, no LLM requests:
+Sequential run: 40 confirmed alternating model switches; 0 unexpected disconnects.
+Concurrent run: 2 clients x 50 switches; 1 final confirmed choice; invalid model correctly rejected.
+Concurrent run: 0 unexpected disconnects; both views agreed; reattach restored the committed choice.
+Concurrent run elapsed: 1203 ms including setup, validation and reattach.
+The original user-environment trigger for disconnect remains unconfirmed.
+Only self-created temporary Host processes were stopped.
+
+Existing long-session benchmark (150 frames at each history size):
+stream frames per run: 150
+{"historySize":1000,"streamMedianMs":1.19,"streamTotalMs":187.3,"heapDeltaKb":3406,"appendMs":300.5,"outputKb":8}
+{"historySize":10000,"streamMedianMs":1.48,"streamTotalMs":236.6,"heapDeltaKb":3112,"appendMs":301.6,"outputKb":8}
+{"historySize":50000,"streamMedianMs":2.56,"streamTotalMs":439.4,"heapDeltaKb":9480,"appendMs":527.4,"outputKb":9}
+Benchmark includes event-loop waits and a fixed 300 ms append wait; not pure render or append latency.
+
+scripts/verify-pack.sh: passed; clean temporary installation:
+dshell 0.5.2
+installed plugin: dshell-host
+verified: landasika-dshell-0.5.2.tgz (321465 bytes)
+Tarball SHA256: 99849153a17d990fd358742dab2a245666f1bacab3700c558f814d528d90a9ed
+
+git diff --check: passed
+Read-only upstream references, both git status --porcelain outputs empty:
+rc.2: 687f282e8625c6b8d11ff58211a90524be2e4317
+2026-11-04 source snapshot: 8bd073392eef6f54e921a093b95076248eb08cbb
+No deepseek-harness source, installed DSH code, real user profile or live user Host was modified.

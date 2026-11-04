@@ -14,6 +14,7 @@ import type {
   WorkspaceSummary,
 } from '../backend/index.js'
 import { BackendError } from '../backend/index.js'
+import { sameModelSelection } from '../shared/model-selection.js'
 import type {
   AskedQuestion,
   ModelCatalog,
@@ -86,6 +87,7 @@ import {
 } from './chrome.js'
 import { formatCostCny } from './cost.js'
 import { renderSplash, type SplashSession } from './splash.js'
+import { defaultSessionStatePath, SessionStateStore } from './session-state.js'
 
 export interface TuiOptions {
   cwd: string
@@ -99,6 +101,8 @@ export interface TuiOptions {
   /** Injectable streams for a PTY test harness. */
   input?: ReadStream
   output?: WriteStream
+  /** Override the dshell-owned UI state file; null disables persistence. */
+  statePath?: string | null
 }
 
 interface StartupState {
@@ -107,15 +111,16 @@ interface StartupState {
   workspace?: WorkspaceSummary
   sessions: SessionSummary[]
   index: number
+  selectedSessionId?: string
   /** True until the Host answers the first workspace/session query. */
   loading?: boolean
 }
 
 type Overlay =
-  | { kind: 'sessions'; index: number; workspaceId?: string }
+  | { kind: 'sessions'; index: number; workspaceId?: string; archived?: boolean }
   | { kind: 'workspaces'; index: number }
   | { kind: 'help' }
-  | { kind: 'approval'; details: boolean }
+  | { kind: 'approval'; requestId: string; details: boolean }
   | {
       kind: 'questions'
       callId: string
@@ -127,6 +132,8 @@ type Overlay =
       selected: Record<string, string[]>
       custom: Record<string, string>
       customMode: boolean
+      detailScroll: number
+      detailPageSize?: number
     }
   | { kind: 'history'; query: string; index: number }
   | { kind: 'rewind'; index: number }
@@ -150,6 +157,7 @@ type Overlay =
       providerId: string
       index: number
       draft: Record<ProviderField, string>
+      original: Record<ProviderField, string>
       dirty: Set<ProviderField>
       editing?: { field: ProviderField; value: string }
     }
@@ -193,7 +201,7 @@ function questionRows(question: AskedQuestion, actionLabel = 'submit'): Question
 }
 
 function freshQuestionsOverlay(callId: string, questions: AskedQuestion[]): Overlay {
-  return { kind: 'questions', callId, questions, tab: 0, cursor: 0, selected: {}, custom: {}, customMode: false }
+  return { kind: 'questions', callId, questions, tab: 0, cursor: 0, selected: {}, custom: {}, customMode: false, detailScroll: 0 }
 }
 
 interface AppState {
@@ -255,6 +263,8 @@ interface AppState {
   pasteSeq: number
   /** Ask calls the user dismissed with Esc; they stay hidden until answered. */
   dismissedAsks: Set<string>
+  /** In-progress answers kept while cycling between multiple pending asks. */
+  questionDrafts: Map<string, Extract<Overlay, { kind: 'questions' }>>
   /**
    * How tool approvals are answered while the user is away from the keyboard.
    * `ask` (default) surfaces every request; `auto` allows each one as it
@@ -296,6 +306,13 @@ const PROVIDER_FIELD_LABEL: Record<ProviderField, string> = {
   displayName: 'displayName',
 }
 
+function maskSecret(value: string): string {
+  if (value.length === 0) return value
+  if (/^[A-Z][A-Z0-9_]*$/.test(value)) return value
+  if (value.length <= 6) return '••••••'
+  return `${value.slice(0, 3)}••••${value.slice(-2)}`
+}
+
 interface ModelRow {
   kind: 'group' | 'model' | 'failure'
   provider?: string
@@ -331,6 +348,8 @@ export function findWorkspaceForCwd(
 }
 
 function statusLabel(state: AppState): string {
+  if (state.view?.connected === false) return 'reconnecting'
+  if (state.status === 'switching model') return 'switching model'
   if (state.error !== undefined) return 'error'
   if (state.startup !== undefined) {
     return state.startup.kind === 'missing' ? 'workspace' : 'choose session'
@@ -391,6 +410,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const screen = new TerminalScreen(input, output)
   const viewport = new Viewport()
   const parser = new KeyParser()
+  const stateStore = await SessionStateStore.open(
+    options.statePath === null
+      ? undefined
+      : options.statePath ?? (options.input === undefined && options.output === undefined ? defaultSessionStatePath() : undefined),
+  )
   // 1-based terminal row of the "jump to bottom" pill, for click hit-testing.
   let pillRow: number | null = null
   // 1-based terminal row of the composer's top rule, where the mode pill sits.
@@ -411,6 +435,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
    * attempt is disposed instead of being allowed to replace the current one.
    */
   let sessionGeneration = 0
+  let sessionTarget = options.resume
   let selectAnchor: { line: number; column: number } | null = null
   let selectFocus: { line: number; column: number } | null = null
   /** Screen-space anchor for a drag that started inside a panel (no scrolling). */
@@ -445,6 +470,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     attachments: new Map(),
     pasteSeq: 0,
     dismissedAsks: new Set(),
+    questionDrafts: new Map(),
   }
 
   let renderTimer: NodeJS.Timeout | undefined
@@ -462,6 +488,9 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   /** First screen row of the transcript body, so a selection can be clamped. */
   let lastBodyTop = 3
   let reattaching = false
+  let offBackendDisconnect: (() => void) | undefined
+  let modelChange: { sessionId: string; generation: number; selection: ModelSelection; recovering: boolean; overlay: Overlay | null } | undefined
+  let savingModelDefault = false
   let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
   let lastTurnFailure: string | undefined
   /** Call id already announced as waiting behind another panel. */
@@ -490,6 +519,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const schedule = (): void => {
+    captureSessionState()
     if (renderTimer !== undefined) return
     renderTimer = setTimeout(() => {
       renderTimer = undefined
@@ -534,6 +564,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const quit = (code = 0): void => {
     if (state.quitting) return
     state.quitting = true
+    offBackendDisconnect?.()
     herdrReporter?.release()
     if (renderTimer !== undefined) clearTimeout(renderTimer)
     if (escapeTimer !== undefined) clearTimeout(escapeTimer)
@@ -548,6 +579,28 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.handle = undefined
     screen.stop()
     resolveDone?.(code)
+  }
+
+  const captureSessionState = (): void => {
+    if (state.currentId === undefined) return
+    stateStore.set(state.currentId, {
+      draft: state.editor.text,
+      approvalMode: state.approvalMode,
+      attachments: [...state.attachments].map(([placeholder, text]) => ({ kind: 'text' as const, placeholder, text })),
+    })
+  }
+
+  const restoreSessionState = (sessionId: string): void => {
+    const saved = stateStore.get(sessionId)
+    state.editor = createEditor(saved?.draft ?? '')
+    state.approvalMode = saved?.approvalMode ?? 'ask'
+    state.attachments = new Map(saved?.attachments.map(item => [item.placeholder, item.text]) ?? [])
+    state.pasteSeq = saved?.attachments.reduce((max, item) => {
+      const hit = /#(\d+)/.exec(item.placeholder)
+      return Math.max(max, Number(hit?.[1] ?? 0))
+    }, 0) ?? 0
+    state.historyIndex = -1
+    state.completion = undefined
   }
 
   /**
@@ -650,7 +703,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const session = view === undefined
       ? {}
       : { sessionId: view.sessionId, ...(resume === undefined ? {} : { resumeArgv: resume }) }
-    const approval = view?.pendingApproval
+    const approval = (view?.pendingApprovals?.[0] ?? view?.pendingApproval)
+    const ask = view?.pendingAsks?.[0] ?? view?.pendingAsk
     if (override !== undefined) {
       herdrReporter.update({ state: override, ...session })
       return
@@ -658,6 +712,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (approval !== undefined) {
       const tool = approval.toolName ?? 'tool'
       herdrReporter.update({ state: 'blocked', message: `${tool} needs a decision`, ...session })
+      return
+    }
+    if (ask !== undefined) {
+      herdrReporter.update({ state: 'blocked', message: 'the model needs an answer', ...session })
       return
     }
     herdrReporter.update({ state: view?.status === 'running' ? 'working' : 'idle', ...session })
@@ -728,11 +786,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const view = state.view
     // The Host's live request names the call and arrives while the tool is
     // blocked; the durable scan is the fallback for replay and late answers.
+    const liveAsks = view?.pendingAsks?.length
+      ? view.pendingAsks
+      : view?.pendingAsk === undefined ? [] : [view.pendingAsk]
+    const currentCall = state.overlay?.kind === 'questions' ? state.overlay.callId : undefined
+    const live = liveAsks.find(ask => ask.callId === currentCall)
+      ?? liveAsks.find(ask => !state.dismissedAsks.has(ask.callId))
     const ask = view === undefined || !backend.capabilities().questions
       ? undefined
-      : view.pendingAsk !== undefined
-        ? { callId: view.pendingAsk.callId, questions: view.pendingAsk.questions }
-        : pendingQuestions(view.events)
+      : live !== undefined
+        ? { callId: live.callId, questions: live.questions }
+        : liveAsks.length > 0 ? undefined : pendingQuestions(view.events)
     const current = state.overlay
     if (ask === undefined || state.dismissedAsks.has(ask.callId)) {
       if (current?.kind === 'questions') state.overlay = null
@@ -740,11 +804,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (current === null) {
-      state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
+      state.overlay = state.questionDrafts.get(ask.callId) ?? freshQuestionsOverlay(ask.callId, ask.questions)
       askNotice = undefined
     } else if (current.kind === 'questions') {
-      if (current.callId === ask.callId) current.questions = ask.questions
-      else state.overlay = freshQuestionsOverlay(ask.callId, ask.questions)
+      if (current.callId === ask.callId) {
+        current.questions = ask.questions
+        state.questionDrafts.set(current.callId, current)
+      } else {
+        state.questionDrafts.set(current.callId, current)
+        state.overlay = state.questionDrafts.get(ask.callId) ?? freshQuestionsOverlay(ask.callId, ask.questions)
+      }
     } else if (current.kind !== 'approval' && askNotice !== ask.callId) {
       // The open panel owns the keyboard until it closes; say where the ask is.
       askNotice = ask.callId
@@ -755,6 +824,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const applyView = (view: SessionView): void => {
     state.view = view
     state.currentId = view.sessionId
+    if (view.connected === false) beginReconnect()
     reportHerdr(view)
     refreshGit()
     // Surface a failed turn in the header and as a toast, not only inline.
@@ -787,11 +857,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     pruneQueued(view)
     sampleSpeed(view)
-    if (view.pendingApproval !== undefined) {
+    const approvals = view.pendingApprovals?.length ? view.pendingApprovals : view.pendingApproval === undefined ? [] : [view.pendingApproval]
+    if (approvals.length > 0) {
       // In `allow all` the panel never opens: the request is answered on the
       // way in, so an unattended turn keeps moving instead of stalling here.
       if (state.approvalMode === 'auto') autoAllowApproval()
-      else if (state.overlay?.kind !== 'approval') state.overlay = { kind: 'approval', details: false }
+      else {
+        const selectedApproval = state.overlay?.kind === 'approval' ? state.overlay.requestId : undefined
+        if (selectedApproval !== undefined && approvals.some(item => item.requestId === selectedApproval)) {
+          // Keep the reader on the approval they selected.
+        } else {
+        state.overlay = { kind: 'approval', requestId: approvals[0]!.requestId, details: false }
+        }
+      }
     } else if (state.overlay?.kind === 'approval') {
       state.overlay = null
     }
@@ -801,6 +879,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const openSession = async (sessionId: string): Promise<void> => {
+    if (state.quitting) return
+    sessionTarget = sessionId
     if (state.handle?.id === sessionId) {
       state.startup = undefined
       return
@@ -808,6 +888,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     // Attaching is asynchronous, so two quick picks can overlap: A's reply may
     // land after B's and silently take the screen back to a session the reader
     // already left. Each attempt takes a ticket and only the newest one wins.
+    captureSessionState()
     const generation = ++sessionGeneration
     try {
       state.status = `attaching ${shortId(sessionId)}`
@@ -821,7 +902,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           schedule()
         },
       })
-      if (generation !== sessionGeneration) {
+      if (state.quitting || generation !== sessionGeneration) {
         // A newer pick superseded this one; drop the handle so its socket and
         // listeners do not outlive the attempt.
         next.dispose()
@@ -830,6 +911,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.handle?.dispose()
       state.handle = next
       state.currentId = sessionId
+      restoreSessionState(sessionId)
       state.approvalBusy = false
       state.error = undefined
       state.modelOverride = undefined
@@ -850,6 +932,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       state.pendingPrompt = undefined
       if (pending !== undefined) void send(pending)
     } catch (error) {
+      if (state.quitting || generation !== sessionGeneration) return
       state.error = errorText(error)
       state.status = 'error'
       schedule()
@@ -874,8 +957,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const sessions = await backend.listSessions(workspaceId)
       // Most recently edited first, whichever time the backend could provide.
       state.sessions = [...sessions].sort(
-        (left, right) => (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0),
+        (left, right) => Number(right.pinned === true) - Number(left.pinned === true)
+          || (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0),
       )
+      if (state.startup?.kind === 'sessions') {
+        const selected = state.startup.selectedSessionId ?? state.startup.sessions[state.startup.index]?.sessionId
+        const startupCwd = state.startup.workspace?.path ?? state.startup.cwd
+        state.startup.sessions = state.sessions.filter(session =>
+          session.workspaceId === state.startup?.workspace?.id
+          || (session.cwd !== undefined && canonicalPath(session.cwd) === canonicalPath(startupCwd)),
+        )
+        state.startup.index = Math.max(0, state.startup.sessions.findIndex(session => session.sessionId === selected))
+        state.startup.selectedSessionId = state.startup.sessions[state.startup.index]?.sessionId
+      }
       schedule()
     } catch (error) {
       // A dropped socket is handled by the reconnect loop; do not paint a
@@ -895,6 +989,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const createSession = async (cwd?: string, workspaceId?: string): Promise<void> => {
+    if (state.quitting) return
+    const generation = ++sessionGeneration
     try {
       state.status = 'creating session'
       schedule()
@@ -902,10 +998,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         cwd: workspaceId === undefined ? cwd ?? options.cwd : undefined,
         ...(workspaceId === undefined ? {} : { workspaceId }),
       })
+      if (state.quitting || generation !== sessionGeneration) { handle.dispose(); return }
       const view = handle.snapshot()
+      sessionTarget = view.sessionId
+      captureSessionState()
       state.handle?.dispose()
       state.handle = handle
       state.currentId = view.sessionId
+      restoreSessionState(view.sessionId)
       applyView(view)
       handle.subscribe((next) => applyView(next))
       state.overlay = null
@@ -919,6 +1019,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       void refreshSessions(workspaceIdForCwd(canonicalPath(view.header.cwd ?? options.cwd)))
       toast(`created ${view.sessionId}`)
     } catch (error) {
+      if (state.quitting || generation !== sessionGeneration) return
       state.error = errorText(error)
       state.status = 'error'
       schedule()
@@ -940,13 +1041,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         if (session.workspaceId === workspace.id) return true
         return session.cwd !== undefined && canonicalPath(session.cwd) === canonicalPath(workspace.path)
       })
-      .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))
+      .sort((left, right) => Number(right.pinned === true) - Number(left.pinned === true)
+        || (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0))
     state.startup = {
       kind: 'sessions',
       cwd,
       workspace,
       sessions,
       index: 0,
+      selectedSessionId: sessions[0]?.sessionId,
     }
     schedule()
   }
@@ -1059,7 +1162,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const answerApproval = async (outcome: 'allowed-once' | 'rejected'): Promise<void> => {
-    const pending = state.view?.pendingApproval
+    const requestId = state.overlay?.kind === 'approval' ? state.overlay.requestId : state.view?.pendingApproval?.requestId
+    const pending = state.view?.pendingApprovals?.find(item => item.requestId === requestId) ?? state.view?.pendingApproval
     if (pending === undefined || state.handle === undefined || state.approvalBusy) return
     state.approvalBusy = true
     state.status = outcome === 'allowed-once' ? 'approving' : 'rejecting'
@@ -1082,7 +1186,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
    * widen what the model may run.
    */
   const autoAllowApproval = (): void => {
-    const pending = state.view?.pendingApproval
+    const pending = state.view?.pendingApprovals?.[0] ?? state.view?.pendingApproval
     if (pending === undefined || state.handle === undefined || state.approvalBusy) return
     if (state.approvalMode !== 'auto') return
     const requestId = pending.requestId
@@ -1110,16 +1214,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const switchOverlaySession = (index: number): void => {
     const overlay = state.overlay
     if (overlay?.kind !== 'sessions') return
-    const sessions = filteredSessions(overlay.workspaceId)
+    const sessions = filteredSessions(overlay.workspaceId, overlay.archived === true)
     const chosen = sessions[index]
     if (chosen === undefined) return
     state.overlay = null
     void openSession(chosen.sessionId)
   }
 
-  const filteredSessions = (workspaceId?: string): SessionSummary[] => {
-    if (workspaceId === undefined) return state.sessions
-    return state.sessions.filter((session) => session.workspaceId === workspaceId)
+  const filteredSessions = (workspaceId?: string, archived = false): SessionSummary[] => {
+    return state.sessions.filter(session => (session.archived === true) === archived
+      && (workspaceId === undefined || session.workspaceId === workspaceId))
   }
 
   const modelRows = (): ModelRow[] => {
@@ -1146,6 +1250,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const currentModel = (): ModelSelection | undefined => {
+    if (state.view?.modelSelection !== undefined) return state.view.modelSelection
     if (state.modelOverride !== undefined) return state.modelOverride
     const metrics = currentMetrics()
     if (metrics.provider !== undefined && metrics.model !== undefined) {
@@ -1222,34 +1327,43 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     const reasoningEffort = hasEfforts(row) ? effort ?? effortFor(row) : undefined
+    if (modelChange?.sessionId === view.sessionId && modelChange.generation === sessionGeneration) return
+    const change = { sessionId: view.sessionId, generation: sessionGeneration, recovering: false, overlay: state.overlay,
+      selection: { provider: row.provider, model: model.id, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) } }
+    modelChange = change
     state.status = 'switching model'
     schedule()
     try {
-      const selected = await backend.selectModel(view.sessionId, {
-        provider: row.provider,
-        model: model.id,
-        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-      })
+      const selected = await backend.selectModel(view.sessionId, change.selection)
+      if (state.quitting || state.currentId !== change.sessionId || sessionGeneration !== change.generation) return
       state.modelOverride = selected
       if (selected.reasoningEffort !== undefined) {
         state.modelEfforts[effortKey(selected.provider, selected.model)] = selected.reasoningEffort
       }
-      if (state.modelCatalog !== undefined) state.modelCatalog.default = selected
-      state.overlay = null
+      if (state.overlay === change.overlay) state.overlay = null
       const level = selected.reasoningEffort === undefined ? '' : ` · ${selected.reasoningEffort}`
       const note = hasEfforts(row) || selected.reasoningEffort !== undefined ? '' : ' (no reasoning levels)'
       toast(`model → ${selected.provider}/${selected.model}${level}${note}`)
     } catch (error) {
-      toast(`model switch failed: ${errorText(error)}`)
+      if (state.quitting || state.currentId !== change.sessionId || sessionGeneration !== change.generation) return
+      if (reattaching || !backend.connected) {
+        change.recovering = true
+        toast('reconnecting · checking whether the model switch was saved')
+      } else toast(`model switch failed: ${errorText(error)}`)
     } finally {
-      state.status = 'idle'
-      schedule()
+      if (modelChange === change && !change.recovering) modelChange = undefined
+      if (!state.quitting && state.currentId === change.sessionId && sessionGeneration === change.generation) {
+        state.status = 'idle'
+        schedule()
+      }
     }
   }
 
   const saveModelDefault = async (row: ModelRow, effort?: string): Promise<void> => {
     const model = row.model
     if (row.provider === undefined || model === undefined) return
+    if (savingModelDefault) return
+    savingModelDefault = true
     const reasoningEffort = hasEfforts(row) ? effort ?? effortFor(row) : undefined
     try {
       const selected = await backend.saveDefaultModel({
@@ -1265,6 +1379,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       toast(`default model → ${selected.provider}/${selected.model}${level}`)
     } catch (error) {
       toast(`default model failed: ${errorText(error)}`)
+    } finally {
+      savingModelDefault = false
     }
     schedule()
   }
@@ -1339,15 +1455,21 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   /** Poll the socket until the re-exec'd Host answers, then reopen the session. */
   const reattachAfterRestart = async (): Promise<void> => {
-    const sessionId = state.currentId
     for (let attempt = 0; attempt < 15; attempt += 1) {
+      if (state.quitting) return
       await new Promise((resolve) => setTimeout(resolve, 1000))
+      if (state.quitting) return
+      // The user may already have opened another healthy view during the
+      // backoff. That view owns the screen and needs no reconnect.
+      if (backend.connected && state.handle !== undefined && state.view?.connected === true) return
       try {
         await backend.disconnect().catch(() => {})
         await backend.connect()
+        if (state.quitting) { await backend.disconnect(); return }
       } catch {
         continue
       }
+      const sessionId = sessionTarget ?? state.currentId
       if (sessionId === undefined) {
         toast('host back')
         state.status = 'idle'
@@ -1369,6 +1491,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.status = 'idle'
         state.error = undefined
         toast('host back · reattached')
+        const recovering = modelChange
+        if (recovering?.sessionId === sessionId && recovering.recovering) {
+          modelChange = undefined
+          if (sameModelSelection(reopened.modelSelection, recovering.selection)) {
+            if (state.overlay === recovering.overlay) state.overlay = null
+            toast(`model → ${recovering.selection.provider}/${recovering.selection.model} · restored after reconnect`)
+          } else {
+            toast(reopened.modelSelection === undefined
+              ? 'reconnected · model switch was not confirmed; check /model before sending'
+              : `reconnected · current model: ${reopened.modelSelection.provider}/${reopened.modelSelection.model}; requested choice is no longer active`)
+          }
+        }
         const interruptedTurn = lastInterruptedTurn(reopened.events)
         const continuedKey = interruptedTurn === undefined ? undefined : `${sessionId}:${interruptedTurn}`
         if (continuedKey !== undefined && !autoContinued.has(continuedKey) && autoContinueCount < 3) {
@@ -1435,15 +1569,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const openProviderEditor = (entry: ProviderEntry): void => {
+    const values = {
+      baseURL: entry.baseURL ?? '',
+      apiKeyEnv: entry.apiKeyEnv ?? '',
+      displayName: entry.displayName ?? '',
+    }
     state.overlay = {
       kind: 'providerEdit',
       providerId: entry.id,
       index: 0,
-      draft: {
-        baseURL: entry.baseURL ?? '',
-        apiKeyEnv: entry.apiKeyEnv ?? '',
-        displayName: entry.displayName ?? '',
-      },
+      draft: { ...values },
+      original: { ...values },
       dirty: new Set<ProviderField>(),
     }
     schedule()
@@ -1478,22 +1614,26 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.status = 'saving provider'
     schedule()
     try {
-      if (fields.includes('apiKeyEnv')) {
-        const ref = await storeRawKey(overlay.providerId, overlay.draft.apiKeyEnv)
-        if (ref !== undefined) {
-          toast(`key stored in ~/.dsh/.credentials.yaml as ${ref}`)
-          fields.splice(fields.indexOf('apiKeyEnv'), 1)
-        }
-      }
-      for (const field of fields) {
-        state.providers = await backend.updateProvider(overlay.providerId, field, overlay.draft[field])
-      }
+      const rawKey = fields.includes('apiKeyEnv') && !/^[A-Z][A-Z0-9_]*$/.test(overlay.draft.apiKeyEnv.trim())
+        ? overlay.draft.apiKeyEnv.trim() || undefined
+        : undefined
+      const changes = Object.fromEntries(fields.map(field => [field, overlay.draft[field]])) as Partial<Record<ProviderField, string>>
+      const saved = await backend.saveProvider(overlay.providerId, changes, rawKey)
+      state.providers = saved
+      if (saved.ref !== undefined) toast(`key stored in ~/.dsh/.credentials.yaml as ${saved.ref}`)
       const file = state.providers?.file ?? 'cordis.patch.yml'
+      const diff = fields.map(field => {
+        const before = field === 'apiKeyEnv' && rawKey !== undefined ? maskSecret(overlay.original[field]) : overlay.original[field] || '(unset)'
+        const after = field === 'apiKeyEnv' && rawKey !== undefined ? '(new stored key)' : overlay.draft[field] || '(unset)'
+        return `${PROVIDER_FIELD_LABEL[field]}: ${before} → ${after}`
+      })
       state.overlay = {
         kind: 'confirm',
         title: `provider · ${overlay.providerId}`,
         lines: [
-          `saved ${fields.join(', ')} to`,
+          ...diff,
+          '',
+          'saved atomically to',
           file,
           '',
           'A running Host keeps the providers it booted with.',
@@ -1933,6 +2073,47 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         state.overlay = { kind: 'sessions', index: 0 }
         schedule()
         return
+      case '/archived':
+        state.status = 'listing archived sessions'
+        schedule()
+        try {
+          state.sessions = await backend.listSessions(undefined, true)
+          state.overlay = { kind: 'sessions', index: 0, archived: true }
+        } catch (error) { toast(`archived sessions failed: ${errorText(error)}`) }
+        state.status = 'idle'
+        schedule()
+        return
+      case '/rename':
+        if (!state.currentId || !argument.trim()) { toast('/rename needs a title and an attached session'); return }
+        try {
+          await backend.sessionAction('rename', state.currentId, argument.trim())
+          if (state.view) state.view = { ...state.view, header: { ...state.view.header, title: argument.trim() } }
+          await refreshSessions(workspaceIdForCwd(canonicalPath(state.view?.header.cwd ?? options.cwd)))
+          toast('session renamed')
+        } catch (error) { toast(`rename failed: ${errorText(error)}`) }
+        schedule()
+        return
+      case '/archive':
+        if (!state.currentId) { toast('attach a session first'); return }
+        try { await backend.sessionAction('archive', state.currentId); await refreshSessions(); toast('session archived') }
+        catch (error) { toast(`archive failed: ${errorText(error)}`) }
+        return
+      case '/pin':
+        if (!state.currentId) { toast('attach a session first'); return }
+        try {
+          const row = (await backend.listSessions(undefined, true)).find(item => item.sessionId === state.currentId)
+          await backend.sessionAction('pin', state.currentId, row?.pinned !== true)
+          await refreshSessions()
+          toast(row?.pinned === true ? 'session unpinned' : 'session pinned')
+        } catch (error) { toast(`pin failed: ${errorText(error)}`) }
+        return
+      case '/fork':
+        if (!state.currentId) { toast('attach a session first'); return }
+        try {
+          const result = await backend.sessionAction('fork', state.currentId)
+          if (result.sessionId) await openSession(result.sessionId)
+        } catch (error) { toast(`fork failed: ${errorText(error)}`) }
+        return
       case '/workspaces':
         state.status = 'listing sessions'
         schedule()
@@ -1975,6 +2156,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         schedule()
         return
       case '/reconnect':
+        if (!backend.connected) await backend.connect()
+        if (state.quitting) { await backend.disconnect(); return }
         if (state.currentId !== undefined) {
           const id = state.currentId
           state.handle?.dispose()
@@ -2327,6 +2510,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     const callId = overlay.callId
+    state.questionDrafts.delete(callId)
     state.overlay = null
     // The Host settles the call through its durable log, which can take a few
     // frames. Dismissing it here stops any event in that window from popping
@@ -2343,6 +2527,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         // The answer never left, so the question is still answerable.
         state.dismissedAsks.delete(callId)
         state.overlay = overlay
+        state.questionDrafts.set(callId, overlay)
         toast('answer failed; the ask stays open')
       }
       schedule()
@@ -2410,6 +2595,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'text' && key.text === 'y' && copyOverlayContent()) return
     if (overlay.kind === 'approval') {
+      const approvals = state.view?.pendingApprovals?.length
+        ? state.view.pendingApprovals
+        : state.view?.pendingApproval === undefined ? [] : [state.view.pendingApproval]
+      if (key.type === 'text' && (key.text === '[' || key.text === ']') && approvals.length > 1) {
+        const index = Math.max(0, approvals.findIndex(item => item.requestId === overlay.requestId))
+        const next = (index + (key.text === ']' ? 1 : approvals.length - 1)) % approvals.length
+        overlay.requestId = approvals[next]!.requestId
+        overlay.details = false
+        schedule()
+        return
+      }
       if (key.type === 'text' && key.text.toLowerCase() === 'a') void answerApproval('allowed-once')
       else if (key.type === 'text' && key.text.toLowerCase() === 'r') void answerApproval('rejected')
       else if (key.type === 'text' && key.text.toLowerCase() === 'd') {
@@ -2419,6 +2615,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (overlay.kind === 'questions') {
+      const asks = state.view?.pendingAsks ?? []
+      if (key.type === 'text' && (key.text === '[' || key.text === ']') && asks.length > 1 && !overlay.customMode) {
+        state.questionDrafts.set(overlay.callId, overlay)
+        const index = Math.max(0, asks.findIndex(item => item.callId === overlay.callId))
+        const next = (index + (key.text === ']' ? 1 : asks.length - 1)) % asks.length
+        const ask = asks[next]!
+        state.overlay = state.questionDrafts.get(ask.callId) ?? freshQuestionsOverlay(ask.callId, ask.questions)
+        schedule()
+        return
+      }
       const questions = overlay.questions
       const last = Math.max(0, questions.length - 1)
       const submitTab = overlay.tab > last
@@ -2484,13 +2690,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (key.type === 'left') {
         overlay.tab = Math.max(0, overlay.tab - 1)
         overlay.cursor = 0
+        overlay.detailScroll = 0
       } else if (key.type === 'right' || key.type === 'tab') {
         overlay.tab = Math.min(questions.length, overlay.tab + 1)
         overlay.cursor = 0
+        overlay.detailScroll = 0
       } else if (key.type === 'up' || key.type === 'ctrl-p') {
         overlay.cursor = Math.max(0, overlay.cursor - 1)
       } else if (key.type === 'down' || key.type === 'ctrl-n') {
         overlay.cursor = Math.min(Math.max(0, rows.length - 1), overlay.cursor + 1)
+      } else if (key.type === 'page-up') {
+        overlay.detailScroll = Math.max(0, overlay.detailScroll - (overlay.detailPageSize ?? 3))
+      } else if (key.type === 'page-down') {
+        overlay.detailScroll += overlay.detailPageSize ?? 3
       } else if (key.type === 'text' && key.text === ' ') {
         // Space belongs to typing, not picking: in the ask it is deliberately
         // inert, so a stray press cannot toggle an answer behind the reader's
@@ -2928,11 +3140,26 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return
     }
     if (overlay.kind !== 'sessions') return
-    const overlaySessions = filteredSessions(overlay.workspaceId)
+    const overlaySessions = filteredSessions(overlay.workspaceId, overlay.archived === true)
     if (key.type === 'up') overlay.index = Math.max(0, overlay.index - 1)
     else if (key.type === 'down') overlay.index = Math.min(overlaySessions.length - 1, overlay.index + 1)
     else if (key.type === 'enter') switchOverlaySession(overlay.index)
     else if (key.type === 'text' && key.text.toLowerCase() === 'n') void createSession(undefined, overlay.workspaceId)
+    else if (key.type === 'text' && key.text.toLowerCase() === 'a' && overlay.archived !== true) {
+      const session = overlaySessions[overlay.index]
+      if (session) void backend.sessionAction('archive', session.sessionId).then(() => refreshSessions(overlay.workspaceId), error => toast(`archive failed: ${errorText(error)}`))
+    } else if (key.type === 'text' && key.text.toLowerCase() === 'x' && overlay.archived === true) {
+      const session = overlaySessions[overlay.index]
+      if (session) void backend.sessionAction('restore', session.sessionId).then(() => backend.listSessions(undefined, true)).then(sessions => { state.sessions = sessions; schedule() }, error => toast(`restore failed: ${errorText(error)}`))
+    } else if (key.type === 'text' && key.text.toLowerCase() === 'p') {
+      const session = overlaySessions[overlay.index]
+      if (session) void backend.sessionAction('pin', session.sessionId, session.pinned !== true).then(() => refreshSessions(overlay.workspaceId), error => toast(`pin failed: ${errorText(error)}`))
+    } else if (key.type === 'text' && key.text.toLowerCase() === 'f') {
+      const session = overlaySessions[overlay.index]
+      if (session) void backend.sessionAction('fork', session.sessionId).then(async result => {
+        if (result.sessionId) await openSession(result.sessionId)
+      }, error => toast(`fork failed: ${errorText(error)}`))
+    }
     schedule()
   }
 
@@ -2980,8 +3207,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'up' || (key.type === 'text' && key.text.toLowerCase() === 'k')) {
       startup.index = Math.max(0, startup.index - 1)
+      startup.selectedSessionId = startup.sessions[startup.index]?.sessionId
     } else if (key.type === 'down' || (key.type === 'text' && key.text.toLowerCase() === 'j')) {
       startup.index = Math.min(Math.max(0, startup.sessions.length - 1), startup.index + 1)
+      startup.selectedSessionId = startup.sessions[startup.index]?.sessionId
     } else if (key.type === 'enter' || key.type === 'newline') {
       const chosen = startup.sessions[startup.index]
       if (chosen !== undefined) void openSession(chosen.sessionId)
@@ -2989,6 +3218,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       void createSession(undefined, startup.workspace?.id)
     }
     schedule()
+  }
+
+  const maybeLoadOlder = (): void => {
+    if (state.view?.hasMoreHistory !== true || state.handle === undefined) return
+    const top = Math.max(0, transcriptLineCount() - transcriptHeight())
+    if (viewport.scrollOffset >= Math.max(0, top - 2)) {
+      void state.handle.loadOlder().catch(error => {
+        state.error = errorText(error)
+        schedule()
+      })
+    }
   }
 
   const handleKey = (key: Key): void => {
@@ -3037,6 +3277,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       // A copy stays highlighted: the range lives in content space, so a render
       // puts it back over the same text after any scroll.
       viewport.scroll(-key.delta * 3, transcriptLineCount(), transcriptHeight())
+      maybeLoadOlder()
       schedule()
       return
     }
@@ -3130,10 +3371,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (key.type === 'ctrl-z') {
       // Detach: leave now and let the turn keep running in the Host — the
       // tmux shape. /sessions reattaches later.
-      if (state.editor.text.length > 0) {
-        state.editor = createEditor()
-        state.historyIndex = -1
-      }
+      captureSessionState()
       quit(0)
       return
     }
@@ -3191,6 +3429,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     }
     if (key.type === 'page-up') {
       viewport.page(1, transcriptLineCount(), transcriptHeight())
+      maybeLoadOlder()
       schedule()
       return
     }
@@ -3592,9 +3831,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const usageRailLine = (metrics: SessionMetrics, now: number): string => {
     const running = metrics.agents.filter((agent) => agent.status === 'running').length
-    const model = state.modelOverride?.model ?? metrics.model
-    const provider = state.modelOverride?.provider ?? metrics.provider
-    const effort = state.modelOverride?.reasoningEffort
+    const selected = state.view?.modelSelection ?? state.modelOverride
+    const model = selected?.model ?? metrics.model
+    const provider = selected?.provider ?? metrics.provider
+    const effort = selected?.reasoningEffort
       ?? (model === undefined || provider === undefined ? undefined : state.modelEfforts[`${provider}/${model}`])
     return renderUsageRail(theme, {
       tokens: metrics.cost.tokens,
@@ -3658,6 +3898,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const askWizard = (
     overlay: Extract<Overlay, { kind: 'questions' }>,
     columns: number,
+    maxHeight = 18,
   ): { lines: string[]; height: number; cursorRow?: number; cursorColumn?: number } => {
     const total = Math.max(20, columns)
     const inner = Math.max(10, total - 4)
@@ -3669,6 +3910,33 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const rows = question === undefined ? [] : questionRows(question, actionLabel.toLowerCase())
     const qid = question?.id ?? ''
     const lines: string[] = []
+
+    // A short terminal still needs a readable prompt and the row that owns
+    // the keyboard. Page keys move through all text; arrows move the answer.
+    if (maxHeight < 11 && question !== undefined) {
+      const limit = Math.max(3, maxHeight)
+      lines.push(paint(theme, 'accentSoft', submitTab ? ' Review answers' : ' The model asks'))
+      const reading = submitTab
+        ? questions.flatMap(entry => wrapText(`${entry.header ?? entry.id}: ${[...(overlay.selected[entry.id] ?? []), overlay.custom[entry.id] ?? ''].filter(Boolean).join(' · ') || '(skipped)'}`, total - 2))
+        : wrapText([question.header, question.question, question.detail].filter(Boolean).join('\n'), total - 2)
+      const readLimit = Math.max(1, limit - 3)
+      overlay.detailPageSize = readLimit
+      const start = Math.min(overlay.detailScroll, Math.max(0, reading.length - readLimit))
+      for (const line of reading.slice(start, start + readLimit)) lines.push(` ${line}`)
+      const active = rows[overlay.cursor]
+      const custom = overlay.custom[qid] ?? ''
+      const inputText = wrapText(custom, Math.max(4, total - 5)).at(-1) ?? ''
+      const activeRow = lines.length
+      if (submitTab || active?.kind === 'action') lines.push(` ▸ ${submitTab ? 'Submit' : actionLabel} ✓`)
+      else if (overlay.customMode) lines.push(` ▸ ✎ ${inputText}`)
+      else if (active?.kind === 'option') {
+        const selected = (overlay.selected[qid] ?? []).includes(active.label ?? '')
+        lines.push(` ▸ ${selected ? '●' : '○'} ${active.label ?? ''}`)
+      } else lines.push(` ▸ ✎ ${custom || 'custom answer (c)'}`)
+      if (lines.length < limit) lines.push(paint(theme, 'dim', ' ↑↓ select · PgDn read · enter'))
+      return { lines, height: lines.length, ...(overlay.customMode && !submitTab
+        ? { cursorRow: activeRow, cursorColumn: displayWidth(` ▸ ✎ ${inputText}`) + 1 } : {}) }
+    }
 
     /** One row that reads as a page rule: title, then the line to the edge. */
     const heading = (label: string, tone: ThemeStyle = 'accentSoft'): string => {
@@ -3682,7 +3950,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       return `${paint(theme, 'border', '─')}${text}${paint(theme, 'border', '─'.repeat(Math.max(0, total - used - 1)))}`
     }
 
-    lines.push(heading('the model asks'))
+    const pendingAsks = state.view?.pendingAsks ?? []
+    const askIndex = pendingAsks.findIndex(item => item.callId === overlay.callId)
+    const askSuffix = pendingAsks.length > 1 ? ` · ${String(askIndex + 1)}/${String(pendingAsks.length)}` : ''
+    lines.push(heading((question?.intent?.kind === 'plan-review' ? 'plan review' : 'the model asks') + askSuffix))
     const answered = (id: string): boolean =>
       (overlay.selected[id] ?? []).length > 0 || (overlay.custom[id] ?? '').trim().length > 0
     if (questions.length > 1) {
@@ -3706,7 +3977,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const name = truncate(entry.header ?? entry.id, 18)
         lines.push(` ${mark} ${paint(theme, 'muted', pad(name, 18))} ${answer.length > 0 ? paint(theme, 'text', truncate(answer, Math.max(6, inner - 22))) : paint(theme, 'dim', '— skipped')}`)
       }
-      lines.push(footer('enter submit · ←→ switch · esc later'))
+      lines.push(footer(`enter submit · ←→ questions${pendingAsks.length > 1 ? ' · [ ] pending asks' : ''} · esc later`))
       return { lines, height: lines.length }
     }
 
@@ -3718,8 +3989,20 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (question.header !== undefined && question.header.length > 0) {
       lines.push(paint(theme, 'bold', paint(theme, 'accentSoft', ` ${truncate(question.header, total - 2)}`)))
     }
-    for (const line of wrapText(question.question, inner)) {
+    const questionLines = wrapText(question.question, inner)
+    for (const line of questionLines.slice(0, 3)) {
       lines.push(paint(theme, 'bold', paint(theme, 'text', ` ${line}`)))
+    }
+    if (questionLines.length > 3) lines.push(paint(theme, 'dim', '  … more question text below'))
+    const detailLines = [...questionLines.slice(3), ...(question.detail === undefined ? [] : wrapText(question.detail, inner))]
+    const detailLimit = Math.max(1, Math.min(4, maxHeight - lines.length - 6))
+    overlay.detailPageSize = detailLimit
+    if (detailLines.length > 0) {
+      const detailStart = Math.min(overlay.detailScroll, Math.max(0, detailLines.length - detailLimit))
+      for (const line of detailLines.slice(detailStart, detailStart + detailLimit)) lines.push(paint(theme, 'text', ` ${line}`))
+      if (detailLines.length > detailLimit) {
+        lines.push(paint(theme, 'dim', `  ${String(detailStart + 1)}-${String(Math.min(detailLines.length, detailStart + detailLimit))} / ${String(detailLines.length)} · pgup/pgdn`))
+      }
     }
     lines.push(paint(theme, 'muted', question.multiSelect === true
       ? ' select all that apply · enter toggles'
@@ -3729,7 +4012,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const optionRows = rows.filter((entry) => entry.kind === 'option')
     const cursorRow = rows[overlay.cursor]
     const cursorOption = optionRows.findIndex((entry) => entry === cursorRow)
-    const limit = 8
+    const fixed = lines.length + 4
+    const limit = Math.max(1, Math.min(8, maxHeight - fixed))
     const start = options.length <= limit
       ? 0
       : Math.max(0, Math.min(options.length - limit, Math.max(0, cursorOption) - Math.floor(limit / 2)))
@@ -3774,14 +4058,16 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       : `${actionLabel} ✓`)
     lines.push(` ${actionMark} ${actionText}`)
 
+    const pendingHint = pendingAsks.length > 1 ? ' · [ ] pending asks' : ''
     const hint = customCursor
       ? questions.length === 1
         ? 'type an answer · enter submit · esc cancel text'
         : 'type an answer · enter done · esc cancel text'
       : question.multiSelect === true
-        ? `↑↓ move · enter toggle · c custom · ↓ ${actionLabel.toLowerCase()} commits · esc later`
-        : `↑↓ move · enter answers · ↓ ${actionLabel.toLowerCase()} commits · esc later`
-    lines.push(footer(hint))
+        ? `↑↓ move · pgup/pgdn read · enter toggle · c custom · ↓ ${actionLabel.toLowerCase()} · esc later`
+        : `↑↓ move · pgup/pgdn read · enter answers · ↓ ${actionLabel.toLowerCase()} · esc later`
+    const fullHint = hint + pendingHint
+    lines.push(footer(fullHint))
     return {
       lines,
       height: lines.length,
@@ -3949,13 +4235,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const marker = selected ? paint(theme, 'accent', '▸') : ' '
         const title = entry.displayName ?? entry.id
         const address = entry.baseURL ?? paint(theme, 'muted', 'no baseURL')
-        const key = entry.apiKeyEnv === undefined ? paint(theme, 'muted', 'no key env') : paint(theme, 'text', entry.apiKeyEnv)
+        const key = entry.apiKeyEnv === undefined ? paint(theme, 'muted', 'no key env') : paint(theme, 'text', maskSecret(entry.apiKeyEnv))
         body.push(`${marker} ${paint(theme, selected ? 'text' : 'muted', pad(truncate(entry.id, 18), 18))} ${paint(theme, 'text', truncate(title, 16))}`)
         body.push(`  ${address}  ${key}  ${paint(theme, 'muted', `${String(entry.models)} models`)}`)
       }
       if (rowsList.length === 0) body.push(paint(theme, 'muted', 'no providers declared'))
       body.push('')
       body.push(paint(theme, 'muted', list?.file ?? 'no patch file found'))
+      if (list?.source !== undefined) {
+        const modifiers = [list.source.kind, list.source.inherited ? 'inherits defaults' : '', list.source.overridden ? 'has override' : ''].filter(Boolean)
+        body.push(paint(theme, 'muted', `source: ${modifiers.join(' · ')}`))
+      }
       if (list?.writable === false) body.push(paint(theme, 'error', 'read-only: fix the file permissions to edit'))
       return panelRule(theme, 'providers', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter edit · a add · u sync models · x remove · r restart · esc close')],
@@ -3994,7 +4284,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const dirty = overlay.dirty.has(field) ? paint(theme, 'accent', ' •') : ''
         const editing = overlay.editing?.field === field
         const raw = editing ? overlay.editing?.value ?? '' : overlay.draft[field]
-        const shown = raw.length === 0 ? paint(theme, 'muted', '(unset)') : paint(theme, selected ? 'text' : 'muted', raw)
+        const visible = field === 'apiKeyEnv' && !/^[A-Z][A-Z0-9_]*$/.test(raw) ? maskSecret(raw) : raw
+        const shown = visible.length === 0 ? paint(theme, 'muted', '(unset)') : paint(theme, selected ? 'text' : 'muted', visible)
         body.push(`${marker} ${paint(theme, 'muted', pad(PROVIDER_FIELD_LABEL[field], 12))} ${editing ? `${shown}${paint(theme, 'accent', '▏')}` : shown}${dirty}`)
       }
       body.push('')
@@ -4055,7 +4346,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       })
     }
     if (overlay.kind === 'sessions') {
-      const sessions = filteredSessions(overlay.workspaceId)
+      const sessions = filteredSessions(overlay.workspaceId, overlay.archived === true)
       const visibleCount = Math.max(1, Math.min(12, rows - 10))
       const start = Math.max(0, Math.min(overlay.index - Math.floor(visibleCount / 2), sessions.length - visibleCount))
       const body = sessions.slice(start, start + visibleCount).map((session, offset) => {
@@ -4078,22 +4369,27 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         return `${row}${' '.repeat(Math.max(1, inner - displayWidth(row) - displayWidth(right)))}${right}`
       })
       if (body.length === 0) body.push(paint(theme, 'muted', 'no sessions; press n to create one'))
-      return panelRule(theme, 'sessions', body, width, {
-        footer: [paint(theme, 'muted', '↑/↓ select · enter open (✓ 查看 / ! ? 接手) · n new · esc close')],
+      return panelRule(theme, overlay.archived ? 'archived sessions' : 'sessions', body, width, {
+        footer: [paint(theme, 'muted', overlay.archived
+          ? '↑/↓ select · enter open · x restore · f fork · esc close'
+          : '↑/↓ select · enter open · a archive · p pin · f fork · n new · esc close')],
       })
     }
     if (overlay.kind === 'history') {
       const items = historyItems(overlay.query)
       const index = Math.min(overlay.index, Math.max(0, items.length - 1))
-      const visible = items.slice(0, Math.max(1, Math.min(9, rows - 12)))
+      const count = Math.max(1, Math.min(9, rows - 12))
+      const start = Math.max(0, Math.min(index - Math.floor(count / 2), items.length - count))
+      const visible = items.slice(start, start + count)
       const body = [
         `${paint(theme, 'muted', 'search')} ${paint(theme, 'text', overlay.query)}${paint(theme, 'accent', '▌')}`,
         '',
       ]
       if (visible.length === 0) body.push(paint(theme, 'muted', 'no matching prompt in this session'))
       for (const [offset, item] of visible.entries()) {
-        const marker = offset === index ? paint(theme, 'accent', '▸') : ' '
-        body.push(`${marker} ${paint(theme, offset === index ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
+        const selected = start + offset === index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        body.push(`${marker} ${paint(theme, selected ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
       }
       return panelRule(theme, 'history search', body, width, {
         footer: [paint(theme, 'muted', 'type to filter · ↑/↓ select · enter insert · esc cancel')],
@@ -4102,12 +4398,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (overlay.kind === 'rewind') {
       const prompts = userPrompts()
       const index = Math.min(overlay.index, Math.max(0, prompts.length - 1))
-      const visible = prompts.slice(0, Math.max(1, Math.min(10, rows - 12)))
+      const count = Math.max(1, Math.min(10, rows - 12))
+      const start = Math.max(0, Math.min(index - Math.floor(count / 2), prompts.length - count))
+      const visible = prompts.slice(start, start + count)
       const body = [paint(theme, 'muted', 'Restore a previous prompt into the composer.'), paint(theme, 'muted', 'The session itself is not truncated.'), '']
       if (visible.length === 0) body.push(paint(theme, 'muted', 'no previous prompt'))
       for (const [offset, item] of visible.entries()) {
-        const marker = offset === index ? paint(theme, 'accent', '▸') : ' '
-        body.push(`${marker} ${paint(theme, offset === index ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
+        const selected = start + offset === index
+        const marker = selected ? paint(theme, 'accent', '▸') : ' '
+        body.push(`${marker} ${paint(theme, selected ? 'text' : 'muted', truncate(item.replace(/\s+/g, ' '), inner - 2))}`)
       }
       return panelRule(theme, 'rewind', body, width, {
         footer: [paint(theme, 'muted', '↑/↓ select · enter restore · esc cancel')],
@@ -4261,7 +4560,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       })
     }
     if (overlay.kind !== 'approval') return []
-    const pending = state.view?.pendingApproval
+    const approvals = state.view?.pendingApprovals?.length
+      ? state.view.pendingApprovals
+      : state.view?.pendingApproval === undefined ? [] : [state.view.pendingApproval]
+    const pending = approvals.find(item => item.requestId === overlay.requestId) ?? approvals[0]
     if (pending === undefined) return panelRule(theme, 'approval', [paint(theme, 'muted', 'no approval pending')], width)
     const body = [
       `${paint(theme, 'muted', 'tool')}     ${paint(theme, 'bold', pending.toolName)}`,
@@ -4271,9 +4573,10 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (overlay.details) {
       body.push('', paint(theme, 'muted', 'The full tool arguments are in the transcript above.'))
     }
-    body.push('', paint(theme, 'warning', '[a] allow once   [r] reject   [d] details   [esc] later'))
+    const index = Math.max(0, approvals.findIndex(item => item.requestId === pending.requestId))
+    body.push('', paint(theme, 'warning', `[a] allow once   [r] reject   [d] details${approvals.length > 1 ? '   [[/]] switch' : ''}   [esc] later`))
     body.push(paint(theme, 'muted', 'A timeout, disconnect, or non-TTY frontend fails closed.'))
-    return panelRule(theme, 'approval required', body, width, { tone: 'warning' })
+    return panelRule(theme, `approval required${approvals.length > 1 ? ` · ${String(index + 1)}/${String(approvals.length)}` : ''}`, body, width, { tone: 'warning' })
   }
 
   const startupLines = (): string[] => {
@@ -4355,7 +4658,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
     const now = Date.now()
     const metrics = currentMetrics()
-    const header = headerLines()
+    const header = rows < 14 ? headerLines().slice(0, 1) : headerLines()
     const overlay = overlayLines()
     const toastActive = state.toast !== undefined && state.toast.until > now
     let focusHint: string | undefined
@@ -4395,7 +4698,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const askOverlay = state.overlay?.kind === 'questions' ? state.overlay : undefined
     // The ask wizard owns the composer's place, not the page: the transcript
     // stays readable above it, the way a bottom-pane wizard should.
-    const menu = askOverlay === undefined ? completionMenuLines() : []
+    const menu = askOverlay === undefined && rows >= 9 ? completionMenuLines() : []
     const strip = statusStripLine(metrics)
     const lastRange = transcriptData.ranges.at(-1)
     // The turn summary owns the last transcript row; the job/todo chip rides
@@ -4407,34 +4710,37 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       && lastRange.block.kind === 'turnend'
       && lastRange.end === transcriptData.lines.length
       && displayWidth(transcriptData.lines.at(-1) ?? '') + displayWidth(strip) + 1 <= columns
-    const footer = footerLines(metrics, now, strip, mergeStrip)
-    const usage = usageRailLine(metrics, now)
+    const footerRows = footerLines(metrics, now, strip, mergeStrip)
+    const footer = rows < 9 ? [] : rows < 14 ? footerRows.slice(-1) : footerRows
+    const usage = rows < 14 ? '' : usageRailLine(metrics, now)
     const speed = speedFor(metrics, now)
     const showSpeed = metrics.turnStartedAt !== undefined || state.tpsSamples.length > 0
-    const composer = askOverlay !== undefined
-      ? askWizard(askOverlay, columns)
-      : renderComposer(theme, state.editor, columns, 7, renderHintLine(theme, columns), {
-          ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
-          ...(showSpeed ? { tps: speed } : {}),
-          approvalMode: state.approvalMode,
-        })
     const noticeRows = notice === undefined ? 0 : 1
     const total = transcriptData.lines.length
     lastTranscriptTotal = total
     if (viewport.scrollOffset === 0) seenTranscriptTotal = total
     const unseen = Math.max(0, total - seenTranscriptTotal)
-    const pill = viewport.scrollOffset === 0 ? undefined : renderJumpToBottom(theme, unseen, columns)
+    const pill = viewport.scrollOffset === 0 || rows < 9 ? undefined : renderJumpToBottom(theme, unseen, columns)
     const focusOrder = buildFocusItems(transcriptData.ranges, transcriptData.lines.length)
     const focused = state.focus === undefined ? undefined : focusOrder[state.focus]
-    const queuedRows = queuedEntries().slice(-2).map((entry) => {
+    const queuedRows = (rows < 9 ? [] : queuedEntries().slice(-2)).map((entry) => {
       const oneLine = entry.text.replace(/\s+/g, ' ').trim()
       const label = entry.mode === 'steer' ? 'steering' : 'queued'
       const row = paint(theme, 'dim', truncate(`  ◷ ${label} · ${oneLine}`, columns))
       const selected = focused?.kind === 'queue' && focused.queue?.requestId === entry.requestId
       return selected ? selectionBand(row) : row
     })
+    const fixedRows = header.length + footer.length + menu.length + noticeRows + queuedRows.length + (usage ? 1 : 0) + 1
+    const composerLines = Math.max(1, rows - fixedRows - 3)
+    const composer = askOverlay !== undefined
+      ? askWizard(askOverlay, columns, Math.max(3, rows - fixedRows))
+      : renderComposer(theme, state.editor, columns, Math.min(7, composerLines), rows < 9 ? undefined : renderHintLine(theme, columns), {
+          ...(metrics.contextPct === undefined ? {} : { contextPct: metrics.contextPct }),
+          ...(showSpeed ? { tps: speed } : {}),
+          approvalMode: state.approvalMode,
+        })
     const bodyHeight = Math.max(
-      3,
+      0,
       rows -
         header.length -
         footer.length -
@@ -4484,7 +4790,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     } else if (composer.cursorRow !== undefined) {
       cursor = { row: composerStart + composer.cursorRow + 1, column: composer.cursorColumn ?? 1 }
     }
-    lines.push(usage)
+    if (usage) lines.push(usage)
     screen.draw(lines.slice(0, rows), cursor)
     if (state.toast !== undefined && state.toast.until <= now) state.toast = undefined
     ensureTick()
@@ -4497,7 +4803,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     state.startup = { kind: 'sessions', cwd: canonicalPath(options.cwd), sessions: [], index: 0, loading: true }
   }
 
-  backend.onDisconnect?.(() => {
+  offBackendDisconnect = backend.onDisconnect?.(() => {
     beginReconnect()
   })
 
@@ -4526,6 +4832,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     } else {
       await prepareStartup()
     }
+    if (state.quitting) return await done
     state.status = 'idle'
     schedule()
     pollTimer = setInterval(() => {
@@ -4539,6 +4846,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     return code
   } finally {
     if (!state.quitting) quit(0)
+    captureSessionState()
+    await stateStore.flush().catch(() => undefined)
     screen.stop()
   }
 }

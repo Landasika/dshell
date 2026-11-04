@@ -1,3 +1,7 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { stringify, parseDocument } from 'yaml'
+import { isDeepStrictEqual } from 'node:util'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import {
@@ -13,10 +17,11 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
+  openSync,
+  closeSync,
 } from 'node:fs'
 import { createServer, Socket, type Server } from 'node:net'
 import { basename, dirname, join, resolve, sep } from 'node:path'
-import { createInterface } from 'node:readline'
 
 import {
   CAPABILITIES,
@@ -24,6 +29,7 @@ import {
   type AgentPresetSummary,
   type AgentRosterMessage,
   type ProviderEntry,
+  type PromptContentPart,
   type QuestionAnswer,
   type QuestionClosedMessage,
   type QuestionRequestMessage,
@@ -42,7 +48,10 @@ import {
   type WorkspaceSummary,
 } from '../protocol/index.js'
 import { resolveDshHome, resolveSocketPath } from '../shared/paths.js'
+import { latestUserPreview } from '../shared/session-events.js'
+import { advanceModelSelection, readModelSelection, type ModelSelectionState } from '../shared/model-selection.js'
 import { ApprovalCoordinator } from './approval.js'
+import { openHistory, historyEvents, type HarnessHistoryOwner } from './harness-history.js'
 import {
   HUB_PROVIDER,
   createHubProvider,
@@ -55,6 +64,7 @@ import {
 import {
   ProviderEditError,
   addProvider,
+  clearProviderField,
   isProviderField,
   readProviderDetail,
   syncProviderModels,
@@ -88,7 +98,7 @@ interface UserMessageLike {
   id: string
   role: 'user'
   content: Array<{ type: 'text'; text: string }>
-  source: { kind: 'user' } | { kind: 'user-question-reply'; callId: string; outcome: 'answered' }
+  source: { kind: 'user'; rpcId?: string } | { kind: 'user-question-reply'; callId: string; outcome: 'answered' }
 }
 
 interface InboxLike {
@@ -100,6 +110,7 @@ interface InboxLike {
 
 interface AgentLike {
   id: string
+  status?: 'idle' | 'running'
   session: { id: string }
   followup(message: UserMessageLike): void
   steer(message: UserMessageLike): void
@@ -140,6 +151,7 @@ interface SessionObservationLike {
       agentPreset?: string
       modelSelection?: {
         lastUsed?: Record<string, unknown>
+        next?: Record<string, unknown>
       }
     }
   }
@@ -172,6 +184,12 @@ interface WorkspaceLike {
 }
 
 interface WorkspaceRegistryLike {
+  readonly archivedSessionIds?: readonly string[]
+  readonly pinnedSessionIds?: readonly string[]
+  archiveSession?(id: string): Promise<void>
+  unarchiveSession?(id: string): Promise<void>
+  pinSession?(id: string): Promise<void>
+  unpinSession?(id: string): Promise<void>
   list(): WorkspaceLike[]
   get(id: string): WorkspaceLike | undefined
   create(path: string, title?: string): Promise<WorkspaceLike>
@@ -201,12 +219,15 @@ interface AgentPresetRegistryLike {
 
 /** One addressable row of the profile composition, as the config editor sees it. */
 interface ConfigRowLike {
+  inherited?: Record<string, unknown>
   entry: { options: { id: string; name?: string; config?: unknown } }
   override: Record<string, unknown>
 }
 
 interface ConfigEditorLike {
+  documentPath?: string
   configuration?(): readonly ConfigRowLike[]
+  edit?(entry: ConfigRowLike['entry'], change: (current: Record<string, unknown>, inherited: Record<string, unknown>) => Record<string, unknown>): Promise<void>
 }
 
 /** The plugin package a row must mount to declare an agent preset. */
@@ -217,8 +238,13 @@ interface AgentDefaultModelLike {
   saveSelection?(selection: ModelSelection): Promise<void>
 }
 
-interface SessionControllerLike {
+interface SessionControllerLike extends HarnessHistoryOwner {
+  rename?(request: { sessionId: string; title: string }): Promise<{ title: string; seq: number }>
+  fork?(request: { sessionId: string; atSeq?: number }): Promise<{ sessionId: string }>
   modelCatalog(): Promise<ModelCatalog>
+  prompt?(request: { sessionId: string; requestId: string; mode: 'queue' | 'steer'; content: PromptContentPart[] }, signal: AbortSignal): Promise<unknown>
+  resolveAgent?(sessionId: string): Promise<{ agent: AgentLike } | { error: Error }>
+  create?(request: { cwd?: string; workspaceId?: string; sessionId?: string }): Promise<{ sessionId: string }>
   selectModel(request: ModelSelection & { sessionId: string }): Promise<{ selected: ModelSelection }>
   list?(
     request: { cursor?: string },
@@ -342,10 +368,17 @@ function mappedError(error: unknown): ErrorMessage {
   return { type: 'error', code: 'INTERNAL', message }
 }
 
+const rpcContext = new AsyncLocalStorage<{ socket: Socket; rpcId?: string }>()
+const BROADCAST_TYPES = new Set(['event', 'stream', 'status', 'approval-request', 'approval-resolved', 'question/request', 'question/closed'])
 function jsonLine(socket: Socket, message: unknown): void {
   if (socket.destroyed || !socket.writable) return
   try {
-    socket.write(`${JSON.stringify(message)}\n`)
+    const context = rpcContext.getStore()
+    const payload = message as { type?: string }
+    const outgoing = context?.socket === socket && context.rpcId && !BROADCAST_TYPES.has(payload.type ?? '')
+      ? { ...payload, rpcId: context.rpcId } : payload
+    if (socket.writableLength > 16 * 1024 * 1024) { socket.destroy(); return }
+    socket.write(JSON.stringify(outgoing) + '\n')
   } catch {
     // The peer may reset between the writable check and the write.
   }
@@ -506,19 +539,24 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   // keep subagent children out of the picker (they belong to a parent's roster).
   const sessionCache = new Map<string, { at: number; sessions: SessionSummary[] }>()
   /** Running-session input state, cached with the same TTL as the list. */
+  const activePrompt = new Map<string, string>()
   const pendingInput = new Map<string, { at: number; value: 'approval' | 'question' | undefined }>()
   const titleCache = new Map<string, { at: number; title: string }>()
+  const previewCache = new Map<string, { at: number; preview: string }>()
   const SESSION_LIST_TIMEOUT_MS = 15_000
   const SESSION_CACHE_MS = 4_000
+  const PREVIEW_CACHE_MS = 300_000
+  const PREVIEW_ROWS = 24
+  const PREVIEW_BUDGET_MS = 1_500
 
-  const listSessions = async (workspaceId?: string): Promise<SessionSummary[]> => {
-    const cacheKey = workspaceId ?? ''
+  const listSessions = async (workspaceId?: string, includeArchived = false): Promise<SessionSummary[]> => {
+    const cacheKey = `${workspaceId ?? ''}:${includeArchived ? 'archived' : 'active'}`
     const cached = sessionCache.get(cacheKey)
     if (cached !== undefined && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions
     const records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
     if (records === undefined) return []
-    loadTrashedOnce()
-    const notTrashed = trashedIds.size === 0 ? records : records.filter((r) => !trashedIds.has(r.header.id))
+    const archived = new Set(ctx.workspaceRegistry?.archivedSessionIds ?? [])
+    const pinned = new Set(ctx.workspaceRegistry?.pinnedSessionIds ?? [])
     // The durable activity time comes from the Host's session list projection;
     // without it the picker falls back to the creation time.
     const activity = new Map<string, number>()
@@ -550,11 +588,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
     const workspaceOf = (record: SessionRecordLike): WorkspaceSummary | undefined =>
       record.header.cwd === undefined ? undefined : workspaceByPath.get(record.header.cwd)
-    const visible = notTrashed
+    const visible = records
+      .filter(record => includeArchived || !archived.has(record.header.id))
       .filter((record) => record.header.origin !== 'subagent' && record.header.parentSession === undefined)
       .map((record) => ({ record, workspace: workspaceOf(record) }))
       .filter((entry) => workspaceId === undefined || entry.workspace?.id === workspaceId)
-      .sort((left, right) => lastActivity(right.record) - lastActivity(left.record))
+      .sort((left, right) => Number(pinned.has(right.record.header.id)) - Number(pinned.has(left.record.header.id))
+        || lastActivity(right.record) - lastActivity(left.record))
 
     const titles = new Map<string, string>()
     const TITLE_CACHE_MS = 300_000
@@ -603,6 +643,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       const title = titles.get(record.header.id) ?? record.header.title
       return {
         sessionId: record.header.id,
+        archived: archived.has(record.header.id),
+        pinned: pinned.has(record.header.id),
         ...(title === undefined || title.length === 0 ? {} : { title }),
         cwd: record.header.cwd,
         createdAt: record.header.createdAt,
@@ -654,6 +696,29 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       const needs = await needsInputOf(session.sessionId)
       if (needs !== undefined) session.needsInput = needs
     }))
+    const previewOf = async (sessionId: string): Promise<string | undefined> => {
+      const cachedPreview = previewCache.get(sessionId)
+      if (cachedPreview !== undefined && Date.now() - cachedPreview.at < PREVIEW_CACHE_MS) {
+        return cachedPreview.preview.length === 0 ? undefined : cachedPreview.preview
+      }
+      try {
+        const snapshot = await withTimeout(ctx.sessionQuery.readSession(sessionId), 1_200, 'session preview')
+        if (snapshot === undefined) return undefined
+        const preview = latestUserPreview(snapshot.events)
+        previewCache.set(sessionId, { at: Date.now(), preview: preview ?? '' })
+        return preview
+      } catch {
+        return undefined
+      }
+    }
+    // Mobile and desktop pickers need one useful subtitle, but list latency is
+    // more important than completeness. Timed-out rows fill on a later poll.
+    const previewDeadline = Date.now() + PREVIEW_BUDGET_MS
+    await Promise.all(sessions.slice(0, PREVIEW_ROWS).map(async (session) => {
+      if (Date.now() > previewDeadline) return
+      const preview = await previewOf(session.sessionId)
+      if (preview !== undefined) session.preview = preview
+    }))
     sessionCache.set(cacheKey, { at: Date.now(), sessions })
     return sessions
   }
@@ -676,126 +741,87 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const liveAgent = async (sessionId: string): Promise<AgentLike> => {
     const existing = ctx.agents.get(sessionId)
     if (existing !== undefined) return existing
-
     const pending = resuming.get(sessionId)
-    if (pending !== undefined) return (await pending).agent
-
-    const observation = await ctx.sessionQuery.observeSession(sessionId, { projectionMode: 'all' })
-    let presetId: string | undefined
-    let sessionModel: Record<string, unknown> | undefined
-    try {
-      presetId = observation.projections?.values.agentPreset
-      sessionModel = observation.projections?.values.modelSelection?.lastUsed
-    } finally {
-      observation[Symbol.dispose]()
-    }
-    const composition = await composeAgent(presetId)
-    const agentOptions = sessionModel ?? ctx.agentDefaultModel?.currentSelection()
-
-    const resume = ctx.agents.resume({
-      resumeSessionId: sessionId,
-      ...(agentOptions === undefined ? {} : { agentOptions }),
-      ...(composition.setup === undefined ? {} : { setup: composition.setup }),
-    })
-      .then((handle) => {
-        handles.set(sessionId, handle)
-        return handle
+    if (pending) return (await pending).agent
+    const operation = (async (): Promise<AgentHandleLike> => {
+      const controller = sessionController()
+      if (controller?.resolveAgent) {
+        const result = await controller.resolveAgent(sessionId)
+        if ('error' in result) throw result.error
+        return { agent: result.agent, dispose: async () => {} }
+      }
+      const observation = await ctx.sessionQuery.observeSession(sessionId, { projectionMode: 'all' })
+      let presetId: string | undefined
+      let selected: Record<string, unknown> | undefined
+      try {
+        if (observation.header?.origin === 'subagent') throw new Error('owned subagent sessions cannot be independently resumed')
+        presetId = observation.projections?.values.agentPreset
+        selected = observation.projections?.values.modelSelection?.next ?? observation.projections?.values.modelSelection?.lastUsed
+      } finally { observation[Symbol.dispose]() }
+      const composition = await composeAgent(presetId)
+      const agentOptions = selected ?? ctx.agentDefaultModel?.currentSelection()
+      const handle = await ctx.agents.resume({ resumeSessionId: sessionId,
+        ...(agentOptions === undefined ? {} : { agentOptions }),
+        ...(composition.setup === undefined ? {} : { setup: composition.setup }),
       })
-      .finally(() => {
-        resuming.delete(sessionId)
-      })
-    resuming.set(sessionId, resume)
-    return (await resume).agent
+      handles.set(sessionId, handle)
+      return handle
+    })()
+    resuming.set(sessionId, operation)
+    try { return (await operation).agent }
+    finally { if (resuming.get(sessionId) === operation) resuming.delete(sessionId) }
   }
 
   const sendError = (socket: Socket, error: ErrorMessage): void => {
     jsonLine(socket, error)
   }
 
-  // 回收站即墓碑：.trash-* 里出现过的 session 目录一律不再出现在列表里。
-  // dsh 核心的 sessionQuery 有自己的账本（删了磁盘它也不知道），插件层负责兜底。
-  const trashedIds = new Set<string>()
-  let trashedLoaded = false
-  const loadTrashedOnce = (): void => {
-    if (trashedLoaded) return
-    trashedLoaded = true
-    try {
-      const root = resolve(join(resolveDshHome(), 'sessions'))
-      for (const entry of readdirSync(root)) {
-        if (!entry.startsWith('.trash')) continue
-        for (const group of readdirSync(join(root, entry))) {
-          try { for (const sid of readdirSync(join(root, entry, group))) trashedIds.add(sid) } catch { /* 空分组 */ }
-        }
-      }
-    } catch { /* sessions 根不存在 */ }
-  }
-
-  // 会话存储目录名固定为 session-<uuid>；其余形态一律拒绝（路径注入防线）
-  const SESSION_DIR_RE = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
-
-  /**
-   * session/delete：把一个已结束的会话从磁盘挪进回收站目录（sessions/.trash-<ts>/）。
-   * dsh 核心没有删除 API（sessionQuery 只有 list/read/observe），这里在插件层落实现：
-   *  - 活会话（live）拒绝删除，Host 正在写它的存储目录
-   *  - 不直接 rm：rename 进 .trash-<ts>/<原分组>/，误删可手工找回
-   *  - 目标路径经 resolve+前缀+目录名三重校验，只动 sessions/ 之内
-   */
-  const deleteSession = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+  const sessionAction = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
     const sessionId = typeof message.sessionId === 'string' ? message.sessionId : ''
-    if (!SESSION_DIR_RE.test(sessionId)) {
-      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'sessionId must look like session-<uuid>' })
-      return
-    }
-    let records: SessionRecordLike[] | undefined
-    try {
-      records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
-    } catch (error) {
-      sendError(socket, { type: 'error', code: 'INTERNAL', message: `session list failed: ${String(error)}` })
-      return
-    }
-    loadTrashedOnce()
-    const record = records?.find((candidate) => candidate.header.id === sessionId)
-    if (record === undefined || trashedIds.has(sessionId)) {
-      sendError(socket, { type: 'error', code: 'SESSION_NOT_FOUND', message: `no such session: ${sessionId}` })
-      return
-    }
-    if (record.live) {
-      sendError(socket, {
-        type: 'error',
-        code: 'SESSION_ACTIVE',
-        message: 'session is live; wait for it to finish before deleting',
-        action: 'Cancel or finish the running turn, then delete again.',
-      })
-      return
-    }
-    // 定位磁盘目录：sessions/<encoded-cwd>/session-<uuid>
-    const sessionsRoot = resolve(join(resolveDshHome(), 'sessions'))
-    let target: string | undefined
-    try {
-      for (const group of readdirSync(sessionsRoot)) {
-        if (group.startsWith('.trash')) continue
-        const candidate = join(sessionsRoot, group, sessionId)
-        // 绝大多数分组下并没有这个会话目录：ENOENT 是常态，跳过继续找，
-        // 不能让它把整个定位循环打断（初版就是在这里被第一个分组噎住的）
-        let st
-        try { st = lstatSync(candidate) } catch { continue }
-        if (st.isDirectory() && !st.isSymbolicLink()) { target = candidate; break }
-      }
-    } catch { /* sessions 根目录缺失按未持久化处理 */ }
-    if (target !== undefined) {
-      const resolved = resolve(target)
-      if (!resolved.startsWith(sessionsRoot + sep) || basename(resolved) !== sessionId) {
-        sendError(socket, { type: 'error', code: 'INTERNAL', message: 'resolved session path escaped sessions root' })
+    if (!sessionId) throw new Error('session action requires a sessionId')
+    const controller = sessionController()
+    const registry = ctx.workspaceRegistry
+    let result: Record<string, unknown> = {}
+    switch (message.type) {
+      case 'session/rename':
+        if (!controller?.rename) break
+        if (typeof message.title !== 'string' || !message.title.trim()) throw new Error('title must not be empty')
+        result = await controller.rename({ sessionId, title: message.title.trim() })
+        titleCache.delete(sessionId)
+        break
+      case 'session/fork':
+        if (!controller?.fork) break
+        result = { newSessionId: (await controller.fork({ sessionId })).sessionId }
+        break
+      case 'session/archive':
+        if (!registry?.archiveSession) break
+        await registry.archiveSession(sessionId)
+        break
+      case 'session/restore':
+        if (!registry?.unarchiveSession) break
+        await registry.unarchiveSession(sessionId)
+        break
+      case 'session/pin':
+        if (!registry?.pinSession || !registry.unpinSession) break
+        await (message.pinned === false ? registry.unpinSession(sessionId) : registry.pinSession(sessionId))
+        break
+      default:
+        sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'physical deletion is unavailable; archive the session instead' })
         return
-      }
-      const trash = join(sessionsRoot, `.trash-${Date.now()}`)
-      const group = dirname(resolved).slice(sessionsRoot.length + 1)
-      mkdirSync(join(trash, group), { recursive: true })
-      renameSync(resolved, join(trash, group, sessionId))
     }
-    trashedIds.add(sessionId)   // 核心账本不感知磁盘删除，列表过滤靠它即时生效
-    sessionCache.clear()        // 列表缓存作废，下一次 list 立刻反映删除
-    jsonLine(socket, { type: 'session-deleted', sessionId })
+    if (message.type === 'session/pin') result = { ...result, pinned: message.pinned !== false }
+    if (message.type === 'session/archive') result = { ...result, archived: true }
+    if (message.type === 'session/restore') result = { ...result, archived: false }
+    const supported = message.type === 'session/rename' ? controller?.rename
+      : message.type === 'session/fork' ? controller?.fork
+      : message.type === 'session/archive' ? registry?.archiveSession
+      : message.type === 'session/restore' ? registry?.unarchiveSession : registry?.pinSession
+    if (!supported) {
+      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'Host does not support this session action' })
+      return
+    }
+    sessionCache.clear()
+    jsonLine(socket, { type: 'session-updated', sessionId, action: String(message.type).slice(8), ...result })
   }
 
   const sessionController = (): SessionControllerLike | undefined => {
@@ -939,7 +965,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     const { selected } = await controller.selectModel({ sessionId, ...selection })
-    jsonLine(socket, { type: 'model-selected', sessionId, selected, savedAsDefault: true })
+    jsonLine(socket, { type: 'model-selected', sessionId, selected })
   }
 
   const setDefaultModel = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
@@ -989,12 +1015,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   }
 
   /** The Host's credential store: `set` writes ~/.dsh/.credentials.yaml. */
-  const credentialStore = (): { set(ref: string, value: string): Promise<void> } | undefined => {
-    const service = ctx.get?.('credentials') as
-      | { set?: (ref: string, value: string) => Promise<void> }
-      | undefined
-    if (typeof service?.set !== 'function') return undefined
-    return { set: (ref: string, value: string) => service.set?.(ref, value) ?? Promise.resolve() }
+  const credentialStore = (): { set(ref: string, value: string): Promise<void>; unset(ref: string): Promise<void> } | undefined => {
+    const service = ctx.get?.('credentials') as { set?: (ref: string, value: string) => Promise<void>; unset?: (ref: string) => Promise<void> } | undefined
+    if (typeof service?.set !== 'function' || typeof service.unset !== 'function') return undefined
+    return { set: (ref, value) => service.set!(ref, value), unset: ref => service.unset!(ref) }
   }
 
   const hubDirs = resolveHubDirs({
@@ -1130,23 +1154,50 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const providerFileCandidates = (): string[] => {
     const home = dshHome()
     if (home === undefined) return []
-    const candidates = [join(home, 'cordis.patch.yml')]
+    const candidates: string[] = []
     const profile = process.env.DSH_PROFILE
     if (profile !== undefined && profile.length > 0) {
       candidates.push(join(home, 'profiles', profile, 'cordis.patch.yml'))
     }
+    candidates.push(join(home, 'cordis.patch.yml'))
     return candidates.filter((path) => existsSync(path))
   }
 
   const providerFile = (): string | undefined => {
+    const owned = configEditor()?.documentPath
+    if (owned) return owned
     const candidates = providerFileCandidates()
     // A file that declares no providers cannot be the one the Host routes.
     return candidates.find((path) => readProviders(safeRead(path)).length > 0) ?? candidates[0]
   }
 
+  const providerOwner = (): ConfigRowLike | undefined => {
+    const rows = configEditor()?.configuration?.().filter(row =>
+      row.entry.options.id === 'llm-pi-ai' || row.entry.options.name === '@deepseek-ai/dsh-llm-pi-ai') ?? []
+    if (rows.length > 1) throw new Error('multiple addressable provider owners; select the profile explicitly')
+    return rows[0]
+  }
+  const providerText = (file: string): string => {
+    const owner = providerOwner()
+    if (configEditor()?.documentPath === file && owner) {
+      return stringify([{ id: owner.entry.options.id, name: owner.entry.options.name, config: owner.entry.options.config ?? {} }])
+    }
+    return safeRead(file)
+  }
   const providerRows = (): ProviderEntry[] => {
     const file = providerFile()
-    return file === undefined ? [] : readProviderEntries(safeRead(file))
+    return file === undefined ? [] : readProviderEntries(providerText(file))
+  }
+  const providerSource = () => {
+    const owner = providerOwner()
+    return owner === undefined
+      ? { kind: 'file' as const, layer: 'entry' as const, inherited: false, overridden: false }
+      : {
+          kind: 'config-editor' as const,
+          layer: 'entry' as const,
+          inherited: Object.keys(owner.inherited ?? {}).length > 0,
+          overridden: Object.keys(owner.override ?? {}).length > 0,
+        }
   }
 
   /**
@@ -1154,23 +1205,63 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * intended. A near-miss (indentation drift, quoting slip) refuses the write
    * and leaves the file untouched.
    */
-  const persistProviders = (socket: Socket, file: string, after: string, expected: ProviderEntry[]): boolean => {
+  const persistProviders = async (socket: Socket, file: string, after: string, expected: ProviderEntry[], before = providerText(file)): Promise<boolean> => {
     if (JSON.stringify(providerSignature(expected)) !== JSON.stringify(providerSignature(readProviderEntries(after)))) {
-      sendError(socket, {
-        type: 'error',
-        code: 'INTERNAL',
-        message: 'refusing to write: the edited patch file no longer parses to the expected providers',
-        action: 'Edit the provider rows in cordis.patch.yml by hand.',
-      })
+      sendError(socket, { type: 'error', code: 'INTERNAL', message: 'edited configuration does not match the requested providers' })
       return false
     }
-    const temporary = `${file}.dshell-tmp`
-    writeFileSync(temporary, after, { mode: 0o600 })
-    renameSync(temporary, file)
-    return true
+    const editor = configEditor()
+    const row = providerOwner()
+    if (editor?.edit && editor.documentPath === file && row) {
+      const extract = (text: string): Record<string, unknown> | undefined => {
+        const value = parseDocument(text).toJS()
+        const visit = (node: unknown): Record<string, unknown> | undefined => {
+          if (Array.isArray(node)) { for (const item of node) { const found = visit(item); if (found) return found }; return }
+          if (!node || typeof node !== 'object') return
+          const obj = node as Record<string, unknown>
+          if (obj.id === 'llm-pi-ai' || obj.name === '@deepseek-ai/dsh-llm-pi-ai') return (obj.config as Record<string, unknown>)?.providers as Record<string, unknown>
+          for (const [key, value] of Object.entries(obj)) if (key !== 'config') { const found = visit(value); if (found) return found }
+        }
+        return visit(value)
+      }
+      const providers = extract(after)
+      if (!providers) throw new Error('configuration source has no addressable providers')
+      try {
+        await editor.edit(row.entry, current => {
+          const previous = parseDocument(before).toJS()[0]?.config ?? {}
+          if (!isDeepStrictEqual(current, previous)) throw new Error('configuration changed; reload providers and retry')
+          return { ...current, providers }
+        })
+      } catch (error) {
+        if (/configuration changed; reload providers and retry/i.test(errorText(error))) {
+          sendError(socket, { type: 'error', code: 'CONFIG_CONFLICT', message: errorText(error) })
+          return false
+        }
+        throw error
+      }
+      return true
+    }
+    // Fallback for Hosts without configEditor: serialize dshell writers and detect external edits.
+    const lock = file + '.dshell-lock'
+    let fd: number | undefined
+    const temporary = file + '.dshell-' + randomUUID()
+    try {
+      fd = openSync(lock, 'wx', 0o600)
+      if (safeRead(file) !== before) {
+        sendError(socket, { type: 'error', code: 'CONFIG_CONFLICT', message: 'configuration changed; reload providers and retry' })
+        return false
+      }
+      writeFileSync(temporary, after, { mode: 0o600, flag: 'wx' })
+      renameSync(temporary, file)
+      return true
+    } finally {
+      if (fd !== undefined) { closeSync(fd); try { unlinkSync(lock) } catch {} }
+      try { unlinkSync(temporary) } catch {}
+    }
   }
 
   const providerWritable = (file: string): boolean => {
+    if (configEditor()?.documentPath === file && configEditor()?.edit && providerOwner()) return true
     try {
       accessSync(file, fsConstants.W_OK)
       return true
@@ -1194,8 +1285,70 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       type: 'provider-list',
       file,
       writable: providerWritable(file),
+      source: providerSource(),
       providers: providerRows(),
     })
+  }
+
+  const saveProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
+    const providerId = typeof message.providerId === 'string' ? message.providerId.trim() : ''
+    const changes = typeof message.changes === 'object' && message.changes !== null
+      ? message.changes as Record<string, unknown>
+      : {}
+    const apiKey = typeof message.apiKey === 'string' && message.apiKey.trim().length > 0 ? message.apiKey.trim() : undefined
+    const fields = Object.keys(changes).filter(isProviderField)
+    if (providerId.length === 0 || (fields.length === 0 && apiKey === undefined)) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'provider/save needs providerId and at least one field or key' })
+      return
+    }
+    const file = providerFile()
+    if (file === undefined || !providerWritable(file)) {
+      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: file === undefined ? 'this Host found no provider configuration' : `${file} is not writable` })
+      return
+    }
+    const before = providerText(file)
+    const detail = readProviderDetail(before, providerId)
+    let ref: string | undefined
+    let ownerPrefix: string | undefined
+    const store = apiKey === undefined ? undefined : credentialStore()
+    if (apiKey !== undefined && store === undefined) {
+      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host has no credential store' })
+      return
+    }
+    let after = before
+    try {
+      for (const field of fields) {
+        if (field === 'apiKeyEnv' && apiKey !== undefined) continue
+        const raw = typeof changes[field] === 'string' ? changes[field] as string : ''
+        const value = raw.trim()
+        if (field === 'baseURL' && value.length > 0 && !/^https?:\/\/[^\s]+$/.test(value)) throw new ProviderEditError('BAD_FIELD', 'baseURL must be an absolute http(s) URL')
+        if (field === 'apiKeyEnv' && value.length > 0 && !/^[A-Z][A-Z0-9_]*$/.test(value)) throw new ProviderEditError('BAD_FIELD', 'apiKeyEnv must be an upper-case environment variable name')
+        after = value.length === 0 ? clearProviderField(after, providerId, field) : setProviderField(after, providerId, field, value)
+      }
+      if (apiKey !== undefined) {
+        ownerPrefix = 'DSHELL_' + createHash('sha256').update(resolve(file) + '\0' + providerId).digest('hex').slice(0, 20).toUpperCase() + '_'
+        ref = ownerPrefix + randomUUID().replaceAll('-', '').toUpperCase() + '_API_KEY'
+        await store!.set(ref, apiKey)
+        after = setProviderField(after, providerId, 'apiKeyEnv', ref)
+        if (!fields.includes('apiKeyEnv')) fields.push('apiKeyEnv')
+      }
+    } catch (error) {
+      if (ref !== undefined) await store?.unset(ref).catch(() => undefined)
+      if (error instanceof ProviderEditError) { sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message }); return }
+      throw error
+    }
+    let committed = false
+    try {
+      committed = after === before || await persistProviders(socket, file, after, readProviderEntries(after), before)
+      if (!committed) return
+    } finally {
+      if (!committed && ref !== undefined) await store?.unset(ref).catch(() => undefined)
+    }
+    if (ownerPrefix !== undefined && detail.apiKeyEnv?.startsWith(ownerPrefix) && detail.apiKeyEnv !== ref
+      && !readProviderEntries(after).some(row => row.id !== providerId && row.apiKeyEnv === detail.apiKeyEnv)) {
+      await store?.unset(detail.apiKeyEnv).catch(() => undefined)
+    }
+    jsonLine(socket, { type: 'provider-saved', file, providerId, fields, ...(ref === undefined ? {} : { ref }), source: providerSource(), providers: providerRows() })
   }
 
   const updateProvider = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
@@ -1245,7 +1398,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    const before = safeRead(file)
+    const before = providerText(file)
     let after: string
     try {
       after = setProviderField(before, providerId, field, value)
@@ -1264,7 +1417,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         else edited[field] = value.trim()
         return edited
       })
-      if (!persistProviders(socket, file, after, expected)) return
+      if (!await persistProviders(socket, file, after, expected, before)) return
     }
     jsonLine(socket, {
       type: 'provider-updated',
@@ -1326,25 +1479,23 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    const ref = `${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')}_API_KEY`
+    const before = providerText(file)
+    const detail = readProviderDetail(before, providerId) // validate owner before storing anything
+    const owner = createHash('sha256').update(resolve(file) + '\0' + providerId).digest('hex').slice(0, 20).toUpperCase()
+    const ref = 'DSHELL_' + owner + '_' + randomUUID().replaceAll('-', '').toUpperCase() + '_API_KEY'
+    const after = setProviderField(before, providerId, 'apiKeyEnv', ref)
+    const expected = readProviderEntries(before).map(row => row.id === providerId ? { ...row, apiKeyEnv: ref } : row)
     await store.set(ref, value)
-    const before = safeRead(file)
-    let after: string
+    let committed = false
     try {
-      after = setProviderField(before, providerId, 'apiKeyEnv', ref)
-    } catch (error) {
-      if (error instanceof ProviderEditError) {
-        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: error.message })
-        return
-      }
-      throw error
+      committed = after === before || await persistProviders(socket, file, after, expected, before)
+      if (!committed) return
+    } finally {
+      if (!committed) await store.unset(ref)
     }
-    if (after !== before) {
-      const expected = providerRows().map((row) => {
-        if (row.id !== providerId) return row
-        return { ...row, apiKeyEnv: ref }
-      })
-      if (!persistProviders(socket, file, after, expected)) return
+    // Only retire an earlier dshell-owned version after its replacement is durable.
+    if (detail.apiKeyEnv?.startsWith('DSHELL_' + owner + '_') && !readProviderEntries(after).some(row => row.id !== providerId && row.apiKeyEnv === detail.apiKeyEnv)) {
+      await store.unset(detail.apiKeyEnv).catch(() => undefined)
     }
     jsonLine(socket, {
       type: 'provider-key-stored',
@@ -1419,7 +1570,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host found no cordis.patch.yml to read providers from' })
       return
     }
-    const detail = readProviderDetail(safeRead(file), providerId)
+    const detail = readProviderDetail(providerText(file), providerId)
     if (detail.baseURL === undefined) {
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: `provider ${providerId} declares no baseURL to list models from` })
       return
@@ -1458,7 +1609,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    const before = safeRead(file)
+    const before = providerText(file)
     let after: string
     try {
       after = syncProviderModels(before, providerId, add, remove)
@@ -1469,7 +1620,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       }
       throw error
     }
-    if (after !== before && !persistProviders(socket, file, after, providerRows())) return
+    const expected = providerRows().map(row => row.id !== providerId ? row : { ...row, models: readProviderDetail(after, providerId).modelIds.length })
+    if (after !== before && !await persistProviders(socket, file, after, expected, before)) return
     jsonLine(socket, { type: 'provider-sync-applied', file, providerId, providers: providerRows() })
   }
 
@@ -1511,7 +1663,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    const before = safeRead(file)
+    const before = providerText(file)
     let after: string
     try {
       after = addProvider(before, {
@@ -1536,7 +1688,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
       ...(displayName.length === 0 ? {} : { displayName }),
     }
-    if (!persistProviders(socket, file, after, [...providerRows(), entry])) return
+    if (!await persistProviders(socket, file, after, [...providerRows(), entry], before)) return
     jsonLine(socket, { type: 'provider-created', file, providerId, providers: providerRows() })
   }
 
@@ -1556,7 +1708,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    const before = safeRead(file)
+    const before = providerText(file)
     let after: string
     try {
       after = removeProvider(before, providerId)
@@ -1568,7 +1720,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       throw error
     }
     const expected = providerRows().filter((row) => row.id !== providerId)
-    if (!persistProviders(socket, file, after, expected)) return
+    if (!await persistProviders(socket, file, after, expected, before)) return
     jsonLine(socket, { type: 'provider-deleted', file, providerId, providers: providerRows() })
   }
 
@@ -1625,6 +1777,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     process.exit(0)
   }
 
+  const historyCuts = new Map<Socket, Map<string, number>>()
+
   const watch = (socket: Socket, sessionId: string): Set<string> => {
     let sessions = watched.get(socket)
     if (sessions === undefined) {
@@ -1674,6 +1828,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     sessionId: string
     callId: string
     questions: AskedQuestion[]
+    message: QuestionRequestMessage
+    agent?: AgentLike
+    claim: AbortController
+    claimHeld: boolean
+    otherDone: boolean
     // The Host tool reads `.answers` off the waterfall's return value.
     resolve: (result: { answers: QuestionAnswer[] }) => void
     reject: (error: unknown) => void
@@ -1749,6 +1908,40 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     return true
   }
 
+  const validAnswers = (questions: readonly AskedQuestion[], answers: readonly QuestionAnswer[]): boolean => {
+    if (answers.length !== questions.length || new Set(answers.map(a => a.id)).size !== answers.length) return false
+    return questions.every(question => {
+      const answer = answers.find(a => a.id === question.id)
+      if (!answer || new Set(answer.selected).size !== answer.selected.length) return false
+      if (!question.multiSelect && answer.selected.length > 1) return false
+      const labels = new Set(question.options?.map(option => option.label) ?? [])
+      return answer.selected.every(label => labels.has(label))
+        && (answer.selected.length > 0 || Boolean(answer.custom?.trim()))
+    })
+  }
+  const questionService = () => ctx.get?.('userQuestions') as {
+    answer?(agent: AgentLike, callId: string, answer: { answers: QuestionAnswer[] }): boolean
+    attachWait?(agent: AgentLike, callId: string, signal: AbortSignal): AsyncIterable<{ remainingMs: number }>
+  } | undefined
+
+  const holdQuestion = (entry: PendingQuestion): void => {
+    const service = questionService()
+    if (!entry.message.timed || entry.claimHeld || !entry.agent || !service?.attachWait
+      || watchersFor(entry.sessionId).length === 0) return
+    const claim = new AbortController()
+    entry.claim = claim
+    entry.claimHeld = true
+    void (async () => {
+      try {
+        for await (const frame of service.attachWait!(entry.agent!, entry.callId, claim.signal)) {
+          if (claim.signal.aborted) break
+          entry.message.timeoutMs = frame.remainingMs
+        }
+      } catch { /* the owner's request signal settles the question */ }
+      finally { if (entry.claim === claim) entry.claimHeld = false }
+    })()
+  }
+
   const handleQuestion = async (
     request: {
       questions: AskedQuestion[]
@@ -1775,6 +1968,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       questions: request.questions.map((question) => ({
         id: question.id,
         question: question.question,
+        ...(question.detail === undefined ? {} : { detail: question.detail }),
+        ...(question.intent === undefined ? {} : { intent: { ...question.intent } }),
         ...(question.header === undefined ? {} : { header: question.header }),
         ...(question.multiSelect === undefined ? {} : { multiSelect: question.multiSelect }),
         ...(question.options === undefined
@@ -1788,7 +1983,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       const onAbort = (): void => {
         settleQuestion(callId, 'aborted', undefined, signal?.reason)
       }
-      questionRequests.set(callId, {
+      const claim = new AbortController()
+      const questionEntry: PendingQuestion = {
+        message, agent: request.agent, claim, claimHeld: false, otherDone: false,
         sessionId,
         callId,
         questions: message.questions,
@@ -1796,6 +1993,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         reject,
         close: (reason) => {
           signal?.removeEventListener('abort', onAbort)
+          questionEntry.claim.abort()
           broadcast(sessionId, {
             type: 'question/closed',
             sessionId,
@@ -1803,13 +2001,27 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             reason,
           } satisfies QuestionClosedMessage)
         },
-      })
+      }
+      questionRequests.set(callId, questionEntry)
       if (signal?.aborted === true) {
         onAbort()
         return
       }
       signal?.addEventListener('abort', onAbort)
       broadcast(sessionId, message)
+      const entry = questionRequests.get(callId)!
+      holdQuestion(entry)
+      // Let other frontends answer concurrently; unavailable/error cannot beat a live TUI.
+      void Promise.resolve().then(next).then(result => {
+        const value = result as { answers?: QuestionAnswer[] } | undefined
+        if (Array.isArray(value?.answers) && validAnswers(message.questions, value.answers)) {
+          settleQuestion(callId, 'answered', value.answers)
+        } else entry.otherDone = true
+      }, () => { entry.otherDone = true }).finally(() => {
+        if (entry.otherDone && watchersFor(sessionId).length === 0 && !entry.claimHeld) {
+          settleQuestion(callId, 'detached', undefined, new Error('no answerer remains'))
+        }
+      })
     })
   }
 
@@ -1842,30 +2054,56 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // subscription would otherwise be lost. The client buffers messages
     // until `attached`, then dedupes them by seq.
     watch(socket, sessionId)
-    let snapshot
+    let snapshot: { session: SessionHeader; events: SessionEvent[] }
+    let hasMore = false
+    let modelSelection: ModelSelection | undefined
+    let modelSelectionLastUsed: ModelSelection | undefined
     try {
-      snapshot = await ctx.sessionQuery.readSession(sessionId)
+      const controller = sessionController()
+      if (controller?.follow && controller.page) {
+        const opening = await openHistory(controller, sessionId, AbortSignal.timeout(10_000))
+        const openingEvents = historyEvents(opening)
+        snapshot = { session: opening.header, events: openingEvents.slice(-500) }
+        const projection = opening.projections?.values?.modelSelection as { next?: unknown; lastUsed?: unknown } | undefined
+        const selection = openingEvents.reduce(advanceModelSelection, {} as ModelSelectionState)
+        modelSelection = readModelSelection(projection?.next ?? projection?.lastUsed) ?? selection.pending ?? selection.lastUsed
+        modelSelectionLastUsed = readModelSelection(projection?.lastUsed) ?? selection.lastUsed
+        historyCuts.get(socket)?.set(sessionId, opening.cursor)
+        if (!historyCuts.has(socket)) historyCuts.set(socket, new Map([[sessionId, opening.cursor]]))
+        // The owner budgets messages, which can contain thousands of tool or
+        // telemetry events. Bound our transport in events as well.
+        hasMore = opening.hasMore || openingEvents.length > snapshot.events.length
+      } else {
+        const all = await ctx.sessionQuery.readSession(sessionId)
+        snapshot = { session: all.session, events: all.events.slice(-500) }
+        const selection = all.events.reduce(advanceModelSelection, {} as ModelSelectionState)
+        modelSelection = selection.pending ?? selection.lastUsed
+        modelSelectionLastUsed = selection.lastUsed
+        hasMore = all.events.length > 500
+      }
     } catch (error) {
       unwatch(socket, sessionId)
       throw error
     }
+    for (const pending of questionRequests.values()) if (pending.sessionId === sessionId) holdQuestion(pending)
+    const status = ctx.agents.get(sessionId)?.status ?? (openTurn(snapshot.events) ? 'running' : 'idle')
     jsonLine(socket, {
-      type: 'attached',
-      sessionId,
-      header: snapshot.session,
-      cursor: snapshot.events.at(-1)?.seq ?? -1,
-      events: snapshot.events,
+      type: 'attached', sessionId, header: snapshot.session,
+      cursor: historyCuts.get(socket)?.get(sessionId) ?? snapshot.events.at(-1)?.seq ?? -1,
+      events: snapshot.events, hasMore, status,
+      ...(modelSelection === undefined ? {} : { modelSelection }),
+      ...(modelSelectionLastUsed === undefined ? {} : { modelSelectionLastUsed }),
+      approvals: approvals.snapshot(sessionId),
+      questions: [...questionRequests.values()].filter(p => p.sessionId === sessionId).map(p => p.message),
     })
-    // Tell a late attacher whether a turn is already running; without this the
-    // client assumes idle and Enter would queue instead of steering.
-    jsonLine(socket, { type: 'status', sessionId, status: openTurn(snapshot.events) ? 'running' : 'idle' })
+    jsonLine(socket, { type: 'status', sessionId, status })
   }
 
   /** True when the newest turn event in a snapshot is a `turn/start`. */
   const openTurn = (events: readonly SessionEvent[]): boolean => {
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const type = events[index]?.type
-      if (type === 'turn/end') return false
+      if (type === 'turn/end' || type === 'turn/failed') return false
       if (type === 'turn/start') return true
     }
     return false
@@ -1876,26 +2114,26 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'session/history requires a sessionId' })
       return
     }
-    const snapshot = await ctx.sessionQuery.readSession(message.sessionId)
     const limit = typeof message.limit === 'number' && Number.isFinite(message.limit)
-      ? Math.min(200, Math.max(1, Math.floor(message.limit)))
-      : 50
-    const before = typeof message.before === 'number' && Number.isFinite(message.before)
-      ? message.before
-      : undefined
-    const end = before === undefined
-      ? snapshot.events.length
-      : snapshot.events.findIndex((event) => event.seq >= before)
-    const safeEnd = end === -1 ? snapshot.events.length : end
-    const start = Math.max(0, safeEnd - limit)
-    const events = snapshot.events.slice(start, safeEnd)
-    const reply: HistoryMessage = {
-      type: 'history',
-      sessionId: message.sessionId,
-      events,
-      cursor: events[0]?.seq ?? -1,
-      hasMore: start > 0,
+      ? Math.min(200, Math.max(1, Math.floor(message.limit))) : 50
+    const before = typeof message.before === 'number' && Number.isSafeInteger(message.before) ? message.before : undefined
+    const controller = sessionController()
+    const throughSeq = historyCuts.get(socket)?.get(message.sessionId)
+    let events: SessionEvent[], hasMore: boolean
+    if (controller?.page && throughSeq !== undefined) {
+      const page = await controller.page({ address: { kind: 'session', sessionId: message.sessionId }, throughSeq,
+        ...(before === undefined ? {} : { beforeSeq: before }), maxMessages: limit }, AbortSignal.timeout(10_000))
+      const pageEvents = historyEvents(page)
+      events = pageEvents.slice(-limit)
+      hasMore = page.hasMore || pageEvents.length > events.length
+    } else {
+      const snapshot = await ctx.sessionQuery.readSession(message.sessionId)
+      const eligible = before === undefined ? snapshot.events : snapshot.events.filter(event => event.seq < before)
+      events = eligible.slice(-limit)
+      hasMore = eligible.length > events.length
     }
+    const reply: HistoryMessage = { type: 'history', sessionId: message.sessionId, events,
+      cursor: events[0]?.seq ?? -1, hasMore }
     jsonLine(socket, reply)
   }
 
@@ -1929,6 +2167,15 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
 
+    const controller = sessionController()
+    if (controller?.create) {
+      const created = await controller.create({
+        ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : { cwd: typeof message.cwd === 'string' ? message.cwd : process.cwd() }),
+      })
+      const snapshot = await ctx.sessionQuery.readSession(created.sessionId)
+      jsonLine(socket, { type: 'session-created', sessionId: created.sessionId, header: snapshot.session, ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : {}) })
+      return
+    }
     let workspace: WorkspaceLike | undefined
     if (typeof message.workspaceId === 'string' && message.workspaceId.length > 0) {
       workspace = registry.get(message.workspaceId)
@@ -1977,11 +2224,41 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    if (typeof message.text !== 'string' || message.text.length === 0) {
+    const rawContent = Array.isArray(message.content)
+      ? message.content
+      : typeof message.text === 'string' ? [{ type: 'text', text: message.text }] : []
+    const content: PromptContentPart[] = []
+    for (const raw of rawContent) {
+      if (typeof raw !== 'object' || raw === null) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'prompt content parts must be objects' })
+        return
+      }
+      const part = raw as Record<string, unknown>
+      if (part.type === 'text' && typeof part.text === 'string') {
+        content.push({ type: 'text', text: part.text })
+        continue
+      }
+      if (part.type === 'image' && ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(String(part.mediaType)) && typeof part.data === 'string') {
+        content.push({
+          type: 'image',
+          mediaType: part.mediaType as Extract<PromptContentPart, { type: 'image' }>['mediaType'],
+          data: part.data,
+          ...(typeof part.name === 'string' ? { name: part.name } : {}),
+        })
+        continue
+      }
+      if (part.type === 'file' && typeof part.receiptId === 'string' && part.receiptId.length > 0) {
+        content.push({ type: 'file', receiptId: part.receiptId })
+        continue
+      }
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: `unsupported prompt content part: ${String(part.type)}` })
+      return
+    }
+    if (content.length === 0 || !content.some(part => part.type !== 'text' || part.text.trim().length > 0)) {
       sendError(socket, {
         type: 'error',
         code: 'BAD_REQUEST',
-        message: 'prompt requires non-empty text',
+        message: 'prompt requires text or an attachment',
       })
       return
     }
@@ -2003,23 +2280,33 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       ? message.requestId
       : `dshell-${randomUUID()}`
 
-    // Acknowledge before waking the Agent: followup() may synchronously emit
-    // turn/start, and the client should see `accepted` before those events.
-    jsonLine(socket, {
-      type: 'accepted',
-      sessionId: message.sessionId,
-      requestId,
-      mode,
-    })
-
-    const userMessage: UserMessageLike = {
-      id: requestId,
-      role: 'user',
-      content: [{ type: 'text', text: message.text }],
-      source: { kind: 'user' },
+    if (message.requireIdle === true) {
+      const snapshot = agent.status === undefined ? await ctx.sessionQuery.readSession(message.sessionId) : undefined
+      if (agent.status === 'running' || (snapshot && openTurn(snapshot.events)) || (agent.inbox?.nextTurn.length ?? 0) > 0 || (agent.inbox?.nextStep.length ?? 0) > 0) {
+        sendError(socket, { type: 'error', code: 'SESSION_ACTIVE', message: 'print requires an idle session; use --new or wait for the current turn' })
+        return
+      }
     }
-    if (mode === 'steer') agent.steer(userMessage)
-    else agent.followup(userMessage)
+    const controller = sessionController()
+    if (content.some(part => part.type !== 'text') && controller?.prompt === undefined) {
+      sendError(socket, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host cannot admit image or file prompt content' })
+      return
+    }
+    if (message.requireIdle === true) activePrompt.set(message.sessionId, requestId)
+    try {
+      if (controller?.prompt) {
+        await controller.prompt({ sessionId: message.sessionId, requestId, mode, content }, new AbortController().signal)
+      } else {
+        const text = content.filter((part): part is Extract<PromptContentPart, { type: 'text' }> => part.type === 'text').map(part => part.text).join('\n')
+        const userMessage: UserMessageLike = { id: requestId, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user', rpcId: requestId } }
+        if (mode === 'steer') agent.steer(userMessage)
+        else agent.followup(userMessage)
+      }
+    } catch (error) {
+      if (activePrompt.get(message.sessionId) === requestId) activePrompt.delete(message.sessionId)
+      throw error
+    }
+    jsonLine(socket, { type: 'accepted', sessionId: message.sessionId, requestId, mode })
   }
 
   /**
@@ -2055,6 +2342,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // Stop the parent's turn first — the user is watching it stop. The
     // subagent sweep can wait behind the session list without delaying it.
     const agent = ctx.agents.get(message.sessionId)
+    if (typeof message.requestId === 'string' && activePrompt.get(message.sessionId) !== message.requestId) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'the requested prompt does not own the active turn' })
+      return
+    }
     if (agent !== undefined) agent.cancel({ kind: 'user' })
     const subagents = message.killSubagents === true ? await cancelSubagents(message.sessionId) : 0
     jsonLine(socket, {
@@ -2170,38 +2461,26 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
 
     if (socket.destroyed) return
-    if (questionRequests.has(message.callId)) {
-      watch(socket, message.sessionId)
+    const pending = questionRequests.get(message.callId)
+    if (pending) {
+      if (pending.sessionId !== message.sessionId || !watched.get(socket)?.has(message.sessionId) || !validAnswers(pending.questions, answers)) {
+        sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: 'answer does not match the pending session and complete question batch' })
+        return
+      }
       settleQuestion(message.callId, 'answered', answers)
-      jsonLine(socket, {
-        type: 'question-answered',
-        sessionId: message.sessionId,
-        callId: message.callId,
-      })
-      return
+    } else {
+      if (lateQuestionAnswer(socket, message.callId)) return
+      const owner = questionService()
+      if (!owner?.answer) {
+        sendError(socket, { type: 'error', code: 'QUESTION_NOT_PENDING', message: 'this question has no live request or continued-question owner' })
+        return
+      }
+      const agent = await liveAgent(message.sessionId)
+      if (!owner.answer(agent, message.callId, { answers })) {
+        sendError(socket, { type: 'error', code: 'QUESTION_NOT_PENDING', message: 'question is no longer answerable' })
+        return
+      }
     }
-    if (lateQuestionAnswer(socket, message.callId)) return
-    const agent = await liveAgent(message.sessionId)
-    if (socket.destroyed) return
-    watch(socket, message.sessionId)
-
-    const reply: UserMessageLike = {
-      id: `dshell-answer-${randomUUID()}`,
-      role: 'user',
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            kind: 'answer_to_pending_question',
-            tool: 'ask_user_question',
-            callId: message.callId,
-            answers,
-          }),
-        },
-      ],
-      source: { kind: 'user-question-reply', callId: message.callId, outcome: 'answered' },
-    }
-    agent.steer(reply)
     jsonLine(socket, {
       type: 'question-answered',
       sessionId: message.sessionId,
@@ -2209,19 +2488,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     })
   }
 
-  const handleLine = async (socket: Socket, line: string): Promise<void> => {
-    let message: Record<string, unknown>
-    try {
-      message = JSON.parse(line) as Record<string, unknown>
-    } catch {
-      sendError(socket, {
-        type: 'error',
-        code: 'BAD_REQUEST',
-        message: 'message is not valid JSON',
-      })
-      return
-    }
-
+  const dispatch = async (socket: Socket, message: Record<string, unknown>): Promise<void> => {
     try {
       switch (message.type) {
         case 'hello': {
@@ -2241,10 +2508,15 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             dshVersion: inferDshVersion(),
             capabilities: (CAPABILITIES as readonly Capability[]).filter((capability) => {
               if (capability === 'models') return sessionController() !== undefined
+              if (capability === 'prompt-content') return sessionController()?.prompt !== undefined
               if (capability === 'providers') return providerFile() !== undefined
               if (capability === 'provider-key') return credentialStore() !== undefined && providerFile() !== undefined
               if (capability === 'provider-discover') return llmDiscovery() !== undefined
               if (capability === 'agents') return configEditor() !== undefined
+              if (capability === 'session-rename') return sessionController()?.rename !== undefined
+              if (capability === 'session-fork') return sessionController()?.fork !== undefined
+              if (capability === 'session-archive') return ctx.workspaceRegistry?.archiveSession !== undefined && ctx.workspaceRegistry?.unarchiveSession !== undefined
+              if (capability === 'session-pin') return ctx.workspaceRegistry?.pinSession !== undefined && ctx.workspaceRegistry?.unpinSession !== undefined
               if (capability === 'skills') return skillRegistry() !== undefined
               return true
             }),
@@ -2265,7 +2537,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         case 'session/list':
           jsonLine(socket, {
             type: 'sessions',
-            sessions: await listSessions(typeof message.workspaceId === 'string' ? message.workspaceId : undefined),
+            sessions: await listSessions(typeof message.workspaceId === 'string' ? message.workspaceId : undefined, message.includeArchived === true),
           })
           return
         case 'workspaces':
@@ -2300,7 +2572,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           await prompt(socket, message)
           return
         case 'session/delete':
-          await deleteSession(socket, message)
+        case 'session/rename':
+        case 'session/archive':
+        case 'session/restore':
+        case 'session/pin':
+        case 'session/fork':
+          await sessionAction(socket, message)
           return
         case 'session/cancel':
           cancel(socket, message)
@@ -2341,6 +2618,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         case 'provider/update':
           await updateProvider(socket, message)
           return
+        case 'provider/save':
+          await saveProvider(socket, message)
+          return
         case 'provider/api-key':
           await storeProviderKey(socket, message)
           return
@@ -2374,6 +2654,25 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
   }
 
+  const handleLine = async (socket: Socket, line: string): Promise<void> => {
+    if (Buffer.byteLength(line, 'utf8') > 8 * 1024 * 1024) {
+      socket.destroy()
+      return
+    }
+    let message: Record<string, unknown>
+    try {
+      const value: unknown = JSON.parse(line)
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected a message object')
+      message = value as Record<string, unknown>
+      if (typeof message.type !== 'string') throw new Error('expected a message type')
+      if (message.rpcId !== undefined && (typeof message.rpcId !== 'string' || message.rpcId.length < 1 || message.rpcId.length > 128)) throw new Error('invalid RPC identity')
+    } catch (error) {
+      sendError(socket, { type: 'error', code: 'BAD_REQUEST', message: errorText(error) })
+      return
+    }
+    await rpcContext.run({ socket, rpcId: message.rpcId as string | undefined }, () => dispatch(socket, message))
+  }
+
   const enqueue = (socket: Socket, line: string): void => {
     const previous = queues.get(socket) ?? Promise.resolve()
     const next = previous
@@ -2387,22 +2686,33 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
   const cleanupSocket = (socket: Socket): void => {
     clients.delete(socket)
+    historyCuts.delete(socket)
     unwatch(socket)
     queues.delete(socket)
     approvals.watchersChanged()
     for (const [callId, pending] of questionRequests) {
       if (watchersFor(pending.sessionId).length > 0) continue
-      settleQuestion(callId, 'detached', undefined, new Error('the dshell client disconnected before answering'))
+      pending.claim.abort()
+      pending.claimHeld = false
+      if (pending.otherDone && !pending.message.timed) settleQuestion(callId, 'detached', undefined, new Error('the dshell client disconnected before answering'))
     }
   }
 
   const server = createServer((socket) => {
     clients.add(socket)
     socket.setEncoding('utf8')
-    const lines = createInterface({ input: socket })
-    lines.on('error', () => cleanupSocket(socket))
-    lines.on('line', (line) => {
-      if (line.trim().length > 0) enqueue(socket, line)
+    let buffer = ''
+    socket.on('data', (chunk: string) => {
+      buffer += chunk
+      for (;;) {
+        const newline = buffer.indexOf('\n')
+        if (newline < 0) break
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        if (Buffer.byteLength(line, 'utf8') > 8 * 1024 * 1024) { socket.destroy(); return }
+        if (line.trim().length > 0) enqueue(socket, line)
+      }
+      if (Buffer.byteLength(buffer, 'utf8') > 8 * 1024 * 1024) socket.destroy()
     })
     socket.on('close', () => cleanupSocket(socket))
     socket.on('error', () => cleanupSocket(socket))
@@ -2414,6 +2724,14 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
   const disposeSessionEvent = ctx.on('session/event', (session: { id: string }, event: SessionEvent) => {
     noteAskCall(session.id, event)
+    const data = (event.data ?? {}) as Record<string, any>
+    if (event.type === 'user/message') {
+      const message = data.message ?? data
+      const id = message.source?.rpcId ?? message.id
+      if (typeof id === 'string') activePrompt.set(session.id, id)
+      previewCache.delete(session.id)
+    }
+    if (event.type === 'turn/end' || event.type === 'turn/failed') activePrompt.delete(session.id)
     broadcast(session.id, { type: 'event', sessionId: session.id, event })
   })
 

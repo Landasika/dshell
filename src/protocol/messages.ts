@@ -3,6 +3,14 @@ export const PROTOCOL_VERSION = 2 as const
 
 /** Capabilities advertised by a protocol-v2 host. */
 export const CAPABILITIES = [
+  'session-rename',
+  'session-archive',
+  'session-pin',
+  'session-fork',
+  'rpc-id',
+  'pending-snapshot',
+  'turn-correlation',
+  'prompt-content',
   'list',
   'attach',
   'prompt',
@@ -37,6 +45,8 @@ export type DshellErrorCode =
   | 'SESSION_NOT_FOUND'
   | 'SESSION_ALREADY_LIVE'
   | 'SESSION_ACTIVE'
+  | 'INTERACTION_REQUIRED'
+  | 'CONFIG_CONFLICT'
   | 'APPROVAL_NOT_PENDING'
   | 'QUESTION_NOT_PENDING'
   | 'QUEUE_ITEM_NOT_FOUND'
@@ -112,6 +122,8 @@ export interface WorkspaceSummary {
 }
 
 export interface SessionSummary {
+  archived?: boolean
+  pinned?: boolean
   sessionId: string
   cwd?: string
   title?: string
@@ -127,6 +139,8 @@ export interface SessionSummary {
   running?: boolean
   /** The open turn is waiting on the user: an approval or a question. */
   needsInput?: 'approval' | 'question'
+  /** First line of the latest real user prompt, collapsed and clipped by the Host. */
+  preview?: string
 }
 
 export interface SessionHeader {
@@ -144,6 +158,14 @@ export interface SessionEvent {
   data?: unknown
   [key: string]: unknown
 }
+
+export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+
+/** Ordered prompt content; image bytes and file receipts are admitted by the Host owner. */
+export type PromptContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; mediaType: ImageMediaType; data: string; name?: string }
+  | { type: 'file'; receiptId: string }
 
 export interface WelcomeMessage {
   type: 'welcome'
@@ -177,6 +199,14 @@ export interface AttachedMessage {
   header: SessionHeader
   cursor: number
   events: SessionEvent[]
+  hasMore?: boolean
+  status?: string
+  /** Effective owner projection; it may predate the opening history page. */
+  modelSelection?: ModelSelection
+  /** Last request's model, so an inherited default is not mistaken for a pending choice. */
+  modelSelectionLastUsed?: ModelSelection
+  approvals?: ApprovalRequestMessage[]
+  questions?: QuestionRequestMessage[]
 }
 
 export interface HistoryMessage {
@@ -250,7 +280,15 @@ export interface ProviderListMessage {
   /** Patch file the rows were read from. */
   file: string
   writable: boolean
+  source?: ProviderConfigSource
   providers: ProviderEntry[]
+}
+
+export interface ProviderConfigSource {
+  kind: 'config-editor' | 'file'
+  layer: 'entry'
+  inherited: boolean
+  overridden: boolean
 }
 
 export interface ProviderUpdatedMessage {
@@ -259,6 +297,16 @@ export interface ProviderUpdatedMessage {
   providerId: string
   field: ProviderField
   value: string
+  providers: ProviderEntry[]
+}
+
+export interface ProviderSavedMessage {
+  type: 'provider-saved'
+  file: string
+  providerId: string
+  fields: ProviderField[]
+  ref?: string
+  source?: ProviderConfigSource
   providers: ProviderEntry[]
 }
 
@@ -412,6 +460,8 @@ export interface ApprovalResolvedMessage {
 export interface AskedQuestion {
   id: string
   question: string
+  detail?: string
+  intent?: { kind: string; approve?: string; callId?: string; [key: string]: unknown }
   header?: string
   multiSelect?: boolean
   options?: { label: string; description?: string }[]
@@ -463,11 +513,11 @@ export interface ErrorMessage {
   action?: string
 }
 
-export type ClientMessage =
+export type ClientPayload =
   | { type: 'hello'; protocol: number }
   | { type: 'ping' }
   | { type: 'list' }
-  | { type: 'session/list'; workspaceId?: string }
+  | { type: 'session/list'; workspaceId?: string; includeArchived?: boolean }
   | { type: 'attach'; sessionId: string }
   | { type: 'detach'; sessionId?: string }
   | { type: 'watch'; sessionId: string }
@@ -475,6 +525,10 @@ export type ClientMessage =
   | { type: 'workspaces' }
   | { type: 'workspace/create'; path: string; title?: string }
   | { type: 'session/create'; cwd?: string; workspaceId?: string; title?: string }
+  | { type: 'session/rename'; sessionId: string; title: string }
+  | { type: 'session/archive' | 'session/restore'; sessionId: string }
+  | { type: 'session/pin'; sessionId: string; pinned: boolean }
+  | { type: 'session/fork'; sessionId: string }
   | { type: 'session/history'; sessionId: string; before?: number; limit?: number }
   | { type: 'session/cancel'; sessionId: string; requestId?: string }
   | { type: 'queue/edit'; sessionId: string; requestId: string; text: string }
@@ -482,9 +536,12 @@ export type ClientMessage =
   | {
       type: 'prompt'
       sessionId: string
-      text: string
+      /** Legacy text form; current clients send `content`. */
+      text?: string
+      content?: PromptContentPart[]
       mode?: 'queue' | 'steer'
       requestId?: string
+      requireIdle?: boolean
     }
   | { type: 'approval/answer'; requestId: string; outcome: ApprovalOutcome }
   | { type: 'question/answer'; sessionId: string; callId: string; answers: QuestionAnswer[] }
@@ -493,6 +550,7 @@ export type ClientMessage =
   | { type: 'model/catalog' }
   | { type: 'provider/list' }
   | { type: 'provider/update'; providerId: string; field: ProviderField; value: string }
+  | { type: 'provider/save'; providerId: string; changes: Partial<Record<ProviderField, string>>; apiKey?: string }
   | { type: 'provider/api-key'; providerId: string; value: string }
   | { type: 'provider/discover'; baseURL: string; api?: string; apiKey?: string }
   | { type: 'provider/sync-plan'; providerId: string }
@@ -511,7 +569,17 @@ export type ClientMessage =
   | { type: 'model/select'; sessionId: string; provider: string; model: string; reasoningEffort?: string }
   | { type: 'model/default'; provider: string; model: string; reasoningEffort?: string }
 
-export type ServerMessage =
+export interface SessionUpdatedMessage {
+  type: "session-updated"
+  sessionId: string
+  newSessionId?: string
+  action: string
+  title?: string
+  seq?: number
+}
+
+export type ServerPayload =
+  | SessionUpdatedMessage
   | WelcomeMessage
   | PongMessage
   | SessionsMessage
@@ -537,6 +605,7 @@ export type ServerMessage =
   | ModelSelectedMessage
   | ProviderListMessage
   | ProviderUpdatedMessage
+  | ProviderSavedMessage
   | ProviderKeyStoredMessage
   | ProviderDiscoveredMessage
   | ProviderSyncPlanMessage
@@ -546,3 +615,7 @@ export type ServerMessage =
   | AgentRosterMessage
   | HostRestartingMessage
   | ErrorMessage
+
+/** RPC identity is distinct from prompt/approval requestId. Broadcasts omit it. */
+export type ClientMessage = ClientPayload & { rpcId?: string }
+export type ServerMessage = ServerPayload & { rpcId?: string }

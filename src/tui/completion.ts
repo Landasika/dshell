@@ -10,6 +10,11 @@ export interface CommandSpec {
 export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/help', description: 'show keys and commands' },
   { name: '/sessions', description: 'switch session' },
+  { name: '/archived', description: 'browse and restore archived sessions' },
+  { name: '/rename', description: 'rename the attached session', needsArgument: true },
+  { name: '/archive', description: 'archive the attached session' },
+  { name: '/pin', description: 'pin or unpin the attached session' },
+  { name: '/fork', description: 'fork the attached session' },
   { name: '/workspaces', description: 'switch workspace' },
   { name: '/new', description: 'create a session' },
   { name: '/attach', description: 'attach by id', needsArgument: true },

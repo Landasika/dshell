@@ -7,7 +7,7 @@
  * activity. It is pure so a reconnect renders exactly the same footer.
  */
 import type { SessionView } from '../backend/index.js'
-import type { SessionEvent } from '../protocol/index.js'
+import type { SessionEvent } from '../backend/events.js'
 import { estimateSessionCost, type SessionCost } from './cost.js'
 import type { ThemeStyle } from './theme.js'
 import { summarizeTool } from './events.js'

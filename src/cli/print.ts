@@ -1,14 +1,15 @@
+import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { stdin } from 'node:process'
 
 import {
   SocketBackend,
   type SessionHandle,
+  type SessionEvent,
   type SessionSummary,
   type SessionView,
 } from '../backend/index.js'
 import { DshellError } from '../client/socket-client.js'
-import type { SessionEvent } from '../protocol/index.js'
 import { isTurnEnd, turnFailed } from './output.js'
 
 export type OutputFormat = 'text' | 'json' | 'stream-json'
@@ -33,6 +34,7 @@ interface ResultRecord {
   exitCode: number
   approvalsDenied: number
   reason?: string
+  error?: { code: string; message: string; action?: string }
 }
 
 function assistantText(event: SessionEvent): string {
@@ -58,18 +60,32 @@ function statusFor(reason: string): ResultRecord['status'] {
   return 'failed'
 }
 
-async function readPrompt(options: PrintOptions): Promise<string> {
+async function readPrompt(options: PrintOptions, signal: AbortSignal): Promise<string> {
   if (options.prompt !== undefined) return options.prompt
   if (stdin.isTTY) {
     throw new DshellError('BAD_REQUEST', '`-p` needs a prompt argument or piped stdin')
   }
-  const chunks: Buffer[] = []
-  stdin.setEncoding('utf8')
-  for await (const chunk of stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
-  }
-  const text = Buffer.concat(chunks).toString('utf8')
-  return text.replace(/\r\n/g, '\n').replace(/\n+$/, '')
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: string[] = []
+    const cleanup = (): void => {
+      stdin.off('data', onData)
+      stdin.off('end', onEnd)
+      stdin.off('error', onError)
+      signal.removeEventListener('abort', onAbort)
+      stdin.pause()
+    }
+    const onData = (chunk: string | Buffer): void => { chunks.push(String(chunk)) }
+    const onEnd = (): void => { cleanup(); resolve(chunks.join('').replace(/\r\n/g, '\n').replace(/\n+$/, '')) }
+    const onError = (error: Error): void => { cleanup(); reject(error) }
+    const onAbort = (): void => { cleanup(); reject(signal.reason ?? new Error('prompt input aborted')) }
+    if (signal.aborted) { onAbort(); return }
+    stdin.setEncoding('utf8')
+    stdin.on('data', onData)
+    stdin.once('end', onEnd)
+    stdin.once('error', onError)
+    signal.addEventListener('abort', onAbort, { once: true })
+    stdin.resume()
+  })
 }
 
 function realPathOrNull(path: string): string | null {
@@ -116,7 +132,7 @@ async function chooseSession(
     }
     return {
       handle: await backend.createSession({
-        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(options.workspaceId === undefined ? { cwd: realPathOrNull(options.cwd ?? process.cwd()) ?? (() => { throw new DshellError('BAD_REQUEST', 'cannot resolve working directory') })() } : {}),
         ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
       }),
       created: true,
@@ -144,7 +160,7 @@ async function chooseSession(
   }
   return {
     handle: await backend.createSession({
-      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.workspaceId === undefined ? { cwd: realPathOrNull(options.cwd ?? process.cwd()) ?? (() => { throw new DshellError('BAD_REQUEST', 'cannot resolve working directory') })() } : {}),
       ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
     }),
     created: true,
@@ -157,130 +173,110 @@ async function chooseSession(
  * reflected in the stable exit code (5) instead of being silently allowed.
  */
 export async function runPrint(socketPath: string, options: PrintOptions): Promise<number> {
-  const prompt = await readPrompt(options)
-  if (prompt.trim().length === 0) {
-    throw new DshellError('BAD_REQUEST', 'prompt is empty')
-  }
-
   const backend = new SocketBackend(socketPath)
   let handle: SessionHandle | undefined
   let off: (() => void) | undefined
-  let timedOut = false
-  let interrupted = false
-  let approvalDenied = 0
-  const deniedApprovals = new Set<string>()
-  let reason = 'completed'
-  let lastSeq = -1
-  let requestId = ''
-  const textParts: string[] = []
-
-  const emit = (record: unknown): void => {
-    process.stdout.write(`${JSON.stringify(record)}\n`)
+  let offDisconnect: (() => void) | undefined
+  let requestId = randomUUID(), lastSeq = -1
+  let timedOut = false, interrupted = false, stopped = false, ownTurn = false
+  let reason = 'completed', approvalDenied = 0
+  let failure: { code: string; message: string; action?: string } | undefined
+  const deadline = new AbortController()
+  let cancellation: Promise<void> | undefined
+  const textParts: string[] = [], denied = new Set<string>()
+  const emit = (record: unknown): void => { process.stdout.write(JSON.stringify(record) + '\n') }
+  let finish!: () => void
+  const ended = new Promise<void>(resolve => { finish = resolve })
+  const cancelOwned = (): void => {
+    cancellation = ownTurn
+      ? handle?.cancel(false, requestId).catch(() => undefined)
+      : handle?.removeQueued(requestId).catch(() => undefined)
   }
-  let finishTurn: (() => void) | undefined
-
-  const onSigint = (): void => {
-    interrupted = true
-    void handle?.cancel().catch(() => undefined)
-    finishTurn?.()
-  }
-
-  try {
+  const onSigint = (): void => { interrupted = true; stopped = true; reason = 'interrupted'; deadline.abort(); cancelOwned(); finish() }
+  const timer = setTimeout(() => { timedOut = true; stopped = true; reason = 'deadline exceeded'; deadline.abort(); cancelOwned(); finish() }, options.timeoutMs)
+  process.on('SIGINT', onSigint)
+  const check = (): void => { if (stopped) throw new Error('operation stopped') }
+  const work = async (): Promise<void> => {
+    const prompt = await readPrompt(options, deadline.signal)
+    check()
+    if (!prompt.trim()) throw new DshellError('BAD_REQUEST', 'prompt is empty')
     await backend.connect()
+    if (stopped) { await backend.disconnect(); return }
+    offDisconnect = backend.onDisconnect(() => {
+      if (stopped) return
+      failure = { code: 'HOST_NOT_RUNNING', message: 'Host disconnected during print' }
+      reason = 'Host disconnected'; stopped = true; finish()
+    })
+    if (!backend.capabilities().turnCorrelation) throw new DshellError('UNSUPPORTED_CAPABILITY', 'print requires a Host with prompt/turn correlation', 'Restart the Host with the current dshell-host plugin.')
     const chosen = await chooseSession(backend, options)
     handle = chosen.handle
+    if (stopped) { handle.dispose(); return }
     const initial = handle.snapshot()
+    if (initial.status === 'running' || initial.pendingApproval || initial.pendingAsk) throw new DshellError('SESSION_ACTIVE', 'print requires an idle session; use --new or wait')
     lastSeq = initial.cursor
-    if (options.outputFormat === 'stream-json') {
-      emit({ type: 'start', sessionId: handle.id, created: chosen.created })
-    }
-    if (options.verbose) {
-      process.stderr.write(`dshell: session ${handle.id}${chosen.created ? ' (created)' : ''}\n`)
-    }
-
-    let settle: (() => void) | undefined
-    const ended = new Promise<void>((resolve) => {
-      settle = resolve
-      finishTurn = resolve
-    })
-
+    if (options.outputFormat === 'stream-json') emit({ type: 'start', sessionId: handle.id, created: chosen.created })
+    if (options.verbose) process.stderr.write('dshell: session ' + handle.id + (chosen.created ? ' (created)' : '') + '\n')
     off = handle.subscribe((view: SessionView) => {
-      if (view.pendingApproval !== undefined && !deniedApprovals.has(view.pendingApproval.requestId)) {
-        deniedApprovals.add(view.pendingApproval.requestId)
-        approvalDenied += 1
-        if (options.verbose) {
-          process.stderr.write(`dshell: rejecting approval for ${view.pendingApproval.toolName} (non-interactive)\n`)
-        }
-        if (options.outputFormat === 'stream-json') {
-          emit({ type: 'approval', action: 'rejected', ...view.pendingApproval })
-        }
-        void handle?.answerApproval(view.pendingApproval.requestId, 'rejected').catch(() => undefined)
+      if (stopped) return
+      if (view.connected === false) {
+        failure = { code: 'HOST_NOT_RUNNING', message: 'Session connection closed during print' }
+        reason = 'Host disconnected'; stopped = true; finish(); return
       }
       for (const event of view.events) {
         if (event.seq <= lastSeq) continue
         lastSeq = event.seq
-        if (options.outputFormat === 'stream-json') {
-          emit({ type: 'event', sessionId: view.sessionId, seq: event.seq, event })
+        const data = (event.data ?? {}) as Record<string, any>
+        if (event.type === 'user/message') {
+          const message = data.message ?? data
+          if (message.id === requestId || message.source?.rpcId === requestId) ownTurn = true
         }
+        if (!ownTurn) continue
+        if (options.outputFormat === 'stream-json') emit({ type: 'event', sessionId: view.sessionId, seq: event.seq, event })
         const text = assistantText(event)
-        if (text.length > 0) textParts.push(text)
-        if (isTurnEnd(event)) {
-          reason = endReason(event)
-          settle?.()
-        }
+        if (text) textParts.push(text)
+        if (isTurnEnd(event)) { reason = endReason(event); ownTurn = false; stopped = true; finish(); return }
+      }
+      if (!ownTurn) return
+      if (view.pendingAsk) {
+        failure = { code: 'INTERACTION_REQUIRED', message: 'This prompt requires an interactive answer; reopen it in the TUI.' }
+        reason = 'interactive answer required'; stopped = true; cancelOwned(); finish(); return
+      }
+      if (view.pendingApproval && !denied.has(view.pendingApproval.requestId)) {
+        denied.add(view.pendingApproval.requestId); approvalDenied++
+        if (options.outputFormat === 'stream-json') emit({ type: 'approval', action: 'rejected', ...view.pendingApproval })
+        void handle?.answerApproval(view.pendingApproval.requestId, 'rejected').catch(() => undefined)
       }
     })
-
-    process.on('SIGINT', onSigint)
-    const receipt = await handle.send(prompt)
-    requestId = receipt.requestId
-    let timer: NodeJS.Timeout | undefined
-    try {
-      await Promise.race([
-        ended,
-        new Promise<void>((resolve) => {
-          timer = setTimeout(() => {
-            timedOut = true
-            void handle?.cancel().catch(() => undefined)
-            resolve()
-          }, options.timeoutMs)
-        }),
-      ])
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
+    const receipt = await handle.send(prompt, { requestId, requireIdle: true })
+    if (receipt.requestId !== requestId) throw new DshellError('PROTOCOL_MISMATCH', 'Host changed the submitted prompt identity')
+    await ended
+  }
+  const task = work().catch((error: unknown) => {
+    if (!timedOut && !interrupted && !stopped) {
+      const value = error as { code?: string; message?: string; action?: string }
+      failure = { code: value.code ?? 'INTERNAL', message: value.message ?? String(error), ...(value.action ? { action: value.action } : {}) }
+      reason = failure.message
     }
-  } finally {
+    finish()
+  })
+  try { await Promise.race([task, ended]) }
+  finally {
+    clearTimeout(timer); stopped = true
     process.off('SIGINT', onSigint)
-    off?.()
+    off?.(); offDisconnect?.()
+    await cancellation
     handle?.dispose()
     await backend.disconnect()
   }
-
-  const text = textParts.join('\n').trim()
-  const status: ResultRecord['status'] = timedOut
-    ? 'timeout'
-    : interrupted
-      ? 'cancelled'
-      : statusFor(reason)
-  const exitCode = timedOut ? 4 : interrupted ? 130 : approvalDenied > 0 ? 5 : status === 'completed' ? 0 : 3
-  const record: ResultRecord = {
-    type: 'result',
-    sessionId: handle?.id ?? '',
-    requestId,
-    status,
-    text,
-    exitCode,
-    approvalsDenied: approvalDenied,
-    ...(status === 'completed' ? {} : { reason }),
+  const status: ResultRecord['status'] = timedOut ? 'timeout' : interrupted ? 'cancelled' : failure ? 'failed' : statusFor(reason)
+  const exitCode = timedOut ? 4 : interrupted ? 130 : failure ? (failure.code === 'INTERACTION_REQUIRED' ? 5 : 1) : approvalDenied ? 5 : status === 'completed' ? 0 : 3
+  const record: ResultRecord = { type: 'result', sessionId: handle?.id ?? '', requestId, status,
+    text: textParts.join('\n').trim(), exitCode, approvalsDenied: approvalDenied,
+    ...(status === 'completed' ? {} : { reason }), ...(failure ? { error: failure } : {}) }
+  if (options.outputFormat !== 'text') emit(record)
+  else {
+    if (record.text) process.stdout.write(record.text + '\n')
+    if (failure) process.stderr.write(failure.code + ': ' + failure.message + '\n')
   }
-
-  if (options.outputFormat === 'json') {
-    emit(record)
-  } else if (options.outputFormat === 'stream-json') {
-    emit(record)
-  } else if (text.length > 0) {
-    process.stdout.write(`${text}\n`)
-  }
-  if (options.verbose) process.stderr.write(`dshell: ${status}${approvalDenied > 0 ? ' (approval denied)' : ''}\n`)
   return exitCode
 }

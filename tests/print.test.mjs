@@ -15,7 +15,7 @@ function write(socket, message) {
   }
 }
 
-async function fakeHost({ approval = false, silent = false, sessions = [{ cwd: process.cwd(), updatedAt: 9 }] } = {}) {
+async function fakeHost({ approval = false, silent = false, priorAnswer = false, sessions = [{ cwd: process.cwd(), updatedAt: 9 }] } = {}) {
   const hostSessions = sessions
   const createdCwd = new Map()
   let created = 0
@@ -46,7 +46,7 @@ async function fakeHost({ approval = false, silent = false, sessions = [{ cwd: p
             protocol: 2,
             pluginVersion: 'test',
             dshVersion: 'test',
-            capabilities: ['list', 'attach', 'prompt', 'event', 'stream', 'status'],
+            capabilities: ['list', 'attach', 'prompt', 'event', 'stream', 'status', 'turn-correlation'],
             socketPath: 'test.sock',
             sessions: [],
             workspaces: [],
@@ -58,8 +58,12 @@ async function fakeHost({ approval = false, silent = false, sessions = [{ cwd: p
             type: 'attached',
             sessionId: message.sessionId,
             header: { id: message.sessionId, cwd: sessionCwd(message.sessionId) },
-            cursor: -1,
-            events: [],
+            cursor: priorAnswer ? 2 : -1,
+            events: priorAnswer ? [
+              { type: 'user/message', seq: 0, data: { message: { id: 'old-request', source: { kind: 'user', rpcId: 'old-request' }, content: [{ type: 'text', text: 'old' }] } } },
+              { type: 'assistant/message', seq: 1, data: { message: { content: [{ type: 'text', text: 'STALE_ANSWER' }] } } },
+              { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } },
+            ] : [],
           })
         } else if (message.type === 'session/create') {
           created += 1
@@ -72,7 +76,8 @@ async function fakeHost({ approval = false, silent = false, sessions = [{ cwd: p
             workspaceId: `workspace:${message.cwd ?? process.cwd()}`,
           })
         } else if (message.type === 'prompt') {
-          write(socket, { type: 'accepted', sessionId: message.sessionId, requestId: 'r1', mode: 'queue' })
+          write(socket, { type: 'accepted', sessionId: message.sessionId, requestId: message.requestId, mode: 'queue' })
+          write(socket, { type: 'event', sessionId: message.sessionId, event: { type: 'user/message', seq: priorAnswer ? 3 : 0, data: { message: { id: message.requestId, source: { kind: 'user', rpcId: message.requestId }, content: [{ type: 'text', text: message.text }] } } } })
           if (approval) {
             write(socket, {
               type: 'approval-request',
@@ -82,20 +87,20 @@ async function fakeHost({ approval = false, silent = false, sessions = [{ cwd: p
               reason: 'test',
             })
           } else if (!silent) {
-            write(socket, { type: 'event', sessionId: message.sessionId, event: { type: 'turn/start', seq: 0, data: {} } })
+            write(socket, { type: 'event', sessionId: message.sessionId, event: { type: 'turn/start', seq: priorAnswer ? 4 : 1, data: {} } })
             write(socket, {
               type: 'event',
               sessionId: message.sessionId,
               event: {
                 type: 'assistant/message',
-                seq: 1,
+                seq: priorAnswer ? 5 : 2,
                 data: { message: { content: [{ type: 'text', text: `PRINT_OK_${message.sessionId}` }] } },
               },
             })
             write(socket, {
               type: 'event',
               sessionId: message.sessionId,
-              event: { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } },
+              event: { type: 'turn/end', seq: priorAnswer ? 6 : 3, data: { reason: { kind: 'completed' } } },
             })
           }
         } else if (message.type === 'approval/answer') {
@@ -109,13 +114,15 @@ async function fakeHost({ approval = false, silent = false, sessions = [{ cwd: p
           write(socket, {
             type: 'event',
             sessionId: 's1',
-            event: { type: 'tool/result', seq: 1, data: { message: { content: [{ type: 'text', text: 'denied' }], isError: true } } },
+            event: { type: 'tool/result', seq: priorAnswer ? 5 : 1, data: { message: { content: [{ type: 'text', text: 'denied' }], isError: true } } },
           })
           write(socket, {
             type: 'event',
             sessionId: 's1',
-            event: { type: 'turn/end', seq: 2, data: { reason: { kind: 'failed' } } },
+            event: { type: 'turn/end', seq: priorAnswer ? 6 : 2, data: { reason: { kind: 'failed' } } },
           })
+        } else if (message.type === 'session/cancel') {
+          write(socket, { type: 'cancelled', sessionId: message.sessionId, requestId: message.requestId })
         }
       }
     })
@@ -158,6 +165,15 @@ test('print mode emits clean text and stable exit 0', async (t) => {
   assert.equal(result.code, 0)
   assert.match(result.stdout.trim(), /^PRINT_OK_s\d+$/)
   assert.ok(!result.stdout.includes('"type"'))
+})
+
+test('print ignores a previous answer and waits for its own prompt identity', async (t) => {
+  const host = await fakeHost({ priorAnswer: true })
+  t.after(host.close)
+  const result = await runCli(host.socketPath, ['-p', 'fresh prompt'])
+  assert.equal(result.code, 0)
+  assert.equal(result.stdout.trim(), 'PRINT_OK_s1')
+  assert.equal(result.stdout.includes('STALE_ANSWER'), false)
 })
 
 test('print mode emits parseable JSON', async (t) => {
@@ -269,7 +285,9 @@ test('conflicting session flags fail loudly instead of being ignored (DS-003)', 
 test('--new always creates in the requested directory (DS-003)', async (t) => {
   const host = await fakeHost({ sessions: [{ cwd: process.cwd(), updatedAt: 99 }] })
   t.after(host.close)
-  const result = await runCli(host.socketPath, ['-p', 'hello', '--new', '--cwd', '/project-b'])
+  const projectDirectory = await mkdtemp(join(tmpdir(), 'dshell-project-b-'))
+  t.after(() => rm(projectDirectory, { recursive: true, force: true }))
+  const result = await runCli(host.socketPath, ['-p', 'hello', '--new', '--cwd', projectDirectory])
   assert.equal(result.code, 0)
   assert.equal(result.stdout.trim(), 'PRINT_OK_created-1')
 })

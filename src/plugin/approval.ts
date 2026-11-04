@@ -30,6 +30,7 @@ export interface ApprovalHooks {
 
 interface PendingApproval {
   sessionId: string
+  message: unknown
   settled: boolean
   otherDone: boolean
   resolve: (outcome: ApprovalOutcome) => void
@@ -78,6 +79,7 @@ export class ApprovalCoordinator {
     })
     const entry: PendingApproval = {
       sessionId: request.sessionId,
+      message: request.message,
       settled: false,
       otherDone: false,
       resolve: resolveOutcome,
@@ -141,6 +143,10 @@ export class ApprovalCoordinator {
   /** The session a pending approval belongs to, for watcher checks. */
   sessionOf(requestId: string): string | undefined {
     return this.pending.get(requestId)?.sessionId
+  }
+
+  snapshot(sessionId: string): unknown[] {
+    return [...this.pending.values()].filter(entry => entry.sessionId === sessionId && !entry.settled).map(entry => entry.message)
   }
 
   private otherSettled(requestId: string, value: string): void {

@@ -48,49 +48,51 @@ function isZeroWidth(codePoint: number): boolean {
   )
 }
 
-/** Display cells used by a string (wide CJK/emoji count as 2). ANSI is ignored. */
-export function displayWidth(input: string): number {
+const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+export function graphemes(text: string): string[] {
+  return [...segmenter.segment(text)].map(part => part.segment)
+}
+function clusterWidth(cluster: string): number {
+  if (cluster === '\n' || cluster === '\r') return 0
+  if (cluster === '\t') return 4
+  if (/\p{Extended_Pictographic}|\p{Regional_Indicator}|\uFE0F|\u20E3/u.test(cluster)) return 2
   let width = 0
-  for (const char of stripAnsi(input)) {
-    const codePoint = char.codePointAt(0) ?? 0
-    if (char === '\n') continue
-    if (char === '\t') {
-      width += 4
-      continue
-    }
-    if (isZeroWidth(codePoint)) continue
-    width += isWide(codePoint) ? 2 : 1
+  for (const char of cluster) {
+    const code = char.codePointAt(0) ?? 0
+    if (!isZeroWidth(code)) width = Math.max(width, isWide(code) ? 2 : 1)
   }
   return width
 }
-
-/** Truncate to a display width without cutting ANSI escape sequences. */
+/** Display cells measured on grapheme boundaries, including emoji sequences. */
+export function displayWidth(input: string): number {
+  const plain = stripAnsi(input)
+  if (/^[\x20-\x7e]*$/.test(plain)) return plain.length
+  return graphemes(plain).reduce((sum, cluster) => sum + clusterWidth(cluster), 0)
+}
 export function truncate(input: string, width: number): string {
   if (width <= 0) return ''
   if (displayWidth(input) <= width) return input
-  let result = ''
-  let used = 0
+  let result = '', used = 0
   const target = Math.max(0, width - 1)
-  for (let index = 0; index < input.length;) {
-    if (input.codePointAt(index) === 0x1b) {
-      ANSI.lastIndex = index
-      const match = ANSI.exec(input)
-      if (match !== null && match.index === index) {
-        result += match[0]
-        index += match[0].length
-        continue
-      }
-    }
-    const codePoint = input.codePointAt(index) ?? 0
-    const char = String.fromCodePoint(codePoint)
-    const charWidth = displayWidth(char)
-    if (used + charWidth > target) break
-    result += char
-    used += charWidth
-    index += char.length
+  // Escape tokens stay atomic; visible spans are segmented as complete graphemes.
+  const token = new RegExp(ANSI.source, 'g')
+  let at = 0
+  const spans: { text: string; ansi: boolean }[] = []
+  for (const match of input.matchAll(token)) {
+    spans.push({ text: input.slice(at, match.index), ansi: false }, { text: match[0], ansi: true })
+    at = match.index + match[0].length
   }
-  if (result.includes('\u001b')) result += '\u001b[0m'
-  return `${result}…`
+  spans.push({ text: input.slice(at), ansi: false })
+  outer: for (const span of spans) {
+    if (span.ansi) { result += span.text; continue }
+    for (const cluster of graphemes(span.text)) {
+      const cells = clusterWidth(cluster)
+      if (used + cells > target) break outer
+      result += cluster
+      used += cells
+    }
+  }
+  return result + (result.includes('\u001b') ? '\u001b[0m' : '') + '…'
 }
 
 /** Pad with spaces to a display width, truncating when necessary. */
@@ -137,7 +139,7 @@ export function wrapText(input: string, width: number): string[] {
         currentWidth += wordWidth
         continue
       }
-      for (const char of word) {
+      for (const char of graphemes(word)) {
         const charWidth = displayWidth(char)
         if (currentWidth + charWidth > width && current.length > 0) {
           push(current)
@@ -183,11 +185,11 @@ export function normalizeSelection(range: SelectionRange): SelectionRange {
 function charsBeforeColumn(plain: string, column: number): number {
   let width = 0
   let count = 0
-  for (const char of plain) {
+  for (const char of graphemes(plain)) {
     const cells = char === '\t' ? 4 : Math.max(1, displayWidth(char))
     if (width + cells >= column) break
     width += cells
-    count += 1
+    count += char.length
   }
   return count
 }
@@ -196,10 +198,10 @@ function charsBeforeColumn(plain: string, column: number): number {
 function charsThroughColumn(plain: string, column: number): number {
   let width = 0
   let count = 0
-  for (const char of plain) {
+  for (const char of graphemes(plain)) {
     const cells = char === '\t' ? 4 : Math.max(1, displayWidth(char))
     width += cells
-    count += 1
+    count += char.length
     if (width >= column) break
   }
   return count
@@ -218,7 +220,7 @@ function rawIndexAfter(line: string, plainChars: number): number {
     }
     const char = String.fromCodePoint(line.codePointAt(index) ?? 0)
     index += char.length
-    seen += 1
+    seen += char.length
   }
   return index
 }

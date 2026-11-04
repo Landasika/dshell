@@ -9,6 +9,14 @@ test('protocol v2 advertises the P3 capabilities', () => {
   assert.deepEqual(
     [...CAPABILITIES],
     [
+      'session-rename',
+      'session-archive',
+      'session-pin',
+      'session-fork',
+      'rpc-id',
+      'pending-snapshot',
+      'turn-correlation',
+      'prompt-content',
       'list',
       'attach',
       'prompt',

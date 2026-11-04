@@ -14,7 +14,7 @@
   <img alt="node" src="https://img.shields.io/badge/node-%5E22.19_%7C_%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.2-4d6bfe?style=flat-square">
   <a href="https://github.com/Landasika/dshell/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/Landasika/dshell/ci.yml?branch=main&style=flat-square&label=ci"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-194_passing-2ea043?style=flat-square">
+  <img alt="tests" src="https://img.shields.io/badge/tests-262_passing-2ea043?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-linux-FCC624?style=flat-square&logo=linux&logoColor=black">
 </p>
 
@@ -110,7 +110,7 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
 
 ## Status
 
-`0.5.0` is current: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
+`0.5.2` is current: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
 plan (TUI, scriptable CLI, sessions/workspaces, approval bridge,
 models/providers, subagents, terminal questions) is complete — see the
 [changelog](CHANGELOG.md) and [supported versions](docs/SUPPORTED-VERSIONS.md).
@@ -472,7 +472,7 @@ that the confirmation offers.
 pnpm install
 pnpm typecheck   # tsc --noEmit
 pnpm lint        # alias of typecheck
-pnpm test        # build + node --test (194 tests)
+pnpm test        # build + node --test (262 tests)
 ./scripts/ci.sh  # full local gate, including a clean pack/install
 ```
 

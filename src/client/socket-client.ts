@@ -1,5 +1,5 @@
+import { randomUUID } from 'node:crypto'
 import { connect, type Socket } from 'node:net'
-import { createInterface } from 'node:readline'
 
 import {
   PROTOCOL_VERSION,
@@ -78,6 +78,7 @@ type MessageListener = (message: ServerMessage) => void
  * beyond this is a runaway host; the oldest entries are dropped first.
  */
 const STASH_LIMIT = 4096
+const MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
 /** One attach connection to the local dshell-host plugin. */
 export class HostConnection {
@@ -97,9 +98,19 @@ export class HostConnection {
 
   private constructor(socket: Socket) {
     this.socket = socket
-    const lines = createInterface({ input: socket })
-    lines.on('line', (line) => {
-      if (line.trim().length === 0) return
+    let buffer = ''
+    socket.on('data', (chunk: string) => {
+      buffer += chunk
+      for (;;) {
+        const newline = buffer.indexOf('\n')
+        if (newline < 0) break
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        if (line.trim().length === 0) continue
+        if (Buffer.byteLength(line, 'utf8') > MAX_MESSAGE_BYTES) {
+          this.fail(new DshellError('PROTOCOL_MISMATCH', 'dshell-host message exceeds the 8 MiB frame limit'))
+          return
+        }
       let message: ServerMessage
       try {
         message = JSON.parse(line) as ServerMessage
@@ -107,7 +118,19 @@ export class HostConnection {
         this.fail(new DshellError('PLUGIN_MISSING', 'dshell-host sent invalid JSON'))
         return
       }
+      if (message === null || typeof message !== 'object' || typeof message.type !== 'string') {
+        this.fail(new DshellError('PROTOCOL_MISMATCH', 'invalid dshell-host message envelope'))
+        return
+      }
+      if (message.rpcId !== undefined && (typeof message.rpcId !== 'string' || message.rpcId.length < 1 || message.rpcId.length > 128)) {
+        this.fail(new DshellError('PROTOCOL_MISMATCH', 'invalid RPC identity'))
+        return
+      }
       this.receive(message)
+      }
+      if (Buffer.byteLength(buffer, 'utf8') > MAX_MESSAGE_BYTES) {
+        this.fail(new DshellError('PROTOCOL_MISMATCH', 'dshell-host message exceeds the 8 MiB frame limit'))
+      }
     })
     socket.on('close', () => {
       this.fail(new DshellError('HOST_NOT_RUNNING', 'dshell-host closed the connection'))
@@ -259,15 +282,23 @@ export class HostConnection {
     timeoutMs = 30_000,
   ): Promise<T> {
     const run = async (): Promise<T> => {
-      this.send(message)
-      const reply = await this.waitFor<T | ErrorMessage>(
-        (candidate) => predicate(candidate) || candidate.type === 'error',
+      const correlated = this.welcomeMessage?.capabilities.includes('rpc-id') === true
+      const rpcId = correlated ? randomUUID() : undefined
+      const replyPromise = this.waitFor<T | ErrorMessage>(
+        candidate => (rpcId === undefined || candidate.rpcId === rpcId)
+          && (predicate(candidate) || candidate.type === 'error'),
         timeoutMs,
       )
-      if (reply.type === 'error') {
-        throw new DshellError(reply.code, reply.message, reply.action)
+      void replyPromise.catch(() => undefined)
+      try {
+        this.send({ ...message, ...(rpcId === undefined ? {} : { rpcId }) })
+        const reply = await replyPromise
+        if (reply.type === 'error') throw new DshellError(reply.code, reply.message, reply.action)
+        return reply
+      } catch (error) {
+        if (!correlated && error instanceof Error && /timed out/.test(error.message)) this.close()
+        throw error
       }
-      return reply
     }
     const next = this.commandChain.then(run, run)
     this.commandChain = next.then(
@@ -322,6 +353,7 @@ export class HostConnection {
   private fail(error: Error): void {
     if (this.closed) return
     this.closed = true
+    this.socket.destroy()
     this.notifyClosed()
     for (const waiter of this.waiters) waiter.reject(error)
     this.waiters.clear()

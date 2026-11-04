@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { BackendError, FakeBackend, SocketBackend } from '../dist/backend/index.js'
+import { adaptSessionEvent, BackendError, FakeBackend, ReplayBackend, SocketBackend } from '../dist/backend/index.js'
 
 async function socketServer(handler) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-backend-'))
@@ -71,6 +71,32 @@ test('FakeBackend exposes workspaces, sessions, streaming, and approval', async 
   await backend.disconnect()
 })
 
+test('event adapter normalizes aliases and preserves unknown events as diagnostics', () => {
+  assert.deepEqual(adaptSessionEvent({ type: 'todo/set', seq: 1, data: { todos: [] } }), {
+    type: 'todo/write', seq: 1, data: { todos: [] }, sourceType: 'todo/set',
+  })
+  assert.deepEqual(adaptSessionEvent({ type: 'future/thing', seq: 2, data: { value: 3 } }), {
+    type: 'diagnostic', seq: 2, data: { sourceType: 'future/thing', payload: { value: 3 } }, sourceType: 'future/thing',
+  })
+})
+
+test('FakeBackend preserves ordered text and image prompt content', async () => {
+  const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work', events: [] }])
+  await backend.connect()
+  const handle = await backend.openSession('s1')
+  await handle.send([
+    { type: 'text', text: 'inspect this' },
+    { type: 'image', mediaType: 'image/png', data: 'aGVsbG8=', name: 'shot.png' },
+  ])
+  const message = handle.snapshot().events.find((event) => event.type === 'user/message').data.message
+  assert.deepEqual(message.content, [
+    { type: 'text', text: 'inspect this' },
+    { type: 'image', mediaType: 'image/png', data: 'aGVsbG8=', name: 'shot.png' },
+  ])
+  handle.dispose()
+  await backend.disconnect()
+})
+
 test('FakeBackend exposes the agent presets a session would compose', async () => {
   const backend = new FakeBackend([{ sessionId: 's1', cwd: '/work' }])
   await backend.connect()
@@ -88,6 +114,39 @@ test('FakeBackend exposes the agent presets a session would compose', async () =
   roster.presets[0].plugins.length = 0
   assert.equal((await backend.agentRoster()).presets[0].plugins.length, 4)
   await backend.disconnect()
+})
+
+test('ReplayBackend satisfies list, paging, disposal, and read-only contracts', async () => {
+  const events = Array.from({ length: 7 }, (_, seq) => ({ type: seq === 0 ? 'user/message' : 'custom/event', seq, data: {} }))
+  const backend = new ReplayBackend({
+    pageSize: 3,
+    sessions: [
+      { sessionId: 'open', header: { id: 'open', cwd: '/work', title: 'Open', createdAt: 1 }, events, pinned: true },
+      { sessionId: 'archived', header: { id: 'archived', cwd: '/old', title: 'Archived', createdAt: 2 }, events: [], archived: true },
+    ],
+  })
+  await backend.connect()
+  assert.deepEqual((await backend.listSessions()).map((session) => session.sessionId), ['open'])
+  assert.deepEqual((await backend.listSessions(undefined, true)).map((session) => session.sessionId), ['open', 'archived'])
+  assert.equal(backend.capabilities().paging, true)
+  assert.equal(backend.capabilities().prompt, false)
+
+  const handle = await backend.openSession('open')
+  assert.equal(backend.handleCount, 1)
+  assert.deepEqual(handle.snapshot().events.map((event) => event.seq), [4, 5, 6])
+  assert.equal(handle.snapshot().hasMoreHistory, true)
+  assert.equal(await handle.loadOlder(2), true)
+  assert.deepEqual(handle.snapshot().events.map((event) => event.seq), [2, 3, 4, 5, 6])
+  assert.equal(await handle.loadOlder(5), false)
+  assert.deepEqual(handle.snapshot().events.map((event) => event.seq), [0, 1, 2, 3, 4, 5, 6])
+  await assert.rejects(() => handle.send('no'), /read-only/)
+  await assert.rejects(() => handle.cancel(), /read-only/)
+  await assert.rejects(() => handle.answerQuestion('q', []), /read-only/)
+  handle.dispose()
+  assert.equal(backend.handleCount, 0)
+  assert.throws(() => handle.snapshot(), /disposed/)
+  await backend.disconnect()
+  await assert.rejects(() => backend.openSession('open'), /disconnected/)
 })
 
 test('SocketBackend answers pending questions', async (t) => {
@@ -162,6 +221,49 @@ test('SocketBackend answers pending questions', async (t) => {
   assert.equal(latest.at(-1)?.pendingAsk, undefined)
   off2()
   handle.dispose()
+  await backend.disconnect()
+})
+
+test('SocketBackend sends ordered prompt content and rejects media on legacy hosts', async (t) => {
+  let received = null
+  const modern = await socketServer((message, socket) => {
+    if (message.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test', capabilities: ['attach', 'prompt', 'prompt-content'], socketPath: 'test.sock', sessions: [], workspaces: [] })
+    else if (message.type === 'attach') write(socket, { type: 'attached', sessionId: message.sessionId, header: { id: message.sessionId }, cursor: -1, events: [] })
+    else if (message.type === 'prompt') { received = message; write(socket, { type: 'accepted', sessionId: message.sessionId, requestId: message.requestId, mode: message.mode }) }
+  })
+  t.after(modern.close)
+  const backend = new SocketBackend(modern.socketPath)
+  await backend.connect()
+  const handle = await backend.openSession('s1')
+  await handle.send([{ type: 'text', text: 'see' }, { type: 'file', receiptId: 'receipt-1' }])
+  assert.deepEqual(received.content, [{ type: 'text', text: 'see' }, { type: 'file', receiptId: 'receipt-1' }])
+  handle.dispose(); await backend.disconnect()
+
+  const legacy = await socketServer((message, socket) => {
+    if (message.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'old', dshVersion: 'old', capabilities: ['attach', 'prompt'], socketPath: 'test.sock', sessions: [], workspaces: [] })
+    else if (message.type === 'attach') write(socket, { type: 'attached', sessionId: message.sessionId, header: { id: message.sessionId }, cursor: -1, events: [] })
+  })
+  t.after(legacy.close)
+  const oldBackend = new SocketBackend(legacy.socketPath)
+  await oldBackend.connect()
+  const oldHandle = await oldBackend.openSession('s1')
+  await assert.rejects(() => oldHandle.send([{ type: 'image', mediaType: 'image/png', data: 'aGVsbG8=' }]), /does not accept image/)
+  oldHandle.dispose(); await oldBackend.disconnect()
+})
+
+test('SocketSessionHandle attaches large histories without argument spreading or retention after dispose', async (t) => {
+  const events = Array.from({ length: 100_000 }, (_, seq) => ({ type: 'custom/event', seq }))
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test', capabilities: ['list', 'attach'], socketPath: 'test.sock', sessions: [] })
+    else if (message.type === 'attach') write(socket, { type: 'attached', sessionId: message.sessionId, header: { id: message.sessionId }, cursor: events.length - 1, events })
+  })
+  t.after(server.close)
+  const backend = new SocketBackend(server.socketPath)
+  await backend.connect()
+  const handle = await backend.openSession('s1')
+  assert.equal(handle.snapshot().events.length, 100_000)
+  handle.dispose()
+  assert.equal(backend.handleCount, 0)
   await backend.disconnect()
 })
 

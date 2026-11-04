@@ -1,3 +1,5 @@
 export * from './types.js'
+export * from './events.js'
 export { FakeBackend, type FakeSessionSeed } from './fake.js'
 export { SocketBackend, SocketSessionHandle } from './socket.js'
+export { ReplayBackend, type ReplayBackendOptions } from './replay.js'

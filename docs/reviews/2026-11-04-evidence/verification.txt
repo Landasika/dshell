@@ -1,0 +1,32 @@
+Audit target: /home/landasika/dshell
+Target commit: 9205877b37cee494a5b355f9ee08d84bbd6995d8
+Package: @landasika/dshell@0.5.0
+Date: 2026-11-04
+Platform: Linux
+Node: v24.21.0
+pnpm: 11.27.1
+
+pnpm test: 216 passed, 0 failed, 0 skipped
+pnpm typecheck: passed
+scripts/verify-pack.sh: passed
+Installed CLI output: dshell 0.5.0
+Installed plugin export: dshell-host
+Tarball size in verification: 285550 bytes
+Tarball SHA256: acfe082ce8f62b3c70f6db655a35b8e5a5beb9cc39050265c76664da70dc4dc2
+
+Existing benchmark, 150 streaming frames:
+1k history: median 1.14ms, total 177.2ms
+10k history: median 1.19ms, total 192ms
+50k history: median 1.66ms, total 335ms
+The append section includes a fixed 300ms sleep; it is not a direct append latency measurement.
+
+Upstream repository: https://github.com/deepseek-ai/deepseek-harness
+Reference tag: dsh-v0.2.1-rc.2
+Reference commit: 687f282e8625c6b8d11ff58211a90524be2e4317
+Inspected upstream HEAD: 8bd073392eef6f54e921a093b95076248eb08cbb
+HEAD commit timestamp: 2026-11-03T15:27:29+08:00
+HEAD CLI package version: 0.2.2-alpha.3
+
+Reproduce scripts use real dshell modules and Unix sockets with simulated DSH services.
+UI evidence is a headless TerminalScreen.draw capture, plus a separate real PTY CLI probe.
+No real DSH Host end-to-end, paid model invocation, or user session deletion was performed.

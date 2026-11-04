@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { modelSelectionFromEvents } from '../shared/model-selection.js'
 
 import type {
   AgentPresetSummary,
@@ -6,10 +7,12 @@ import type {
   ModelSelection,
   ProviderEntry,
   ProviderField,
+  PromptContentPart,
   QuestionAnswer,
-  SessionEvent,
+  SessionEvent as WireSessionEvent,
   SessionHeader,
 } from '../protocol/index.js'
+import { adaptSessionEvent, adaptSessionEvents, type SessionEvent } from './events.js'
 import {
   BackendError,
   type AgentRoster,
@@ -18,6 +21,7 @@ import {
   type DshellCapabilities,
   type NewProviderSpec,
   type ProviderList,
+  type PromptInput,
   type SkillCatalog,
   type SendOptions,
   type SendReceipt,
@@ -31,6 +35,7 @@ const CAPABILITIES: DshellCapabilities = {
   list: true,
   attach: true,
   prompt: true,
+  promptContent: true,
   streaming: true,
   workspaces: true,
   createSession: true,
@@ -56,8 +61,12 @@ interface FakeSession {
   status: 'idle' | 'running'
   streamText: string
   streamReasoning: string
+  archived?: boolean
+  pinned?: boolean
   pendingApproval?: SessionView['pendingApproval']
   pendingAsk?: SessionView['pendingAsk']
+  pendingApprovals?: NonNullable<SessionView['pendingApprovals']>
+  pendingAsks?: NonNullable<SessionView['pendingAsks']>
 }
 
 export interface FakeSessionSeed {
@@ -66,7 +75,7 @@ export interface FakeSessionSeed {
   title?: string
   createdAt?: number
   updatedAt?: number
-  events?: SessionEvent[]
+  events?: WireSessionEvent[]
 }
 
 /** In-memory backend used by adapter tests and by `dshell` UI tests. */
@@ -75,7 +84,7 @@ export class FakeBackend implements DshellBackend {
   private readonly workspaces = new Map<string, WorkspaceSummary>()
   private readonly handles = new Set<FakeSessionHandle>()
   /** Prompts accepted while a turn was running, keyed by request id. */
-  private readonly queuedPrompts: { sessionId: string; requestId: string; text: string; mode: 'queue' | 'steer' }[] = []
+  private readonly queuedPrompts: { sessionId: string; requestId: string; content: PromptContentPart[]; text: string; mode: 'queue' | 'steer' }[] = []
   private isConnected = false
   private readonly disconnectListeners = new Set<() => void>()
   private nextId = 1
@@ -169,7 +178,7 @@ export class FakeBackend implements DshellBackend {
       this.sessions.set(seed.sessionId, {
         header: { id: seed.sessionId, cwd: seed.cwd, createdAt, ...(seed.title === undefined ? {} : { title: seed.title }) },
         ...(seed.updatedAt === undefined ? {} : { updatedAt: seed.updatedAt }),
-        events: [...(seed.events ?? [])],
+        events: adaptSessionEvents(seed.events ?? []),
         cursor: Math.max(-1, ...(seed.events ?? []).map((event) => event.seq)),
         status: 'idle',
         streamText: '',
@@ -227,6 +236,7 @@ export class FakeBackend implements DshellBackend {
     const selected = { ...selection }
     this.sessionModels.set(sessionId, selected)
     this.defaultModel = selected
+    this.emit(sessionId, { type: 'model/selection', seq: this.requireSession(sessionId).cursor + 1, data: selected })
     return selected
   }
 
@@ -281,6 +291,7 @@ export class FakeBackend implements DshellBackend {
     return {
       file: '/fake/cordis.patch.yml',
       writable: true,
+      source: { kind: 'file', layer: 'entry', inherited: false, overridden: false },
       providers: this.providerRows.map((row) => ({ ...row })),
     }
   }
@@ -291,6 +302,30 @@ export class FakeBackend implements DshellBackend {
     if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
     row[field] = value
     return this.providerList()
+  }
+
+  async saveProvider(
+    providerId: string,
+    changes: Partial<Record<ProviderField, string>>,
+    apiKey?: string,
+  ): Promise<ProviderList & { ref?: string }> {
+    this.assertConnected()
+    const row = this.providerRows.find((candidate) => candidate.id === providerId)
+    if (row === undefined) throw new BackendError('BAD_REQUEST', `unknown provider ${providerId}`)
+    let ref: string | undefined
+    if (apiKey !== undefined) {
+      ref = `${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`
+      this.storedKeys.set(ref, apiKey)
+      row.apiKeyEnv = ref
+    }
+    for (const field of ['baseURL', 'apiKeyEnv', 'displayName'] as const) {
+      if (!(field in changes) || (field === 'apiKeyEnv' && apiKey !== undefined)) continue
+      const value = changes[field]?.trim() ?? ''
+      if (value.length === 0) delete row[field]
+      else row[field] = value
+    }
+    const list = await this.providerList()
+    return { ...list, ...(ref === undefined ? {} : { ref }) }
   }
 
   /** Two canned ids so the TUI flow can be tested without a network. */
@@ -374,16 +409,33 @@ export class FakeBackend implements DshellBackend {
     return [...this.workspaces.values()].map((workspace) => ({ ...workspace }))
   }
 
-  async listSessions(workspaceId?: string): Promise<SessionSummary[]> {
+  async listSessions(workspaceId?: string, includeArchived = false): Promise<SessionSummary[]> {
     this.assertConnected()
     return [...this.sessions.values()]
       .filter((session) => {
+        if (!includeArchived && session.archived) return false
         if (workspaceId === undefined) return true
         const workspace = this.workspaceFor(session.header.cwd)
         return workspace?.id === workspaceId
       })
       .map((session) => this.summary(session))
       .sort((left, right) => (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0))
+  }
+
+  async sessionAction(action: import('./types.js').SessionAction, sessionId: string, value?: string | boolean) {
+    this.assertConnected()
+    const session = this.sessions.get(sessionId)
+    if (!session) throw new Error(`session ${sessionId} not found`)
+    if (action === 'rename' && typeof value === 'string') session.header = { ...session.header, title: value }
+    if (action === 'archive') session.archived = true
+    if (action === 'restore') session.archived = false
+    if (action === 'pin') session.pinned = value !== false
+    if (action === 'fork') {
+      const id = `fake-${this.nextId++}`
+      this.sessions.set(id, { ...session, header: { ...session.header, id, createdAt: Date.now() }, events: [...session.events] })
+      return { sessionId: id }
+    }
+    return { sessionId, ...(session.header.title ? { title: session.header.title } : {}), archived: session.archived, pinned: session.pinned }
   }
 
   async createSession(options: CreateSessionOptions = {}): Promise<SessionHandle> {
@@ -421,20 +473,25 @@ export class FakeBackend implements DshellBackend {
   }
 
   /** Test/presentation helper: append a durable event as the Host would. */
-  emit(sessionId: string, event: SessionEvent): void {
+  emit(sessionId: string, event: WireSessionEvent | SessionEvent): void {
     const session = this.requireSession(sessionId)
-    session.events.push(event)
-    session.cursor = Math.max(session.cursor, event.seq)
-    if (event.type === 'turn/start') session.status = 'running'
-    if (event.type === 'turn/end' || event.type === 'turn/failed') session.status = 'idle'
+    const normalized = adaptSessionEvent(event as WireSessionEvent)
+    session.events.push(normalized)
+    session.cursor = Math.max(session.cursor, normalized.seq)
+    if (normalized.type === 'turn/start') session.status = 'running'
+    if (normalized.type === 'turn/end' || normalized.type === 'turn/failed') session.status = 'idle'
     for (const handle of this.handles) {
       if (handle.id === sessionId) handle.notify()
     }
   }
 
   /** Remember a prompt the Host would hold behind or inside the running turn. */
-  queuePrompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer'): void {
-    this.queuedPrompts.push({ sessionId, requestId, text, mode })
+  queuePrompt(sessionId: string, requestId: string, content: PromptContentPart[] | string, mode: 'queue' | 'steer'): void {
+    const normalizedContent: PromptContentPart[] = typeof content === 'string'
+      ? [{ type: 'text', text: content }]
+      : content
+    const text = normalizedContent.filter((part): part is Extract<PromptContentPart, { type: 'text' }> => part.type === 'text').map(part => part.text).join('\n')
+    this.queuedPrompts.push({ sessionId, requestId, content: normalizedContent, text, mode })
   }
 
   /** Test helper: start the oldest queued prompt, as the Host does after a turn. */
@@ -483,7 +540,7 @@ export class FakeBackend implements DshellBackend {
     return true
   }
 
-  private deliverEntry(entry: { sessionId: string; requestId: string; text: string }): void {
+  private deliverEntry(entry: { sessionId: string; requestId: string; content: PromptContentPart[] }): void {
     this.emit(entry.sessionId, {
       type: 'user/message',
       seq: this.requireSession(entry.sessionId).cursor + 1,
@@ -491,7 +548,7 @@ export class FakeBackend implements DshellBackend {
         message: {
           id: entry.requestId,
           role: 'user',
-          content: [{ type: 'text', text: entry.text }],
+          content: entry.content,
           source: { kind: 'user' },
         },
       },
@@ -516,7 +573,8 @@ export class FakeBackend implements DshellBackend {
   /** Test helper: create a pending approval without starting a real turn. */
   askApproval(sessionId: string, question: NonNullable<SessionView['pendingApproval']>): void {
     const session = this.requireSession(sessionId)
-    session.pendingApproval = question
+    session.pendingApprovals = [...(session.pendingApprovals ?? []), question]
+    session.pendingApproval = session.pendingApprovals[0]
     session.status = 'running'
     for (const handle of this.handles) handle.notify()
   }
@@ -533,13 +591,15 @@ export class FakeBackend implements DshellBackend {
     options: { timed?: boolean; timeoutMs?: number } = {},
   ): void {
     const session = this.requireSession(sessionId)
-    session.pendingAsk = {
+    const pending = {
       sessionId,
       callId,
       questions,
       timed: options.timed ?? true,
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     }
+    session.pendingAsks = [...(session.pendingAsks ?? []), pending]
+    session.pendingAsk = session.pendingAsks[0]
     this.emit(sessionId, {
       type: 'tool/call',
       seq: session.cursor + 1,
@@ -550,7 +610,8 @@ export class FakeBackend implements DshellBackend {
   /** Test helper: the Host stopped waiting (turn cancelled) and closed the ask. */
   abortQuestion(sessionId: string, callId: string): void {
     const session = this.requireSession(sessionId)
-    if (session.pendingAsk?.callId === callId) session.pendingAsk = undefined
+    session.pendingAsks = (session.pendingAsks ?? []).filter(item => item.callId !== callId)
+    session.pendingAsk = session.pendingAsks[0]
     this.emit(sessionId, {
       type: 'tool/result',
       seq: session.cursor + 1,
@@ -586,6 +647,8 @@ export class FakeBackend implements DshellBackend {
     const workspace = this.workspaceFor(session.header.cwd)
     return {
       sessionId: session.header.id,
+      ...(session.archived ? { archived: true } : {}),
+      ...(session.pinned ? { pinned: true } : {}),
       ...(session.header.title === undefined ? {} : { title: session.header.title }),
       cwd: session.header.cwd,
       createdAt: session.header.createdAt,
@@ -651,8 +714,10 @@ class FakeSessionHandle implements SessionHandle {
   }
 
   snapshot(): SessionView {
+    const modelSelection = modelSelectionFromEvents(this.session.events)
     return {
       sessionId: this.id,
+      ...(modelSelection === undefined ? {} : { modelSelection }),
       header: { ...this.header },
       // Shared like the socket backend: append-only history, immutable events.
       events: this.session.events,
@@ -660,6 +725,8 @@ class FakeSessionHandle implements SessionHandle {
       status: this.session.status,
       streamText: this.session.streamText,
       streamReasoning: this.session.streamReasoning,
+      pendingApprovals: (this.session.pendingApprovals ?? []).map(item => ({ ...item })),
+      pendingAsks: (this.session.pendingAsks ?? []).map(item => ({ ...item, questions: [...item.questions] })),
       ...(this.session.pendingApproval === undefined
         ? {}
         : { pendingApproval: { ...this.session.pendingApproval } }),
@@ -669,16 +736,18 @@ class FakeSessionHandle implements SessionHandle {
     }
   }
 
-  async send(text: string, options: SendOptions = {}): Promise<SendReceipt> {
+  async send(input: PromptInput, options: SendOptions = {}): Promise<SendReceipt> {
     this.assertOpen()
-    if (text.trim().length === 0) {
+    const content: PromptContentPart[] = typeof input === 'string' ? [{ type: 'text', text: input }] : input.map(part => ({ ...part }))
+    if (content.length === 0 || !content.some(part => part.type !== 'text' || part.text.trim().length > 0)) {
       throw new BackendError('BAD_REQUEST', 'prompt must not be empty')
     }
+    const text = content.filter((part): part is Extract<PromptContentPart, { type: 'text' }> => part.type === 'text').map(part => part.text).join('\n')
     const requestId = randomUUID()
     if (this.session.status === 'running') {
       // Queue waits for the next turn; steer joins the running one.
       const mode: 'queue' | 'steer' = options.mode ?? 'queue'
-      this.backend.queuePrompt(this.id, requestId, text, mode)
+      this.backend.queuePrompt(this.id, requestId, content, mode)
       return { requestId, mode }
     }
     const turn = this.session.events.filter((event) => event.type === 'turn/start').length + 1
@@ -690,7 +759,7 @@ class FakeSessionHandle implements SessionHandle {
         message: {
           id: randomUUID(),
           role: 'user',
-          content: [{ type: 'text', text }],
+          content,
           source: { kind: 'user' },
         },
       },
@@ -755,12 +824,13 @@ class FakeSessionHandle implements SessionHandle {
     outcome: 'allowed-once' | 'rejected',
   ): Promise<void> {
     this.assertOpen()
-    const pending = this.session.pendingApproval
+    const pending = (this.session.pendingApprovals ?? []).find(item => item.requestId === requestId) ?? this.session.pendingApproval
     if (pending === undefined || pending.requestId !== requestId) {
       throw new BackendError('APPROVAL_NOT_PENDING', `approval "${requestId}" is not pending`)
     }
-    this.session.pendingApproval = undefined
-    this.session.status = 'idle'
+    this.session.pendingApprovals = (this.session.pendingApprovals ?? []).filter(item => item.requestId !== requestId)
+    this.session.pendingApproval = this.session.pendingApprovals[0]
+    if (this.session.pendingApproval === undefined && this.session.pendingAsk === undefined) this.session.status = 'idle'
     this.emitChange()
     this.append({
       type: 'approval/decided',
@@ -774,8 +844,9 @@ class FakeSessionHandle implements SessionHandle {
     this.backend.answeredQuestions.push({ sessionId: this.id, callId, answers })
     // The live request settles as soon as the answer arrives, even when this
     // fake keeps the durable call open for a slow-Host scenario.
-    if (this.session.pendingAsk?.callId === callId) {
-      this.session.pendingAsk = undefined
+    if ((this.session.pendingAsks ?? []).some(item => item.callId === callId) || this.session.pendingAsk?.callId === callId) {
+      this.session.pendingAsks = (this.session.pendingAsks ?? []).filter(item => item.callId !== callId)
+      this.session.pendingAsk = this.session.pendingAsks[0]
       this.emitChange()
     }
     // A real Host settles the waiting call through the durable log a few frames

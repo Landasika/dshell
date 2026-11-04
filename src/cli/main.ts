@@ -2,8 +2,7 @@ import { createInterface } from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 
 import { DshellError } from '../client/socket-client.js'
-import { BackendError, SocketBackend, type SessionView } from '../backend/index.js'
-import type { SessionEvent } from '../protocol/index.js'
+import { BackendError, SocketBackend, type SessionEvent, type SessionView } from '../backend/index.js'
 import { resolveSocketPath } from '../shared/paths.js'
 import { packageVersion } from '../shared/package.js'
 import { printEvent, printSessions, printWorkspaces, isTurnEnd, turnFailed } from './output.js'
@@ -189,7 +188,7 @@ function parseArgs(argv: string[]): Options {
   }
 
   return {
-    command: print ? 'print' : command ?? (argv.length === 0 ? 'tui' : 'help'),
+    command: print ? 'print' : command ?? 'tui',
     args,
     socket,
     timeoutMs,

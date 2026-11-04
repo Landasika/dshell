@@ -5,12 +5,14 @@ import type {
   ModelCatalog,
   ModelSelection,
   ProviderEntry,
+  ProviderConfigSource,
   ProviderField,
+  PromptContentPart,
   QuestionAnswer,
-  SessionEvent,
   SessionHeader,
   SkillEntry,
 } from '../protocol/index.js'
+import type { SessionEvent } from './events.js'
 
 /** Errors surfaced by a backend, independent of the transport used underneath. */
 export type BackendErrorCode =
@@ -42,8 +44,11 @@ export interface DshellCapabilities {
   attach: boolean
   /** The host accepts prompts. */
   prompt: boolean
+  /** Ordered text/image/file prompt parts are accepted. */
+  promptContent: boolean
   /** The host streams assistant output before the durable assistant message. */
   streaming: boolean
+  turnCorrelation?: boolean
   /** Workspace records can be listed and selected. */
   workspaces: boolean
   /** New sessions can be created without the Web UI. */
@@ -100,6 +105,7 @@ export interface AgentRoster {
 export interface ProviderList {
   file: string
   writable: boolean
+  source?: ProviderConfigSource
   providers: ProviderEntry[]
 }
 
@@ -111,6 +117,8 @@ export interface WorkspaceSummary {
 }
 
 export interface SessionSummary {
+  archived?: boolean
+  pinned?: boolean
   sessionId: string
   cwd?: string
   title?: string
@@ -125,6 +133,17 @@ export interface SessionSummary {
   running?: boolean
   /** The open turn is waiting on the user: an approval or a question. */
   needsInput?: 'approval' | 'question'
+  /** First line of the latest real user prompt, when the backend can resolve it cheaply. */
+  preview?: string
+}
+
+export type SessionAction = 'rename' | 'archive' | 'restore' | 'pin' | 'fork'
+
+export interface SessionActionResult {
+  sessionId?: string
+  title?: string
+  pinned?: boolean
+  archived?: boolean
 }
 
 export interface ApprovalView {
@@ -148,6 +167,8 @@ export interface PendingAskView {
 
 export interface SessionView {
   sessionId: string
+  /** Confirmed model for the next request, including pending durable selections. */
+  modelSelection?: ModelSelection
   header: SessionHeader
   events: SessionEvent[]
   cursor: number
@@ -156,6 +177,10 @@ export interface SessionView {
   streamText: string
   /** Reasoning accumulated from the same stream (reasoning-delta chunks). */
   streamReasoning: string
+  pendingApprovals?: ApprovalView[]
+  pendingAsks?: PendingAskView[]
+  hasMoreHistory?: boolean
+  connected?: boolean
   pendingApproval?: ApprovalView
   /**
    * The Host's live question request. Durable events alone are not enough: the
@@ -167,7 +192,11 @@ export interface SessionView {
 
 export interface SendOptions {
   mode?: 'queue' | 'steer'
+  requireIdle?: boolean
+  requestId?: string
 }
+
+export type PromptInput = string | readonly PromptContentPart[]
 
 export interface SendReceipt {
   requestId: string
@@ -186,9 +215,9 @@ export interface SessionHandle {
   subscribe(listener: (view: SessionView) => void): () => void
   snapshot(): SessionView
 
-  send(text: string, options?: SendOptions): Promise<SendReceipt>
+  send(input: PromptInput, options?: SendOptions): Promise<SendReceipt>
   /** Cancel the running turn; `killSubagents` also aborts its live subagents. */
-  cancel(killSubagents?: boolean): Promise<void>
+  cancel(killSubagents?: boolean, requestId?: string): Promise<void>
   /** Delete one prompt still waiting in the Host inbox. */
   removeQueued(requestId: string): Promise<void>
   /** Rewrite one prompt still waiting in the Host inbox. */
@@ -213,7 +242,7 @@ export interface CreateSessionOptions {
  * The only surface the CLI/TUI should use. Transport and DSH types stay below
  * this boundary so a Host upgrade only changes the adapter implementation.
  */
-export interface DshellBackend {
+export interface ConversationBackend {
   connect(): Promise<void>
   disconnect(): Promise<void>
   readonly connected: boolean
@@ -226,9 +255,13 @@ export interface DshellBackend {
   capabilities(): DshellCapabilities
 
   listWorkspaces(): Promise<WorkspaceSummary[]>
-  listSessions(workspaceId?: string): Promise<SessionSummary[]>
+  listSessions(workspaceId?: string, includeArchived?: boolean): Promise<SessionSummary[]>
   createSession(options?: CreateSessionOptions): Promise<SessionHandle>
   openSession(sessionId: string): Promise<SessionHandle>
+}
+
+/** Host-owned models, tools, provider settings and session organization. */
+export interface AdministrationBackend {
 
   /** Every currently routable provider/model, plus the deployment default. */
   modelCatalog(): Promise<ModelCatalog>
@@ -245,6 +278,8 @@ export interface DshellBackend {
   agentRoster(): Promise<AgentRoster>
   /** Rewrite one provider field; takes effect after the Host restarts. */
   updateProvider(providerId: string, field: ProviderField, value: string): Promise<ProviderList>
+  /** Commit all edited fields and an optional raw key as one configuration transaction. */
+  saveProvider(providerId: string, changes: Partial<Record<ProviderField, string>>, apiKey?: string): Promise<ProviderList & { ref?: string }>
   /** Store a raw key in the Host credential store; returns the ref it now answers to. */
   storeProviderKey(providerId: string, value: string): Promise<ProviderList & { ref: string }>
   /** Interrogate an upstream's model listing; candidate ids, nothing stored. */
@@ -259,4 +294,8 @@ export interface DshellBackend {
   deleteProvider(providerId: string): Promise<ProviderList>
   /** Re-exec the Host process; the socket disappears and comes back. */
   restartHost(): Promise<{ pid: number; argv: string[] }>
+  sessionAction(action: SessionAction, sessionId: string, value?: string | boolean): Promise<SessionActionResult>
 }
+
+/** Compatibility name for the bundled Harness transport implementation. */
+export interface DshellBackend extends ConversationBackend, AdministrationBackend {}

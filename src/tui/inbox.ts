@@ -1,4 +1,4 @@
-import type { SessionEvent } from '../protocol/index.js'
+import type { SessionEvent } from '../backend/events.js'
 
 /** One prompt waiting in the Host's inbox, queued by any client. */
 export interface InboxItem {
