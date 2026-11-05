@@ -1480,3 +1480,79 @@ test('prompt still maps a raw SessionAlreadyOwnedError message to SESSION_ALREAD
   assert.equal(reply.type, 'error')
   assert.equal(reply.code, 'SESSION_ALREADY_LIVE')
 })
+
+/**
+ * 运行态投影失败时，`status` 必须是**未知**而不是 `idle`。
+ *
+ * 背景：`status` 靠 `controller.list()` 给的 running 集合算出来，那个调用
+ * 有 4 秒超时。超时后原先的写法会把所有会话写成 `status:'idle'`——
+ * 不是"中性默认值"，而是**错误结论**：正在跑的任务被报成空闲，客户端首页
+ * 于是显示"没有进行中的任务"。
+ *
+ * 用户的实际症状是"来回切换一下账号，进行中的任务就没了"：切换主机触发
+ * 重连，正好撞上投影还没就绪的那几秒。而错误结果还会进缓存（4 秒），
+ * 把一次瞬时故障延长成确定的 4 秒空白。
+ */
+test('投影超时时 status 缺省为未知，不谎报 idle', async t => {
+  const controller = {
+    list: async () => { throw new Error('projection timeout') },
+  }
+  const harness = await startHarness(t, {}, { sessionController: controller })
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/list' })
+  const reply = await client.next()
+  const row = reply.sessions.find((s) => s.sessionId === 's1')
+  assert.ok(row, '会话本身必须照常返回')
+  assert.equal(row.status, undefined, 'status 缺失表示"不知道"，不能是 idle')
+  assert.equal(row.live, true, 'live 仍然反映常驻状态')
+})
+
+test('投影正常时 status 照常给出 running', async t => {
+  // 对照组：别为了修故障路径把正常路径也弄成 undefined
+  const controller = {
+    list: async () => ({ items: [{ sessionId: 's1', updatedAt: Date.now(), running: true }] }),
+  }
+  const harness = await startHarness(t, {}, { sessionController: controller })
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/list' })
+  const reply = await client.next()
+  assert.equal(reply.sessions.find((s) => s.sessionId === 's1').status, 'running')
+})
+
+test('投影失败的结果不进缓存，下一次请求能立刻拿到正确状态', async t => {
+  let fail = true
+  const controller = {
+    list: async () => {
+      if (fail) throw new Error('projection timeout')
+      return { items: [{ sessionId: 's1', updatedAt: Date.now(), running: true }] }
+    },
+  }
+  const harness = await startHarness(t, {}, { sessionController: controller })
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'session/list' })
+  const first = await client.next()
+  assert.equal(first.sessions.find((s) => s.sessionId === 's1').status, undefined)
+
+  // 故障恢复后立刻再问一次：若第一次的错误结果被缓存（4 秒），这里仍是 undefined
+  fail = false
+  client.send({ type: 'session/list' })
+  const second = await client.next()
+  assert.equal(
+    second.sessions.find((s) => s.sessionId === 's1').status,
+    'running',
+    '投影失败的结果不能被缓存，否则切换主机后的 4 秒里一直是空的',
+  )
+})

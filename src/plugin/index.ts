@@ -641,6 +641,20 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const activity = new Map<string, number>()
     const runningIds = new Set<string>()
     const controller = sessionController()
+    /**
+     * `controller.list()` 有没有拿到**可用**结果。
+     *
+     * 它超时/抛错时 `runningIds` 是空的，而下面据此把所有会话写成
+     * `status:'idle'`——那不是"中性默认值"，是**错误结论**：正在跑的任务
+     * 被报成空闲，客户端首页于是显示"没有进行中的任务"。
+     *
+     * 更糟的是这个错误结果还会进缓存（4 秒），所以切换主机触发重连后，
+     * 那几秒里怎么刷新都是空的。用户看到的就是"来回切一下，任务就没了"。
+     *
+     * 没有 list 能力时（`controller.list === undefined`）视为正常：
+     * 那种部署本来就只有 live/idle 两种状态，不是"不知道"。
+     */
+    let projectionOk = controller?.list === undefined
     if (controller?.list !== undefined) {
       const abort = new AbortController()
       const timer = setTimeout(() => abort.abort(), 4_000)
@@ -654,9 +668,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             runningIds.add(item.sessionId)
           }
         }
+        projectionOk = true
       } catch {
         // Activity is presentation metadata; a slow or missing projection must
         // not keep the picker from showing the sessions.
+        // 但 status 必须保持"未知"，不能写成 idle（见 projectionOk 注释）。
+        projectionOk = false
       } finally {
         clearTimeout(timer)
       }
@@ -735,7 +752,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         ...(runningIds.has(record.header.id) ? { running: true } : {}),
         // A resident agent is not the same thing as a running turn; the turn
         // state lives in the event log, which this list does not read.
-        status: runningIds.has(record.header.id) ? 'running' : record.live ? 'live' : 'idle',
+        // 投影没拿到时给 undefined（= 不知道），而不是 'idle'（= 确认没在跑）。
+        // 客户端遇到 undefined 会沿用上一次已知状态，而不是把"进行中"抹掉。
+        status: runningIds.has(record.header.id)
+          ? 'running'
+          : !projectionOk
+            ? undefined
+            : record.live ? 'live' : 'idle',
       }
     })
     // "Needs input" comes from the durable tail of the running sessions only
@@ -798,7 +821,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       const preview = await previewOf(session.sessionId)
       if (preview !== undefined) session.preview = preview
     }))
-    sessionCache.set(cacheKey, { at: Date.now(), sessions })
+    // 投影失败的结果**不进缓存**：它不是"过 4 秒会自动好的旧数据"，
+    // 而是一次瞬时故障。缓存它等于把故障延长成 4 秒的确定错误，
+    // 而这正好落在切换主机后客户端最需要正确数据的那几秒里。
+    if (projectionOk) sessionCache.set(cacheKey, { at: Date.now(), sessions })
     return sessions
   }
 
