@@ -762,7 +762,18 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       if (isArchived) summary.archived = true
       if (pinned.has(row.sessionId)) summary.pinned = true
       if (workspace !== undefined) summary.workspaceId = workspace.id
-      // 索引给不出此刻是否在跑；留空表示"不知道"，客户端沿用上次已知状态。
+      // 索引本身给不出此刻是否在跑（它只是磁盘上的元数据摘要），
+      // 但 **Host 内存里知道**：`ctx.agents` 只装真正活着的 agent，
+      // 查得到就是 running。这是 O(1)，不读任何文件。
+      //
+      // 这里必须补，因为**索引路径才是主路径**：`listSessions` 命中索引
+      // 就直接返回，根本走不到 `listSessionsFresh` 里那段状态推断。
+      // 只在慢路径修，手机上看到的仍然是错的。
+      const liveStatus = ctx.agents.get(row.sessionId)?.status
+      if (liveStatus !== undefined) {
+        summary.status = liveStatus
+        if (liveStatus === 'running') summary.running = true
+      }
       summary.persisted = true
       if (row.preview !== undefined && row.preview.length > 0) summary.preview = row.preview
       sessions.push(summary)
@@ -931,6 +942,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
     const sessions: SessionSummary[] = visible.map(({ record, workspace }) => {
       const title = titles.get(record.header.id) ?? record.header.title
+      // Host 内存里的实时状态。查不到就是 undefined（没在跑），
+      // 这正是我们想要的语义 —— 不需要任何 IO。
+      const liveStatus = ctx.agents.get(record.header.id)?.status
       return {
         sessionId: record.header.id,
         archived: archived.has(record.header.id),
@@ -943,16 +957,37 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         persisted: record.persisted,
         formatStatus: record.formatStatus,
         ...(workspace === undefined ? {} : { workspaceId: workspace.id }),
-        ...(runningIds.has(record.header.id) ? { running: true } : {}),
-        // A resident agent is not the same thing as a running turn; the turn
-        // state lives in the event log, which this list does not read.
+        ...(liveStatus === 'running' || runningIds.has(record.header.id) ? { running: true } : {}),
+        // ## 状态从哪来（按优先级）
+        //
+        // 1. `ctx.agents.get(id)?.status` —— **内存表，O(1)，零 IO**。
+        //    它只装"真正活着的 agent"（`liveAgent()` 是懒加载的，
+        //    闲着的会话根本不在表里），所以查不到 = 没在跑，语义精确。
+        //
+        // 2. `runningIds` —— 来自 `controller.list()` 的 `items[].running`。
+        //    实测这个字段**永远是空的**：底层会话投影不追踪 turn 状态
+        //    （下面那段英文注释自己承认了"turn state lives in the event
+        //    log, which this list does not read"）。保留它只为兼容
+        //    将来投影真能报 running 的情况。
+        //
+        // 3. `record.live` —— 只代表"agent 驻留"，不等于在跑一个 turn。
+        //
+        // ## 为什么必须加第 1 条
+        //
+        // 实测（24.7 秒的任务，58 次采样）：
+        //     attach 报 running:  57 次   ✅
+        //     list   报 running:   0 次   ❌
+        // 手机上看到的就是"电脑终端在跑，列表里全是空闲"。同一个时刻问
+        // `ctx.agents` 和 `list`，一个说 running 一个连字段都没有。
+        //
         // 投影没拿到时给 undefined（= 不知道），而不是 'idle'（= 确认没在跑）。
         // 客户端遇到 undefined 会沿用上一次已知状态，而不是把"进行中"抹掉。
-        status: runningIds.has(record.header.id)
-          ? 'running'
-          : !projectionOk
-            ? undefined
-            : record.live ? 'live' : 'idle',
+        status: liveStatus
+          ?? (runningIds.has(record.header.id)
+            ? 'running'
+            : !projectionOk
+              ? undefined
+              : record.live ? 'live' : 'idle'),
       }
     })
     // "Needs input" comes from the durable tail of the running sessions only
@@ -2711,6 +2746,20 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : { cwd: typeof message.cwd === 'string' ? message.cwd : process.cwd() }),
       })
       const snapshot = await ctx.sessionQuery.readSession(created.sessionId)
+      // 立刻把新会话写进轻索引。
+      //
+      // 不这么做的话，列表走索引路径时**看不见这条新会话**——索引只在
+      // `listSessionsFresh` 跑完后异步刷新（index.ts:1048），而那是几十秒
+      // 一次的全量枚举。实测：新建一条会话并发起任务后，连续采样 15 秒，
+      // `list` 里始终是 `(missing)`，手机上就是"刚建的会话半天不出现"。
+      //
+      // 这里写一行只有几十字节，比等一次全量枚举便宜得多。
+      void sessionIndex().appendMany([{
+        sessionId: created.sessionId,
+        ...(snapshot.session.cwd === undefined ? {} : { cwd: snapshot.session.cwd }),
+        ...(snapshot.session.createdAt === undefined ? {} : { createdAt: snapshot.session.createdAt }),
+        ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : {}),
+      }]).catch(() => undefined)
       jsonLine(channel, { type: 'session-created', sessionId: created.sessionId, header: snapshot.session, ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : {}) })
       return
     }

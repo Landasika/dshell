@@ -1803,3 +1803,111 @@ test('缓存过期后先返回旧列表而不是阻塞在慢查询上', async t 
   assert.deepEqual(second.sessions.map((s) => s.sessionId), ['s1'])
   assert.ok(elapsed < 2_000, `应立刻返回旧数据（实际 ${String(elapsed)}ms）`)
 })
+
+/*
+ * `list` 的运行状态必须来自 Host 内存里的 `ctx.agents`。
+ *
+ * ## 为什么这几条测试存在
+ *
+ * 实测（一个跑了 24.7 秒的真实任务，58 次采样）：
+ *
+ *     attach 报 running:  57 次   ✅
+ *     list   报 running:   0 次   ❌
+ *
+ * 同一时刻直接问 `ctx.agents`，它明确说 `running`。也就是说 Host **知道**
+ * 谁在跑，只是没把这件事告诉 `list` 的调用方。手机上看到的现象就是
+ * "电脑终端在跑，列表里全是空闲"。
+ *
+ * 根因有两处，两处都得修：
+ *
+ *  1. `listSessionsFromIndex` —— **索引路径才是主路径**（命中索引就直接
+ *     返回，走不到慢路径）。它原来干脆没写 status。
+ *  2. `listSessionsFresh` —— 慢路径只会看 `runningIds`，而那个数据源
+ *     （`controller.list()` 的 `items[].running`）实测永远是空的。
+ */
+test('list 从 ctx.agents 拿到 running —— 主路径（索引命中）', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [
+    { type: 'turn/start', seq: 1, data: {} },
+  ])
+  // Host 内存里这个 agent 正在跑
+  harness.agents.set('s1', { id: 's1', status: 'running', session: { id: 's1' } })
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'list' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'sessions')
+  const row = reply.sessions.find((s) => s.sessionId === 's1')
+  assert.equal(row?.status, 'running')
+  assert.equal(row?.running, true)
+})
+
+test('list 对已结束的 agent 报 idle，而不是漏掉状态', async (t) => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [
+    { type: 'turn/start', seq: 1, data: {} },
+    { type: 'turn/end', seq: 2, data: {} },
+  ])
+  harness.agents.set('s1', { id: 's1', status: 'idle', session: { id: 's1' } })
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'list' })
+  const reply = await client.next()
+  const row = reply.sessions.find((s) => s.sessionId === 's1')
+  assert.equal(row?.status, 'idle')
+  assert.notEqual(row?.running, true)
+})
+
+test('不在 ctx.agents 里的会话不能报成 running', async (t) => {
+  // 反向保护：闲着的会话根本不在内存表里，这时必须走回原来的推断
+  // （live / idle），不能被误判成"在跑"。
+  const harness = await startHarness(t)
+  makeSession(harness, 's1', [{ type: 'turn/end', seq: 1, data: {} }])
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'list' })
+  const reply = await client.next()
+  const row = reply.sessions.find((s) => s.sessionId === 's1')
+  assert.notEqual(row?.status, 'running')
+  assert.notEqual(row?.running, true)
+})
+
+test('新建会话立刻出现在 list 里（不用等索引全量刷新）', async (t) => {
+  // ⚠️ 这条测试**抓不到**它要抓的 bug。
+  //
+  // 要抓的问题是"索引路径看不见新会话"，但 `indexPrimed` 只有在索引
+  // 刷新跑完之后才为 true，而测试都是新建 harness（indexPrimed = false），
+  // 所以永远走慢路径。我把它留着是当行为契约（新建 → 立刻可见），
+  // 但它不能替代对索引路径的保护 —— 那部分靠上面两条 status 测试，
+  // 它们是真的会红的（回滚验证过：2 条失败）。
+  const harness = await startHarness(t)
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'session/create', cwd: '/work' })
+  const created = await client.next()
+  assert.equal(created.type, 'session-created')
+  const sid = created.sessionId
+  assert.ok(typeof sid === 'string' && sid.length > 0)
+
+  client.send({ type: 'list' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'sessions')
+  const ids = reply.sessions.map((s) => s.sessionId)
+  assert.ok(ids.includes(sid), `新建的会话应当立刻出现在列表里，实际只有：${ids.join(',')}`)
+})
