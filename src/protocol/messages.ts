@@ -31,6 +31,10 @@ export const CAPABILITIES = [
   'provider-key',
   'provider-discover',
   'agents',
+  /** `session/children`：按父会话枚举它的子 agent。 */
+  'session-children',
+  /** `session/index-stats`：轻索引与保留期的只读报表。 */
+  'session-index',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
@@ -195,6 +199,43 @@ export interface PongMessage {
 export interface SessionsMessage {
   type: 'sessions'
   sessions: SessionSummary[]
+}
+
+/** 一个子会话的最小描述（按父会话查列表时用）。 */
+export interface SessionChildSummary {
+  sessionId: string
+  title?: string
+  cwd?: string
+  createdAt?: number
+  updatedAt?: number
+  delegationDepth?: number
+}
+
+/**
+ * 某个父会话的子 agent 列表。
+ *
+ * 竞品都有对应的结构：Claude Code 用 `<session>/subagents/` 目录，Codex 用
+ * `thread_spawn_edges` 表。dshell 的子会话原本是平铺且无归属的，这条消息让
+ * 它们可以被按父查询。
+ */
+export interface SessionChildrenMessage {
+  type: 'session-children'
+  sessionId: string
+  children: SessionChildSummary[]
+}
+
+/** 轻索引与保留期的只读报表：只统计，不删除。 */
+export interface SessionIndexStatsMessage {
+  type: 'session-index-stats'
+  indexed: number
+  mainSessions: number
+  subagents: number
+  /** 父会话 id 缺失、或父会话已不在索引里的子会话数。 */
+  orphanSubagents: number
+  cleanupPeriodDays?: number
+  /** 按保留期判定为过期的会话数（未配置保留期时为 0）。 */
+  expired: number
+  expiredSample?: string[]
 }
 
 export interface WorkspacesMessage {
@@ -527,6 +568,8 @@ export type ClientPayload =
   | { type: 'ping' }
   | { type: 'list' }
   | { type: 'session/list'; workspaceId?: string; includeArchived?: boolean }
+  | { type: 'session/children'; sessionId: string }
+  | { type: 'session/index-stats' }
   | { type: 'attach'; sessionId: string }
   | { type: 'detach'; sessionId?: string }
   | { type: 'watch'; sessionId: string }
@@ -592,6 +635,8 @@ export type ServerPayload =
   | WelcomeMessage
   | PongMessage
   | SessionsMessage
+  | SessionChildrenMessage
+  | SessionIndexStatsMessage
   | WorkspacesMessage
   | AttachedMessage
   | HistoryMessage

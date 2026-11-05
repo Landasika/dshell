@@ -9,7 +9,9 @@ import type {
   ProviderField,
   PromptContentPart,
   QuestionAnswer,
+  SessionChildrenMessage,
   SessionHeader,
+  SessionIndexStatsMessage,
   SkillEntry,
 } from '../protocol/index.js'
 import type { SessionEvent } from './events.js'
@@ -263,6 +265,16 @@ export interface ConversationBackend {
 
   listWorkspaces(): Promise<WorkspaceSummary[]>
   listSessions(workspaceId?: string, includeArchived?: boolean): Promise<SessionSummary[]>
+  /**
+   * 按父会话列出它的子 agent（可选能力）。
+   *
+   * 子会话是"有归属的条目"，不是看不见的垃圾。Claude Code 把它们放在
+   * `<session>/subagents/` 下，Codex 用 `thread_spawn_edges` 建边；没有这个
+   * 查询，那些会话就只能在磁盘上默默占空间。
+   */
+  listSessionChildren?(sessionId: string): Promise<SessionChildrenMessage>
+  /** 轻索引与保留期的只读报表（可选能力）。 */
+  sessionIndexStats?(): Promise<SessionIndexStatsMessage>
   createSession(options?: CreateSessionOptions): Promise<SessionHandle>
   openSession(sessionId: string): Promise<SessionHandle>
 }

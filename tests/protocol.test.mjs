@@ -37,8 +37,20 @@ test('protocol v2 advertises the P3 capabilities', () => {
       'provider-key',
       'provider-discover',
       'agents',
+      'session-children',
+      'session-index',
     ],
   )
+})
+
+test('新增的会话组织能力都进了能力表', async () => {
+  // 能力表是客户端判断"这个 Host 支不支持某功能"的唯一依据。加了请求
+  // 却不加能力，客户端就只能靠"收到 unknown message type"才发现不支持——
+  // 那是错误路径，不是协商。
+  const { CAPABILITIES: caps } = await import('../dist/protocol/index.js')
+  for (const name of ['session-children', 'session-index']) {
+    assert.ok(caps.includes(name), `能力表缺少 ${name}`)
+  }
 })
 
 test('socket path follows DSH_HOME', () => {

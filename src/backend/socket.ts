@@ -28,6 +28,8 @@ import type {
   SessionEvent as WireSessionEvent,
   SessionHeader,
   SessionsMessage,
+  SessionChildrenMessage,
+  SessionIndexStatsMessage,
   SkillMessage,
   SkillsMessage,
 } from '../protocol/index.js'
@@ -474,6 +476,47 @@ export class SocketBackend implements DshellBackend {
     }))
     if (workspaceId === undefined) return sessions
     return sessions.filter((session) => session.workspaceId === workspaceId)
+  }
+
+  /**
+   * 按父会话列出它的子 agent。
+   *
+   * 对应 Claude Code 的 `<session>/subagents/` 与 Codex 的
+   * `thread_spawn_edges`：子会话不是"看不见的垃圾"，而是有归属的一等条目。
+   */
+  async listSessionChildren(sessionId: string): Promise<SessionChildrenMessage> {
+    const connection = this.requireControl()
+    if (!connection.welcome.capabilities.includes('session-children')) {
+      throw new BackendError('UNSUPPORTED_CAPABILITY', 'this Host cannot list a session\'s subagents',
+        'restart the Host to load the current dshell-host plugin')
+    }
+    try {
+      return await connection.request<SessionChildrenMessage>(
+        { type: 'session/children', sessionId },
+        (candidate) => candidate.type === 'session-children',
+        10_000,
+      )
+    } catch (error) {
+      throw mapError(error)
+    }
+  }
+
+  /** 轻索引与保留期的只读报表。 */
+  async sessionIndexStats(): Promise<SessionIndexStatsMessage> {
+    const connection = this.requireControl()
+    if (!connection.welcome.capabilities.includes('session-index')) {
+      throw new BackendError('UNSUPPORTED_CAPABILITY', 'this Host has no session index',
+        'restart the Host to load the current dshell-host plugin')
+    }
+    try {
+      return await connection.request<SessionIndexStatsMessage>(
+        { type: 'session/index-stats' },
+        (candidate) => candidate.type === 'session-index-stats',
+        10_000,
+      )
+    } catch (error) {
+      throw mapError(error)
+    }
   }
 
   async sessionAction(action: SessionAction, sessionId: string, value?: string | boolean): Promise<SessionActionResult> {

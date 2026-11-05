@@ -58,6 +58,15 @@ import { DeviceStore, PairCodes, hostName } from './devices.js'
 import { ApprovalCoordinator } from './approval.js'
 import { openHistory, historyEvents, type HarnessHistoryOwner } from './harness-history.js'
 import {
+  SessionIndexFile,
+  rowsFromHeaders,
+  isSubagentRow,
+  isExpired,
+  normalizeCleanupDays,
+  previewOfText,
+  type SessionIndexRow,
+} from './session-index.js'
+import {
   HUB_PROVIDER,
   createHubProvider,
   readSkillFile,
@@ -113,6 +122,23 @@ export interface Config {
   sessionListTimeoutMs?: number
   /** 启动后是否预热会话列表缓存，默认 true。测试里关掉以免抢占数据准备。 */
   warmSessionList?: boolean
+  /**
+   * 会话轻索引文件路径；默认 `$DSH_HOME/dshell-ws/session-index.jsonl`。
+   *
+   * 索引只存列表需要的字段（标题、副标题、时间、归档/置顶、父子边），
+   * 让"列会话"不必解析日志正文。索引是可丢弃的派生数据：删掉只会让下次
+   * 列表慢一次。Claude Code 用 `~/.claude/history.jsonl`、Codex 用
+   * `state_5.sqlite` 的 `threads` 表，都是同一个思路。
+   */
+  sessionIndexFile?: string
+  /**
+   * 会话保留天数；默认不清理。
+   *
+   * 抄 Claude Code 的 `cleanupPeriodDays`：最小 1 天，**0 会被抬到 1**——
+   * 把 0 当作"永不清理"是常见误解，而它曾经真的会关掉写入。这里只用于
+   * 索引侧的过期标记与报表，不会自动删日志。
+   */
+  cleanupPeriodDays?: number
   /**
    * Extra skill hubs (directories of `SKILL.md` bundles) served through
    * `ctx.skills`; `/skills` lists them alongside project and user skills.
@@ -635,6 +661,33 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   }
 
   const SESSION_LIST_TIMEOUT_MS = config.sessionListTimeoutMs ?? 15_000
+  /**
+   * 会话轻索引。列表优先读它，慢路径只在后台补全。
+   *
+   * 路径放在 `dshell-ws/` 下，与设备表同处：它是 dshell 自己的派生数据，
+   * 不该混进 dsh 的 `storages/`。
+   */
+  let sessionIndexInstance: SessionIndexFile | undefined
+  const sessionIndex = (): SessionIndexFile => {
+    if (sessionIndexInstance === undefined) {
+      const base = dshHome() ?? join(process.env.HOME ?? '.', '.dsh')
+      sessionIndexInstance = new SessionIndexFile(
+        config.sessionIndexFile ?? join(base, 'dshell-ws', 'session-index.jsonl'),
+      )
+    }
+    return sessionIndexInstance
+  }
+  /** 保留期（天）；未配置表示不做过期标记。 */
+  const cleanupDays = normalizeCleanupDays(config.cleanupPeriodDays)
+  /**
+   * 索引是否已经至少完整读过一次。
+   *
+   * 索引为空时（首次运行、刚删过）必须先走一次慢路径把它填起来，否则
+   * 列表会永远是空的——"可丢弃"不等于"可以当作权威的空"。
+   */
+  let indexPrimed = false
+  /** 索引正在被首次填充；期间的列表请求沿用慢路径并等它。 */
+  let priming: Promise<void> | undefined
   const SESSION_CACHE_MS = 4_000
   const PREVIEW_CACHE_MS = 300_000
   const PREVIEW_ROWS = 24
@@ -656,10 +709,71 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    */
   const inflightList = new Map<string, Promise<SessionSummary[] | null>>()
 
+  /**
+   * 从轻索引直接构造列表（毫秒级）。
+   *
+   * 这条路径**不读任何会话日志**，也不调 `sessionQuery.listSessions()`，
+   * 所以它不会超时。索引里没有的会话就不会出现——这是刻意的取舍：列表是
+   * 元数据视图，完整性由后台补全去追，而不是让用户等 15 秒。
+   *
+   * `running` / `status` 这类"此刻状态"索引给不了，保持 `undefined`
+   * （= 不知道），而不是写成 `idle`（= 确认没在跑）。
+   */
+  const listSessionsFromIndex = async (
+    workspaceId: string | undefined,
+    includeArchived: boolean,
+  ): Promise<SessionSummary[] | undefined> => {
+    const rows = await sessionIndex().rowsOf()
+    if (rows.size === 0) return undefined
+    const archived = new Set(ctx.workspaceRegistry?.archivedSessionIds ?? [])
+    const pinned = new Set(ctx.workspaceRegistry?.pinnedSessionIds ?? [])
+    const workspaces = workspaceList()
+    const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
+    const sessions: SessionSummary[] = []
+    for (const row of rows.values()) {
+      // 子会话（subagent）不进展柜：它们挂在父会话下，靠索引里的父子边查。
+      if (isSubagentRow(row)) continue
+      const isArchived = archived.has(row.sessionId)
+      if (!includeArchived && isArchived) continue
+      const workspace = row.cwd === undefined ? undefined : workspaceByPath.get(row.cwd)
+      if (workspaceId !== undefined && workspace?.id !== workspaceId) continue
+      const summary: SessionSummary = { sessionId: row.sessionId }
+      if (row.title !== undefined && row.title.length > 0) summary.title = row.title
+      if (row.cwd !== undefined) summary.cwd = row.cwd
+      if (row.createdAt !== undefined) summary.createdAt = row.createdAt
+      if (row.updatedAt !== undefined) summary.updatedAt = row.updatedAt
+      if (isArchived) summary.archived = true
+      if (pinned.has(row.sessionId)) summary.pinned = true
+      if (workspace !== undefined) summary.workspaceId = workspace.id
+      // 索引给不出此刻是否在跑；留空表示"不知道"，客户端沿用上次已知状态。
+      summary.persisted = true
+      if (row.preview !== undefined && row.preview.length > 0) summary.preview = row.preview
+      sessions.push(summary)
+    }
+    sessions.sort((left, right) => Number(right.pinned === true) - Number(left.pinned === true)
+      || (right.updatedAt ?? right.createdAt ?? 0) - (left.updatedAt ?? left.createdAt ?? 0))
+    return sessions
+  }
+
   const listSessions = async (workspaceId?: string, includeArchived = false): Promise<SessionSummary[] | null> => {
     const cacheKey = `${workspaceId ?? ''}:${includeArchived ? 'archived' : 'active'}`
     const cached = sessionCache.get(cacheKey)
     if (cached !== undefined && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions
+    // 索引命中就先给索引结果，同时后台补全。这是与竞品对齐的主路径：
+    // 列会话读索引，不解析正文。索引为空时（首次运行）才走慢路径。
+    if (indexPrimed) {
+      const fromIndex = await listSessionsFromIndex(workspaceId, includeArchived)
+      if (fromIndex !== undefined) {
+        if (!inflightList.has(cacheKey)) {
+          const job = listSessionsFresh(workspaceId, includeArchived).finally(() => {
+            inflightList.delete(cacheKey)
+          })
+          inflightList.set(cacheKey, job)
+          void job
+        }
+        return fromIndex
+      }
+    }
     // 陈旧但存在的数据：**先返回它**，同时后台刷新。
     //
     // 枚举一个 266MB / 1034 文件的 DSH home 要 14~15 秒，正好卡在预算边缘，
@@ -685,8 +799,53 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   /** 真正去枚举会话的那条慢路径（14~15 秒）。结果会写进 [sessionCache]。 */
   const listSessionsFresh = async (workspaceId?: string, includeArchived = false): Promise<SessionSummary[] | null> => {
     const cacheKey = `${workspaceId ?? ''}:${includeArchived ? 'archived' : 'active'}`
-    const records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
-    if (records === undefined) return null
+    /**
+     * 两条查询**并行**发起。
+     *
+     * `controller.list()` 内部第一件事就是自己再调一次
+     * `sessionQuery.listSessions()`（见 `dsh-api-session-controller`），也就是
+     * 同一份会话要被列举两遍。原来这里是串行的：先等 records，再等
+     * controller —— 于是两次全量列举的耗时直接相加。
+     *
+     * 实测（515 份会话）：records 1.2–3.2 秒、controller 1.6–8.9 秒，串行
+     * 叠加后就是 3–12 秒，正好把 15 秒预算吃穿。并发之后，总耗时从
+     * "两段之和"降到"两段之中较慢的那段"。
+     */
+    const recordsPromise = withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
+    const controllerPromise = (() => {
+      const controller = sessionController()
+      if (controller?.list === undefined) return undefined
+      const abort = new AbortController()
+      const timer = setTimeout(() => abort.abort(), 4_000)
+      // 注意：`abort` 只在 `controller.list` 的循环里被检查，卡住它的是循环
+      // **之前**的那次 `listSessions()`，所以 4 秒超时并不保证生效。这里
+      // 仍然保留它（能省则省），但不再依赖它兜底——并行本身已经消除了
+      // "等两遍"的问题。
+      const promise = controller.list({}, abort.signal)
+        .then((listed: { items?: readonly { sessionId?: unknown; updatedAt?: unknown; running?: unknown }[] }) => {
+          const result: { activity: Map<string, number>; runningIds: Set<string> } = {
+            activity: new Map(),
+            runningIds: new Set(),
+          }
+          for (const item of listed.items ?? []) {
+            if (typeof item?.sessionId === 'string' && typeof item.updatedAt === 'number') {
+              result.activity.set(item.sessionId, item.updatedAt)
+            }
+            if (typeof item?.sessionId === 'string' && item.running === true) {
+              result.runningIds.add(item.sessionId)
+            }
+          }
+          return result
+        })
+        .finally(() => { clearTimeout(timer) })
+      return promise
+    })()
+    const records = await recordsPromise
+    if (records === undefined) {
+      // records 失败时 controller 可能还在跑；让它自己结束，别等它。
+      void controllerPromise?.catch(() => undefined)
+      return null
+    }
     const archived = new Set(ctx.workspaceRegistry?.archivedSessionIds ?? [])
     const pinned = new Set(ctx.workspaceRegistry?.pinnedSessionIds ?? [])
     // The durable activity time comes from the Host's session list projection;
@@ -707,28 +866,18 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
      * 没有 list 能力时（`controller.list === undefined`）视为正常：
      * 那种部署本来就只有 live/idle 两种状态，不是"不知道"。
      */
-    let projectionOk = controller?.list === undefined
-    if (controller?.list !== undefined) {
-      const abort = new AbortController()
-      const timer = setTimeout(() => abort.abort(), 4_000)
+    let projectionOk = controllerPromise === undefined
+    if (controllerPromise !== undefined) {
       try {
-        const listed = await controller.list({}, abort.signal)
-        for (const item of listed.items ?? []) {
-          if (typeof item?.sessionId === 'string' && typeof item.updatedAt === 'number') {
-            activity.set(item.sessionId, item.updatedAt)
-          }
-          if (typeof item?.sessionId === 'string' && item.running === true) {
-            runningIds.add(item.sessionId)
-          }
-        }
+        const result = await controllerPromise
+        for (const [id, updatedAt] of result.activity) activity.set(id, updatedAt)
+        for (const id of result.runningIds) runningIds.add(id)
         projectionOk = true
       } catch {
         // Activity is presentation metadata; a slow or missing projection must
         // not keep the picker from showing the sessions.
         // 但 status 必须保持"未知"，不能写成 idle（见 projectionOk 注释）。
         projectionOk = false
-      } finally {
-        clearTimeout(timer)
       }
     }
     const lastActivity = (record: SessionRecordLike): number =>
@@ -878,7 +1027,56 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // 而是一次瞬时故障。缓存它等于把故障延长成 4 秒的确定错误，
     // 而这正好落在切换主机后客户端最需要正确数据的那几秒里。
     if (projectionOk) sessionCache.set(cacheKey, { at: Date.now(), sessions })
+    // 顺手把这一轮结果写进轻索引：下次列表就走毫秒级的索引路径。
+    // 失败不影响返回值——索引是派生数据，写不进去只是下次还得慢一遍。
+    void refreshSessionIndex(records, sessions).catch(() => undefined)
     return sessions
+  }
+
+  /**
+   * 用一次慢查询的结果刷新轻索引。
+   *
+   * 只写"列表需要的字段"：标题、副标题、时间、父会话边。正文永远不进索引。
+   * `records` 里含 subagent（它们不进展柜，但要留父子边给级联查询用）。
+   */
+  const refreshSessionIndex = async (
+    records: readonly SessionRecordLike[],
+    summaries: readonly SessionSummary[],
+  ): Promise<void> => {
+    const byId = new Map(summaries.map(summary => [summary.sessionId, summary]))
+    const extras = new Map<string, Partial<SessionIndexRow>>()
+    for (const summary of summaries) {
+      const extra: Partial<SessionIndexRow> = {}
+      if (summary.title !== undefined) extra.title = summary.title
+      if (summary.preview !== undefined) extra.preview = summary.preview
+      if (summary.updatedAt !== undefined) extra.updatedAt = summary.updatedAt
+      extras.set(summary.sessionId, extra)
+    }
+    // 标题可能只解析了前若干行；索引里已有的旧标题不要被"这次没算到"覆盖掉。
+    const existing = await sessionIndex().rowsOf()
+    const rows: SessionIndexRow[] = []
+    for (const record of records) {
+      const header = record.header
+      const summary = byId.get(header.id)
+      const previous = existing.get(header.id)
+      const row: SessionIndexRow = { sessionId: header.id }
+      if (header.cwd !== undefined) row.cwd = header.cwd
+      if (header.createdAt !== undefined) row.createdAt = header.createdAt
+      const title = summary?.title ?? previous?.title ?? header.title
+      if (title !== undefined && title.length > 0) row.title = title
+      const preview = summary?.preview ?? previous?.preview
+      if (preview !== undefined && preview.length > 0) row.preview = preview
+      if (summary?.updatedAt !== undefined) row.updatedAt = summary.updatedAt
+      else if (previous?.updatedAt !== undefined) row.updatedAt = previous.updatedAt
+      if (header.origin !== undefined) row.origin = header.origin
+      // 父子边：subagent 靠它挂到父会话下，而不是变成无法归属的孤儿。
+      if (header.parentSession !== undefined) row.parentSessionId = header.parentSession
+      if (header.delegationDepth !== undefined) row.delegationDepth = header.delegationDepth
+      rows.push(row)
+    }
+    if (rows.length === 0) return
+    await sessionIndex().appendMany(rows)
+    indexPrimed = true
   }
 
   const composeAgent = async (presetId: string | undefined): Promise<{
@@ -2739,6 +2937,66 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           jsonLine(channel, { type: 'sessions', sessions: rows })
           return
         }
+        /**
+         * `session/children`：按父会话查它的子 agent。
+         *
+         * 这是竞品都有、而 dshell 原来缺的一块。Claude Code 把子会话存成
+         * `<session>/subagents/*.jsonl`（父目录在，子会话就一定在），Codex 用
+         * `thread_spawn_edges(parent_thread_id, child_thread_id)` 建边。dshell
+         * 原来 266 份子会话是平铺的，既列不出、也归不到任何父会话。
+         *
+         * 现在索引里记了 `parentSessionId`，这条请求就能把"孤儿"变成
+         * "可查询的归属关系"。只读索引，不碰日志。
+         */
+        case 'session/children': {
+          if (typeof message.sessionId !== 'string' || message.sessionId.length === 0) {
+            sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'sessionId is required' })
+            return
+          }
+          const rows = await sessionIndex().rowsOf()
+          const children = [...rows.values()]
+            .filter(row => row.parentSessionId === message.sessionId)
+            .map(row => ({
+              sessionId: row.sessionId,
+              ...(row.title === undefined ? {} : { title: row.title }),
+              ...(row.cwd === undefined ? {} : { cwd: row.cwd }),
+              ...(row.createdAt === undefined ? {} : { createdAt: row.createdAt }),
+              ...(row.updatedAt === undefined ? {} : { updatedAt: row.updatedAt }),
+              ...(row.delegationDepth === undefined ? {} : { delegationDepth: row.delegationDepth }),
+            }))
+          jsonLine(channel, { type: 'session-children', sessionId: message.sessionId, children })
+          return
+        }
+        /**
+         * `session/index-stats`：轻索引与保留期的只读报表。
+         *
+         * 只报告、不删除。清理仍然要用户明确决定——这一点与 dsh 上游
+         * 自己的态度一致（"清理已存储检查点属于带外维护"）。
+         */
+        case 'session/index-stats': {
+          const rows = await sessionIndex().rowsOf()
+          const all = [...rows.values()]
+          const subagents = all.filter(row => isSubagentRow(row))
+          const main = all.filter(row => !isSubagentRow(row))
+          const orphans = subagents.filter(row => {
+            const parent = row.parentSessionId
+            return parent === undefined || !rows.has(parent)
+          })
+          const expired = cleanupDays === undefined
+            ? []
+            : all.filter(row => isExpired(row, cleanupDays))
+          jsonLine(channel, {
+            type: 'session-index-stats',
+            indexed: all.length,
+            mainSessions: main.length,
+            subagents: subagents.length,
+            orphanSubagents: orphans.length,
+            ...(cleanupDays === undefined ? {} : { cleanupPeriodDays: cleanupDays }),
+            expired: expired.length,
+            ...(cleanupDays === undefined ? {} : { expiredSample: expired.slice(0, 20).map(row => row.sessionId) }),
+          })
+          return
+        }
         case 'workspaces':
           jsonLine(channel, { type: 'workspaces', workspaces: workspaceList() })
           return
@@ -3199,9 +3457,37 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * 会话"的空结果写进缓存，之后的请求全被这个空缓存挡住。
    * 等一拍让调用方先把上下文就位，预热才有意义。
    */
+  /**
+   * 启动时把索引填起来。
+   *
+   * 索引空 = 列表走慢路径（14 秒级），所以启动后主动跑一次，让之后的列表
+   * 直接命中索引。失败不重试：索引仍然会在下一次慢查询时被写满。
+   */
+  const primeSessionIndex = async (): Promise<void> => {
+    if (priming !== undefined) return priming
+    const run = (async () => {
+      try {
+        await sessionIndex().read()
+        // 索引已经有内容就不必再跑一次慢查询；后台刷新会补齐增量。
+        const rows = await sessionIndex().rowsOf()
+        if (rows.size > 0) {
+          indexPrimed = true
+          return
+        }
+        await listSessionsFresh(undefined, false)
+      } catch {
+        // 预热是尽力而为；失败时列表会在下次请求时自己回源。
+      } finally {
+        priming = undefined
+      }
+    })()
+    priming = run
+    return run
+  }
+
   if (config.warmSessionList !== false) {
     const warm = setTimeout(() => {
-      void listSessions(undefined, false).catch(() => undefined)
+      void primeSessionIndex().catch(() => undefined)
     }, 2_000)
     warm.unref?.()
   }
