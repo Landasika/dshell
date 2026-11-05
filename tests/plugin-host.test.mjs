@@ -1573,6 +1573,67 @@ test('投影失败的结果不进缓存，下一次请求能立刻拿到正确�
 })
 
 /**
+ * controller.list 绝不能收到 AbortSignal：abort 会在 host 查询链深处产生
+ * 无人接住的拒绝，而 host 把任何 unhandledRejection 当致命错误 exit(1)。
+ */
+test('controller.list 不收到 AbortSignal（abort 信号会把 host 打死）', async t => {
+  const calls = []
+  const controller = {
+    list: async (...args) => {
+      calls.push(args)
+      return { items: [{ sessionId: 's1', updatedAt: Date.now(), running: false }] }
+    },
+  }
+  const harness = await startHarness(t, {}, { sessionController: controller })
+  makeSession(harness, 's1', [])
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/list' })
+  await client.next()
+  assert.ok(calls.length >= 1, '投影查询应该被发起')
+  for (const args of calls) {
+    assert.equal(
+      args.length, 1,
+      `controller.list 只应收到 request 一个参数（不能传 AbortSignal），实际收到 ${String(args.length)} 个`,
+    )
+  }
+})
+
+/** 索引命中后的后台补全要限流：否则多端轮询把全量枚举变成常驻负载。 */
+test('索引命中后短时间内不重复开后台枚举', async t => {
+  const harness = await startHarness(t, {})
+  makeSession(harness, 's1', [])
+  const real = harness.ctx.sessionQuery.listSessions
+  let calls = 0
+  harness.ctx.sessionQuery.listSessions = () => { calls += 1; return real() }
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  // 第一次：冷缓存、空索引，必须真的枚举一次（走慢路径并填充索引）
+  client.send({ type: 'list' })
+  const first = await client.next(5_000)
+  assert.equal(first.type, 'sessions')
+  assert.equal(calls, 1)
+
+  // 等 4 秒列表缓存过期（否则第二次直接命中缓存，测不到后台补全）
+  await new Promise((resolve) => setTimeout(resolve, 4_300))
+
+  // 第二次：索引已有内容，应命中索引立即返回；且 30 秒限流窗口内
+  // 不再开后台全量枚举
+  client.send({ type: 'list' })
+  const second = await client.next(2_000)
+  assert.equal(second.type, 'sessions')
+  assert.deepEqual(second.sessions.map((s) => s.sessionId), ['s1'])
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(calls, 1, '限流窗口内的列表请求不应再次触发全量枚举')
+})
+
+/**
  * 会话列表查询超时必须发 error 帧，**不能发空 sessions**。
  *
  * 背景：`sessionQuery.listSessions()` 撞上 15 秒预算时，原先直接
@@ -1608,6 +1669,110 @@ test('会话列表超时发 error 帧而不是空 sessions', async t => {
  *
  * 所以过期后不能阻塞在慢查询上：先给已知数据，让新鲜度由后台那一次去追。
  */
+test('session/children 返回某个会话的子 agent', async t => {
+  const harness = await startHarness(t)
+  makeSession(harness, 'parent')
+  makeSession(harness, 'kid-a', [], { origin: 'subagent', parentSession: 'parent', delegationDepth: 1 })
+  makeSession(harness, 'kid-b', [], { origin: 'subagent', parentSession: 'parent', delegationDepth: 1 })
+  makeSession(harness, 'other', [], { origin: 'subagent', parentSession: 'parent-x' })
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  // 先让索引被填充（列表会走一次慢路径）
+  client.send({ type: 'list' })
+  await client.next(5_000)
+
+  client.send({ type: 'session/children', sessionId: 'parent' })
+  const reply = await client.next(5_000)
+  assert.equal(reply.type, 'session-children')
+  assert.equal(reply.sessionId, 'parent')
+  // 只返回这个父会话的，别的父会话的子 agent 不能混进来
+  assert.deepEqual(reply.children.map((c) => c.sessionId).sort(), ['kid-a', 'kid-b'])
+})
+
+/**
+ * 标题补齐走的是**直接读日志**这条路，不是 `readSession`。
+ *
+ * 实测过为什么：`readTitleSnapshots` / `readSession` 都要重放整个事件流做
+ * 投影，单条 > 8s / > 1.5s，日志里刷满 timed out；而直接读 `.zstd` + 多帧
+ * 解压只要 21ms，差 400 倍。所以测试里造一个假的日志文件，验证真路径。
+ */
+test('子会话没有 header 标题时，从日志的 session/title 事件补上', async t => {
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  // 造一个真实布局：$DSH_HOME/sessions/<slug>/<id>/session.v4.jsonl.zstd
+  // 用临时 DSH_HOME，绝不碰用户的真实会话目录
+  const home = await mkdtemp(join(tmpdir(), 'dshell-home-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  })
+  const slug = '--work--'
+  const dir = join(home, 'sessions', slug, 'kid')
+  mkdirSync(dir, { recursive: true })
+  const jsonl = [
+    JSON.stringify({ type: 'session', version: 4, id: 'kid', cwd: '/work', createdAt: 1_000 }),
+    '{"type":"session/title","seq":1,"data":{"title":"帮我查一下 Cisco 固件"}}',
+  ].join('\n')
+  const { zstdCompressSync } = await import('node:zlib')
+  writeFileSync(join(dir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(jsonl)))
+
+  const harness = await startHarness(t)
+  makeSession(harness, 'parent')
+  makeSession(harness, 'kid', [], { origin: 'subagent', parentSession: 'parent', cwd: '/work', delegationDepth: 1 })
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'list' })
+  await client.next(5_000)
+
+  client.send({ type: 'session/children', sessionId: 'parent' })
+  const reply = await client.next(5_000)
+  assert.equal(reply.children.length, 1)
+  assert.equal(reply.children[0].title, '帮我查一下 Cisco 固件')
+})
+
+test('子会话既没标题也没用户消息时，不编造标题', async t => {
+  const harness = await startHarness(t)
+  makeSession(harness, 'parent')
+  makeSession(harness, 'kid', [], { origin: 'subagent', parentSession: 'parent' })
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'list' })
+  await client.next(5_000)
+
+  client.send({ type: 'session/children', sessionId: 'parent' })
+  const reply = await client.next(5_000)
+  // 没标题就是没有这个字段——客户端会退化成显示 ID 前 8 位，
+  // 而不是显示一个编出来的假标题
+  assert.equal(reply.children[0].title, undefined)
+})
+
+test('session/children 缺 sessionId 时报 BAD_REQUEST 而不是崩', async t => {
+  const harness = await startHarness(t)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  client.send({ type: 'session/children' })
+  const reply = await client.next(5_000)
+  assert.equal(reply.type, 'error')
+  assert.equal(reply.code, 'BAD_REQUEST')
+})
+
 test('缓存过期后先返回旧列表而不是阻塞在慢查询上', async t => {
   const harness = await startHarness(t, { sessionListTimeoutMs: 5_000 })
   makeSession(harness, 's1', [])

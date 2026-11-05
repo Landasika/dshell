@@ -52,6 +52,7 @@ import {
   type WorkspaceSummary,
 } from '../protocol/index.js'
 import { resolveDshHome, resolveSocketPath } from '../shared/paths.js'
+import { zstdDecompressSync } from 'node:zlib'
 import { latestUserPreview } from '../shared/session-events.js'
 import { advanceModelSelection, readModelSelection, type ModelSelectionState } from '../shared/model-selection.js'
 import { DeviceStore, PairCodes, hostName } from './devices.js'
@@ -301,7 +302,8 @@ interface SessionControllerLike extends HarnessHistoryOwner {
   selectModel(request: ModelSelection & { sessionId: string }): Promise<{ selected: ModelSelection }>
   list?(
     request: { cursor?: string },
-    signal: AbortSignal,
+    /** dshell 不传：abort 传进 host 查询链会把 host 打死（见 listSessionsFresh）。 */
+    signal?: AbortSignal,
   ): Promise<{ items: readonly { sessionId: string; updatedAt: number; running?: boolean }[] }>
 }
 
@@ -692,6 +694,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const PREVIEW_CACHE_MS = 300_000
   const PREVIEW_ROWS = 24
   const PREVIEW_BUDGET_MS = 1_500
+  /** 索引命中后的后台全量补全最小间隔：多端轮询不该把枚举变成常驻负载。 */
+  const BACKGROUND_LIST_INTERVAL_MS = 30_000
+  /** 上次全量枚举发起时刻（含直查与启动预热）；后台补全按它限流。 */
+  let lastFreshListAt = 0
 
   /**
    * @returns 会话摘要列表；**`null` 表示这次查不到**（底层查询超时/抛错）。
@@ -708,6 +714,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * 互相叠加，把整个 host 拖死。
    */
   const inflightList = new Map<string, Promise<SessionSummary[] | null>>()
+
+  /** 开一轮后台全量枚举，登记进 [inflightList] 去重。 */
+  const spawnBackgroundList = (
+    workspaceId: string | undefined,
+    includeArchived: boolean,
+    cacheKey: string,
+  ): Promise<SessionSummary[] | null> =>
+    // host 把任何 unhandledRejection 当致命错误 exit(1)，后台任务必须就地吞拒绝。
+    listSessionsFresh(workspaceId, includeArchived)
+      .catch((): SessionSummary[] | null => null)
+      .finally(() => { inflightList.delete(cacheKey) })
 
   /**
    * 从轻索引直接构造列表（毫秒级）。
@@ -764,12 +781,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (indexPrimed) {
       const fromIndex = await listSessionsFromIndex(workspaceId, includeArchived)
       if (fromIndex !== undefined) {
-        if (!inflightList.has(cacheKey)) {
-          const job = listSessionsFresh(workspaceId, includeArchived).finally(() => {
-            inflightList.delete(cacheKey)
-          })
-          inflightList.set(cacheKey, job)
-          void job
+        if (!inflightList.has(cacheKey) && Date.now() - lastFreshListAt >= BACKGROUND_LIST_INTERVAL_MS) {
+          inflightList.set(cacheKey, spawnBackgroundList(workspaceId, includeArchived, cacheKey))
         }
         return fromIndex
       }
@@ -784,12 +797,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // 后台那次刷新去追。列表是元数据摘要，晚几秒完全可以接受；
     // "突然变空"则完全不可接受。
     if (cached !== undefined) {
-      if (!inflightList.has(cacheKey)) {
-        const job = listSessionsFresh(workspaceId, includeArchived).finally(() => {
-          inflightList.delete(cacheKey)
-        })
-        inflightList.set(cacheKey, job)
-        void job
+      if (!inflightList.has(cacheKey) && Date.now() - lastFreshListAt >= BACKGROUND_LIST_INTERVAL_MS) {
+        inflightList.set(cacheKey, spawnBackgroundList(workspaceId, includeArchived, cacheKey))
       }
       return cached.sessions
     }
@@ -799,6 +808,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   /** 真正去枚举会话的那条慢路径（14~15 秒）。结果会写进 [sessionCache]。 */
   const listSessionsFresh = async (workspaceId?: string, includeArchived = false): Promise<SessionSummary[] | null> => {
     const cacheKey = `${workspaceId ?? ''}:${includeArchived ? 'archived' : 'active'}`
+    lastFreshListAt = Date.now()
     /**
      * 两条查询**并行**发起。
      *
@@ -812,38 +822,20 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
      * "两段之和"降到"两段之中较慢的那段"。
      */
     const recordsPromise = withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
+    /**
+     * 投影与 records 并行，但**绝不把 AbortSignal 传进 host**：host 把任何
+     * unhandledRejection 当致命错误 exit(1)，而 abort 会在它的查询链深处
+     * 产生没人接住的拒绝。预算用本地赛跑表达——withTimeout 超时只是不等
+     * 投影（projectionOk=false，status 置"未知"），查询让它在 host 里跑完。
+     */
     const controllerPromise = (() => {
       const controller = sessionController()
       if (controller?.list === undefined) return undefined
-      const abort = new AbortController()
-      const timer = setTimeout(() => abort.abort(), 4_000)
-      // 注意：`abort` 只在 `controller.list` 的循环里被检查，卡住它的是循环
-      // **之前**的那次 `listSessions()`，所以 4 秒超时并不保证生效。这里
-      // 仍然保留它（能省则省），但不再依赖它兜底——并行本身已经消除了
-      // "等两遍"的问题。
-      const promise = controller.list({}, abort.signal)
-        .then((listed: { items?: readonly { sessionId?: unknown; updatedAt?: unknown; running?: unknown }[] }) => {
-          const result: { activity: Map<string, number>; runningIds: Set<string> } = {
-            activity: new Map(),
-            runningIds: new Set(),
-          }
-          for (const item of listed.items ?? []) {
-            if (typeof item?.sessionId === 'string' && typeof item.updatedAt === 'number') {
-              result.activity.set(item.sessionId, item.updatedAt)
-            }
-            if (typeof item?.sessionId === 'string' && item.running === true) {
-              result.runningIds.add(item.sessionId)
-            }
-          }
-          return result
-        })
-        .finally(() => { clearTimeout(timer) })
-      return promise
+      return withTimeout(controller.list({}), SESSION_LIST_TIMEOUT_MS, 'session projection')
     })()
     const records = await recordsPromise
     if (records === undefined) {
-      // records 失败时 controller 可能还在跑；让它自己结束，别等它。
-      void controllerPromise?.catch(() => undefined)
+      // records 失败时投影还在后台跑；withTimeout 自己兜错，让它自然结束。
       return null
     }
     const archived = new Set(ctx.workspaceRegistry?.archivedSessionIds ?? [])
@@ -852,7 +844,6 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // without it the picker falls back to the creation time.
     const activity = new Map<string, number>()
     const runningIds = new Set<string>()
-    const controller = sessionController()
     /**
      * `controller.list()` 有没有拿到**可用**结果。
      *
@@ -868,16 +859,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
      */
     let projectionOk = controllerPromise === undefined
     if (controllerPromise !== undefined) {
-      try {
-        const result = await controllerPromise
-        for (const [id, updatedAt] of result.activity) activity.set(id, updatedAt)
-        for (const id of result.runningIds) runningIds.add(id)
+      const listed = await controllerPromise
+      if (listed !== undefined) {
+        for (const item of listed.items ?? []) {
+          if (typeof item?.sessionId === 'string' && typeof item.updatedAt === 'number') {
+            activity.set(item.sessionId, item.updatedAt)
+          }
+          if (typeof item?.sessionId === 'string' && item.running === true) {
+            runningIds.add(item.sessionId)
+          }
+        }
         projectionOk = true
-      } catch {
-        // Activity is presentation metadata; a slow or missing projection must
-        // not keep the picker from showing the sessions.
-        // 但 status 必须保持"未知"，不能写成 idle（见 projectionOk 注释）。
-        projectionOk = false
       }
     }
     const lastActivity = (record: SessionRecordLike): number =>
@@ -1126,6 +1118,196 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     resuming.set(sessionId, operation)
     try { return (await operation).agent }
     finally { if (resuming.get(sessionId) === operation) resuming.delete(sessionId) }
+  }
+
+  /**
+   * 给子会话补标题（按需，只补请求里的那几条）。
+   *
+   * 子会话 header 没有 title，标题在事件流的 `session/title` 里。列表只给前
+   * 24 行解析标题，266 个子会话永远轮不到，所以索引里 title 全是空。
+   *
+   * 约束：
+   *  - **并发 4 路**：一次 readSession 要几百毫秒，73 个子会话串行要几十秒；
+   *  - **总预算 3 秒**：超时就放弃，宁可显示 ID 也不能让接口挂住；
+   *  - **补到就写回索引**：索引是追加式的，下次就不用再读日志了；
+   *  - **失败静默**：标题是展示信息，读不到不该影响这条子任务本身。
+   */
+  const childTitleCache = new Map<string, string>()
+
+  /**
+   * 从事件流里取会话标题。
+   *
+   * 两个来源，优先前者：
+   *  - `session/title` 事件 —— Host 自己算好并落盘的标题（实测存在，
+   *    形如 `{data:{title:"任务：在互联网上寻找…"}}`）；
+   *  - 第一条真实用户消息 —— 老会话可能没有 title 事件，用首行兜底。
+   *
+   * 两者都没有就返回 undefined，让调用方显示 ID 前 8 位，而不是编一个假标题。
+   */
+  const titleFromEvents = (events: readonly { type?: string; data?: unknown }[]): string | undefined => {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i]
+      if (event?.type !== 'session/title') continue
+      const data = event.data as { title?: unknown } | undefined
+      const title = typeof data?.title === 'string' ? data.title.trim() : ''
+      if (title.length > 0) return title
+    }
+    for (const event of events) {
+      if (event?.type !== 'user/message') continue
+      const data = event.data as { message?: { source?: { kind?: string } } } | undefined
+      const source = data?.message?.source
+      if (source?.kind !== 'user') continue
+      const text = latestUserPreview([event as never], { maxChars: 40 })
+      if (text !== undefined && text.length > 0) return text
+    }
+    return undefined
+  }
+
+  /**
+   * 给子会话补标题（按需，只补请求里的那几条）。
+   *
+   * ## 为什么需要这一步
+   *
+   * 子会话 header 里**没有 title 字段**（实测：只有 type/version/id/createdAt/
+   * cwd/isSeeded/delegationDepth/agentPreset），标题是后来从事件流的
+   * `session/title` 算出来的。而列表只给前 24 行解析标题，266 个子会话永远
+   * 轮不到——索引里 title 全是空。不补的话，App 里那 73 条子任务会显示成
+   * 一串 `session-xxx` ID，用户等于看到一列乱码。
+   *
+   * ## 为什么用 readTitleSnapshots 而不是 readSession
+   *
+   * 实测：`readSession` 要**投影整个事件流**，单条就超过 1.5 秒（日志里刷的
+   * 全是 `child title timed out after 1500ms`）。73 条串行要几分钟，并行也会
+   * 打爆投影存储——上游注释明确写了「projection store serializes snapshot
+   * reads」。`readTitleSnapshots` 是**只算标题**的专用路径，几百毫秒一条，
+   * 而且它内部有缓存。
+   *
+   * ## 约束
+   *
+   *  - **并发 6 路** + **总预算 12 秒**：补不到就放弃，宁可显示 ID 也不能
+   *    让接口挂住；
+   *  - **补到就写回索引**：索引是追加式的，下次不必再算；
+   *  - **失败静默**：标题是展示信息，读不到不该影响这条子任务本身。
+   */
+  /**
+   * 直接读会话日志里的 `session/title`，绕开 Host 的投影。
+   *
+   * ## 为什么不走 ctx.sessionQuery.readTitleSnapshots / readSession
+   *
+   * 实测（本机真实数据）：
+   *
+   * | 路径 | 单条耗时 |
+   * |---|---|
+   * | `readTitleSnapshots([id])` | **> 8000ms**（日志里刷满 `child title timed out`）|
+   * | `readSession(id)` | **> 1500ms**（同样超时）|
+   * | 直接读 `.zstd` + 多帧解压 | **21ms** |
+   *
+   * 差 400 倍。原因是那两个接口都走**投影存储**，而投影要重放整个事件流；
+   * 上游注释也写了「projection store serializes snapshot reads」。我们只
+   * 需要标题这一个字段，没必要为它付全量投影的代价。
+   *
+   * ## 多帧 zstd
+   *
+   * 会话日志是**增量追加的多帧 zstd 流**（实测这一份有 361 帧）。
+   * `zlib.zstdDecompressSync()` 只解**第一帧**就返回（这份只出 294 字节，
+   * 完整内容是 1162817 字节）。所以要按 magic `28 b5 2f fd` 切开逐帧解。
+   */
+  const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+  const inflateSessionLog = (buf: Buffer): Buffer => {
+    if (buf.length < 4 || !buf.subarray(0, 4).equals(MAGIC)) return buf
+    const chunks: Buffer[] = []
+    let pos = 0
+    while (pos < buf.length - 3) {
+      if (!buf.subarray(pos, pos + 4).equals(MAGIC)) { pos += 1; continue }
+      const next = buf.indexOf(MAGIC, pos + 4)
+      const end = next === -1 ? buf.length : next
+      try { chunks.push(zstdDecompressSync(buf.subarray(pos, end))) } catch { /* 坏帧跳过 */ }
+      pos = end
+    }
+    return Buffer.concat(chunks)
+  }
+
+  /** 在解出的 JSONL 里找 `session/title`，找不到就用第一条真实用户消息。 */
+  const titleFromLog = (text: string): string | undefined => {
+    let fallback: string | undefined
+    for (const line of text.split('\n', 400)) {
+      if (line.length === 0) continue
+      if (line.includes('"session/title"')) {
+        try {
+          const value = (JSON.parse(line) as { data?: { title?: unknown } }).data?.title
+          if (typeof value === 'string' && value.trim().length > 0) return value.trim()
+        } catch { /* 坏行跳过 */ }
+      }
+      if (fallback === undefined && line.includes('"user/message"')) {
+        const preview = latestUserPreview([JSON.parse(line) as never], { maxChars: 40 })
+        if (preview !== undefined && preview.length > 0) fallback = preview
+      }
+    }
+    return fallback
+  }
+
+  /** 子会话日志路径：`$DSH_HOME/sessions/<workspace>/<id>/session.v4.jsonl.zstd`。 */
+  const findSessionLog = (sessionId: string, cwd: string | undefined): string | undefined => {
+    const home = dshHome()
+    if (home === undefined) return undefined
+    const root = join(home, 'sessions')
+    const candidates: string[] = []
+    if (cwd !== undefined && cwd.length > 0) {
+      // 目录名规则：绝对路径把 `/` 和 `.` 换成 `-`，两端各补一个 `--`
+      const slug = `--${cwd.replace(/^\//, '').replace(/[^A-Za-z0-9]+/g, '-')}--`
+      candidates.push(join(root, slug, sessionId, 'session.v4.jsonl.zstd'))
+      candidates.push(join(root, slug, 'session-' + sessionId, 'session.v4.jsonl.zstd'))
+    }
+    for (const candidate of candidates) {
+      try { if (statSync(candidate).isFile()) return candidate } catch { /* 继续找 */ }
+    }
+    // 兜底：直接遍历（只在路径规则对不上时走，慢但正确）
+    try {
+      for (const dir of readdirSync(root)) {
+        const direct = join(root, dir, sessionId, 'session.v4.jsonl.zstd')
+        try { if (statSync(direct).isFile()) return direct } catch { /* 下一个 */ }
+        const prefixed = join(root, dir, 'session-' + sessionId, 'session.v4.jsonl.zstd')
+        try { if (statSync(prefixed).isFile()) return prefixed } catch { /* 下一个 */ }
+      }
+    } catch { /* 目录不存在 */ }
+    return undefined
+  }
+
+  const fillChildTitles = async (kids: SessionIndexRow[]): Promise<void> => {
+    const pending = kids.filter(kid => {
+      if (kid.title !== undefined && kid.title.length > 0) return false
+      const cached = childTitleCache.get(kid.sessionId)
+      if (cached !== undefined) {
+        kid.title = cached
+        return false
+      }
+      return true
+    })
+    if (pending.length === 0) return
+    const deadline = Date.now() + 12_000
+    const queue = [...pending]
+
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (Date.now() > deadline) return
+        const kid = queue.shift()
+        if (kid === undefined) return
+        try {
+          const file = findSessionLog(kid.sessionId, kid.cwd)
+          if (file === undefined) continue
+          const text = inflateSessionLog(readFileSync(file)).toString('utf8')
+          const title = titleFromLog(text)
+          if (title === undefined || title.length === 0) continue
+          kid.title = title
+          childTitleCache.set(kid.sessionId, title)
+          // 写回索引：追加式文件，新行覆盖旧行，下次不必再读日志
+          await sessionIndex().appendMany([{ ...kid, title }]).catch(() => undefined)
+        } catch {
+          // 标题是展示信息，读不到不影响这条子任务本身
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(6, queue.length) }, worker))
   }
 
   const sendError = (channel: Channel, error: ErrorMessage): void => {
@@ -2953,9 +3135,46 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
             sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'sessionId is required' })
             return
           }
+          const parentId = String(message.sessionId)
           const rows = await sessionIndex().rowsOf()
-          const children = [...rows.values()]
-            .filter(row => row.parentSessionId === message.sessionId)
+          let kids = [...rows.values()].filter(row => row.parentSessionId === parentId)
+          // 索引是**派生数据**，可能还没建立（刚启动、刚清过、或索引写入是
+          // fire-and-forget 异步的）。这时直接问一次会话记录，别让用户看到
+          // "这个会话没有子任务"——那是把"不知道"撒谎成"没有"。
+          if (kids.length === 0 && ctx.sessionQuery.listSessions !== undefined) {
+            const records = await withTimeout(
+              ctx.sessionQuery.listSessions(),
+              SESSION_LIST_TIMEOUT_MS,
+              'children fallback',
+            )
+            if (records !== undefined) {
+              kids = records
+                .filter(record => record.header.origin === 'subagent'
+                  && record.header.parentSession === parentId)
+                .map((record) => {
+                  const row: SessionIndexRow = {
+                    sessionId: String(record.header.id),
+                    origin: 'subagent',
+                    parentSessionId: parentId,
+                  }
+                  if (record.header.title !== undefined) row.title = record.header.title
+                  if (record.header.cwd !== undefined) row.cwd = record.header.cwd
+                  if (record.header.createdAt !== undefined) row.createdAt = record.header.createdAt
+                  if (record.header.delegationDepth !== undefined) row.delegationDepth = record.header.delegationDepth
+                  return row
+                })
+            }
+          }
+          // 子会话的 header 里**没有 title 字段**（实测确认：header 只有
+          // type/version/id/createdAt/cwd/isSeeded/delegationDepth/agentPreset），
+          // 标题是后来从事件流的 `session/title` 事件里算出来的。而列表只给
+          // 前 24 行解析标题，266 个子会话根本轮不到——索引里 title 全是空。
+          //
+          // 不补的话，App 里这 73 条子任务会显示成一串 `session-xxx` ID，
+          // 用户等于看到一列乱码。这里按需补：只补当前这个父会话的，
+          // 并发 4 路、总预算 3 秒，补不到的留空（绝不因此让整个请求挂掉）。
+          await fillChildTitles(kids)
+          const children = kids
             .map(row => ({
               sessionId: row.sessionId,
               ...(row.title === undefined ? {} : { title: row.title }),
