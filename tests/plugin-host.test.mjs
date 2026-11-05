@@ -238,9 +238,22 @@ async function startHarness(t, config = {}, services = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-plugin-'))
   const socketPath = join(directory, 'dshell.sock')
   const harness = createFakeCtx(services)
-  // 默认关掉启动预热：它会在 apply 返回后自己去查列表，抢在测试准备好
-  // 会话数据之前把空结果写进缓存，导致后续断言拿到空的。
-  await apply(harness.ctx, { warmSessionList: false, socketPath, ...config })
+  // 三条测试隔离（都是踩过的坑）：
+  //
+  // 1. warmSessionList: false —— 预热会在 apply 返回后自己去查列表，抢在
+  //    测试准备好会话数据之前把空结果写进缓存，害 10 个用例拿到空断言。
+  // 2. sessionIndexFile 指向本测试的临时目录 —— 默认路径是真实的
+  //    `$DSH_HOME/dshell-ws/session-index.jsonl`，不改的话测试会往用户的
+  //    生产索引里写，而且用例之间互相污染（索引是追加式文件，前一个用例
+  //    造出来的会话会出现在后一个用例的列表里）。
+  // 3. deviceFile 同理，别碰真实设备库。
+  await apply(harness.ctx, {
+    warmSessionList: false,
+    sessionIndexFile: join(directory, 'session-index.jsonl'),
+    deviceFile: join(directory, 'devices.json'),
+    socketPath,
+    ...config,
+  })
   t.after(async () => {
     for (const disposer of harness.disposers) await disposer?.()
     await rm(directory, { recursive: true, force: true })
