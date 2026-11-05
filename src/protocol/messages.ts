@@ -46,6 +46,19 @@ export const CAPABILITIES = [
    * 塞一整段历史进内存（几十条就卡死）。
    */
   'watch',
+  /**
+   * `state`：折叠好的状态快照（`{sessions:[{id,title,phase,updatedAt,preview}],
+   * running, waitingApproval, focus}`）。
+   *
+   * 为什么需要单独声明：这是"只想显示在不在跑"的客户端唯一划算的路子。
+   * 订阅广播（`watch`）拿到的是原始事件流——实测为了 0.2% 的 status，
+   * 要连带收下 99.8% 的 event+stream（9.92 MB/小时）。
+   * `state` 一条 5000 字节，3 秒一轮 5.72 MB/小时，还快 10 倍。
+   *
+   * 声明它，客户端才能探测"这台 Host 支持轻量状态吗"，而不是硬编码
+   * 试一次、失败了再退。
+   */
+  'state',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
