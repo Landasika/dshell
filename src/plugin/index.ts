@@ -105,6 +105,15 @@ export interface Config {
   /** Hard fail-closed deadline for an unanswered CLI approval. */
   approvalTimeoutMs?: number
   /**
+   * 会话列表查询的预算（毫秒），默认 15 秒。
+   *
+   * 超时会返回 `SESSION_LIST_TIMEOUT` 错误而不是空列表。做成可配主要是
+   * 为了测试能快速跑——正常部署不该动它。
+   */
+  sessionListTimeoutMs?: number
+  /** 启动后是否预热会话列表缓存，默认 true。测试里关掉以免抢占数据准备。 */
+  warmSessionList?: boolean
+  /**
    * Extra skill hubs (directories of `SKILL.md` bundles) served through
    * `ctx.skills`; `/skills` lists them alongside project and user skills.
    */
@@ -601,6 +610,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (!channel.alive) return
     try {
       const rows = await listSessions(undefined, false)
+      // 查不到就一个字节都别推：推一份空 `state` 会让宠物显示"什么都没在跑"，
+      // 而实际上只是这次查询超时了。宁可保持它上一帧。
+      if (rows === null) return
       if (!channel.alive) return
       const sessions = rows.slice(0, 30).map((row) => ({
         id: row.sessionId,
@@ -622,18 +634,59 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
   }
 
-  const SESSION_LIST_TIMEOUT_MS = 15_000
+  const SESSION_LIST_TIMEOUT_MS = config.sessionListTimeoutMs ?? 15_000
   const SESSION_CACHE_MS = 4_000
   const PREVIEW_CACHE_MS = 300_000
   const PREVIEW_ROWS = 24
   const PREVIEW_BUDGET_MS = 1_500
 
-  const listSessions = async (workspaceId?: string, includeArchived = false): Promise<SessionSummary[]> => {
+  /**
+   * @returns 会话摘要列表；**`null` 表示这次查不到**（底层查询超时/抛错）。
+   *
+   * `null` 和 `[]` 必须分开：前者是"不知道"，后者是"确认没有"。
+   * 原先超时直接 `return []`，于是把一次 15 秒的查询超时伪装成了
+   * "这台机器上一个会话都没有"——客户端首页因此显示空，而用户的
+   * 6 个 live 会话其实一直在跑。这不是降级，是**谎报**。
+   */
+  /**
+   * 后台刷新中的 key：避免多个调用方同时触发同一次慢查询。
+   *
+   * 枚举 249 个会话要十几秒，如果每个轮询/每个客户端都开一次，慢查询会
+   * 互相叠加，把整个 host 拖死。
+   */
+  const inflightList = new Map<string, Promise<SessionSummary[] | null>>()
+
+  const listSessions = async (workspaceId?: string, includeArchived = false): Promise<SessionSummary[] | null> => {
     const cacheKey = `${workspaceId ?? ''}:${includeArchived ? 'archived' : 'active'}`
     const cached = sessionCache.get(cacheKey)
     if (cached !== undefined && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions
+    // 陈旧但存在的数据：**先返回它**，同时后台刷新。
+    //
+    // 枚举一个 266MB / 1034 文件的 DSH home 要 14~15 秒，正好卡在预算边缘，
+    // 于是列表时好时坏（同一份数据，这一次 249 条，下一次超时变空）。
+    // 用户看到的就是"任务一会儿有一会儿没有"。
+    //
+    // 与其让每次刷新都赌这 15 秒，不如把已知数据先给出去，让新鲜度由
+    // 后台那次刷新去追。列表是元数据摘要，晚几秒完全可以接受；
+    // "突然变空"则完全不可接受。
+    if (cached !== undefined) {
+      if (!inflightList.has(cacheKey)) {
+        const job = listSessionsFresh(workspaceId, includeArchived).finally(() => {
+          inflightList.delete(cacheKey)
+        })
+        inflightList.set(cacheKey, job)
+        void job
+      }
+      return cached.sessions
+    }
+    return listSessionsFresh(workspaceId, includeArchived)
+  }
+
+  /** 真正去枚举会话的那条慢路径（14~15 秒）。结果会写进 [sessionCache]。 */
+  const listSessionsFresh = async (workspaceId?: string, includeArchived = false): Promise<SessionSummary[] | null> => {
+    const cacheKey = `${workspaceId ?? ''}:${includeArchived ? 'archived' : 'active'}`
     const records = await withTimeout(ctx.sessionQuery.listSessions(), SESSION_LIST_TIMEOUT_MS, 'session list')
-    if (records === undefined) return []
+    if (records === undefined) return null
     const archived = new Set(ctx.workspaceRegistry?.archivedSessionIds ?? [])
     const pinned = new Set(ctx.workspaceRegistry?.pinnedSessionIds ?? [])
     // The durable activity time comes from the Host's session list projection;
@@ -2665,12 +2718,27 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
           jsonLine(channel, { type: 'pong', time: Date.now() })
           return
         case 'list':
-        case 'session/list':
-          jsonLine(channel, {
-            type: 'sessions',
-            sessions: await listSessions(typeof message.workspaceId === 'string' ? message.workspaceId : undefined, message.includeArchived === true),
-          })
+        case 'session/list': {
+          const rows = await listSessions(
+            typeof message.workspaceId === 'string' ? message.workspaceId : undefined,
+            message.includeArchived === true,
+          )
+          // 查不到发 error 帧，**不发空 sessions**。
+          //
+          // 空 `sessions` 的意思是"这台机器上没有会话"，客户端会据此把首页清空；
+          // 而真实情况只是这次查询超时了。两种情况必须让客户端能分清，
+          // 否则用户看到的就是"任务全没了"，然后过一会儿又自己回来。
+          if (rows === null) {
+            sendError(channel, {
+              type: 'error',
+              code: 'SESSION_LIST_TIMEOUT',
+              message: `session list did not finish in time; sessions were not cleared`,
+            })
+            return
+          }
+          jsonLine(channel, { type: 'sessions', sessions: rows })
           return
+        }
         case 'workspaces':
           jsonLine(channel, { type: 'workspaces', workspaces: workspaceList() })
           return
@@ -3114,6 +3182,28 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     } catch {
       // Already gone.
     }
+  }
+
+  /**
+   * 启动预热：后台先跑一次会话列表。
+   *
+   * 冷启动那一次要 14~15 秒（枚举一个 266MB / 1034 文件的 DSH home），
+   * 正好卡在 15 秒预算边缘。若不预热，**第一个连上来的客户端**必然吃满
+   * 这 15 秒——App 冷启动就是白屏，宠物刚连上也是空的。
+   *
+   * 放在这里异步跑、不 await：握手和监听不该等它。预热失败也无所谓，
+   * 下一次真实请求会自己重试。
+   *
+   * **延迟一拍再跑**：`apply()` 返回后调用方往往紧接着准备数据（测试里
+   * 就是先 makeSession 再发 list）。若在这里同步抢跑，预热会把"还没有
+   * 会话"的空结果写进缓存，之后的请求全被这个空缓存挡住。
+   * 等一拍让调用方先把上下文就位，预热才有意义。
+   */
+  if (config.warmSessionList !== false) {
+    const warm = setTimeout(() => {
+      void listSessions(undefined, false).catch(() => undefined)
+    }, 2_000)
+    warm.unref?.()
   }
 
   ctx.effect(() => () => close())

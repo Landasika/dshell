@@ -238,7 +238,9 @@ async function startHarness(t, config = {}, services = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-plugin-'))
   const socketPath = join(directory, 'dshell.sock')
   const harness = createFakeCtx(services)
-  await apply(harness.ctx, { socketPath, ...config })
+  // 默认关掉启动预热：它会在 apply 返回后自己去查列表，抢在测试准备好
+  // 会话数据之前把空结果写进缓存，导致后续断言拿到空的。
+  await apply(harness.ctx, { warmSessionList: false, socketPath, ...config })
   t.after(async () => {
     for (const disposer of harness.disposers) await disposer?.()
     await rm(directory, { recursive: true, force: true })
@@ -1555,4 +1557,71 @@ test('投影失败的结果不进缓存，下一次请求能立刻拿到正确�
     'running',
     '投影失败的结果不能被缓存，否则切换主机后的 4 秒里一直是空的',
   )
+})
+
+/**
+ * 会话列表查询超时必须发 error 帧，**不能发空 sessions**。
+ *
+ * 背景：`sessionQuery.listSessions()` 撞上 15 秒预算时，原先直接
+ * `return []`，把"查不出来"伪装成"这台机器上没有会话"。客户端收到空列表
+ * 就把首页清空了——而用户那 6 个 live 会话其实一直在跑。
+ *
+ * 空列表和"没查到"必须让客户端能分清：前者该清空界面，后者该保留现有数据
+ * 并提示刷新失败。
+ */
+test('会话列表超时发 error 帧而不是空 sessions', async t => {
+  // 预算压到 100ms：这条测的是"超时走哪条分支"，不是真的等 15 秒
+  const harness = await startHarness(t, { sessionListTimeoutMs: 100 })
+  makeSession(harness, 's1', [])
+  // 让底层查询永远不返回，触发 15s 超时预算（用 fake timer 不好使，
+  // 这里直接卡住并靠测试超时兜底——见下面的短预算测试）
+  harness.ctx.sessionQuery.listSessions = () => new Promise(() => {})
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'list' })
+  const reply = await client.next(5_000)
+  assert.equal(reply.type, 'error', '超时必须报错，不能假装成功')
+  assert.equal(reply.code, 'SESSION_LIST_TIMEOUT')
+})
+
+/**
+ * 缓存过期后要**先返回旧数据**，同时后台刷新。
+ *
+ * 枚举一个大的 DSH home 要 14~15 秒（实测 249 个会话 / 266MB），正好卡在
+ * 15 秒预算边缘，于是同一份数据时好时坏：这一次 249 条，下一次超时变空。
+ * 用户看到的就是"任务一会儿有一会儿没有"。
+ *
+ * 所以过期后不能阻塞在慢查询上：先给已知数据，让新鲜度由后台那一次去追。
+ */
+test('缓存过期后先返回旧列表而不是阻塞在慢查询上', async t => {
+  const harness = await startHarness(t, { sessionListTimeoutMs: 5_000 })
+  makeSession(harness, 's1', [])
+  const real = harness.ctx.sessionQuery.listSessions
+  let calls = 0
+  harness.ctx.sessionQuery.listSessions = () => { calls += 1; return real() }
+
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+
+  // 第一次：冷缓存，必须真的查一次
+  client.send({ type: 'list' })
+  const first = await client.next(5_000)
+  assert.equal(first.type, 'sessions')
+  assert.equal(calls, 1)
+
+  // 让 4 秒缓存过期
+  await new Promise((resolve) => setTimeout(resolve, 4_200))
+
+  // 第二次：缓存已过期，但应立刻返回旧数据，不被慢查询阻塞
+  const startedAt = Date.now()
+  client.send({ type: 'list' })
+  const second = await client.next(2_000)
+  const elapsed = Date.now() - startedAt
+  assert.equal(second.type, 'sessions', '过期后仍要给出数据，不能因为刷新中而报错')
+  assert.deepEqual(second.sessions.map((s) => s.sessionId), ['s1'])
+  assert.ok(elapsed < 2_000, `应立刻返回旧数据（实际 ${String(elapsed)}ms）`)
 })

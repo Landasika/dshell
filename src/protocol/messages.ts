@@ -55,6 +55,14 @@ export type DshellErrorCode =
   | 'SKILLS_FAILED'
   | 'SKILL_MISSING'
   | 'BAD_REQUEST'
+  /**
+   * 会话列表查询超时（底层 `sessionQuery.listSessions()` 没在预算内返回）。
+   *
+   * 单独一个码而不是复用 `INTERNAL`，是因为它的**处置方式完全不同**：
+   * 这代表"这次没查到"，不是"没有会话"。客户端收到它应当保留现有列表、
+   * 提示刷新失败，而**不是把界面清空**。
+   */
+  | 'SESSION_LIST_TIMEOUT'
   | 'INTERNAL'
 
 /** One provider/model route the Host can run. */
