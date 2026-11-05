@@ -7,6 +7,7 @@ import { resolveSocketPath } from '../shared/paths.js'
 import { packageVersion } from '../shared/package.js'
 import { printEvent, printSessions, printWorkspaces, isTurnEnd, turnFailed } from './output.js'
 import { runDoctor } from './doctor.js'
+import { decideRestart, isAffirmative } from './restart.js'
 import { runTui } from '../tui/app.js'
 import { runPrint, type OutputFormat } from './print.js'
 
@@ -38,6 +39,8 @@ interface Options {
   noService?: boolean
   /** (install) 只建服务。 */
   serviceOnly?: boolean
+  /** (restart) 跳过确认。 */
+  yes?: boolean
 }
 
 const HELP = `dshell ${packageVersion()}
@@ -57,6 +60,7 @@ Usage:
   dshell cancel <sessionId>
   dshell remote [--port 8792]        show a pairing QR code for the phone App
   dshell install [--profile dshell]  install the plugin + host service into a profile
+  dshell restart [--yes]             re-exec the Host (kills running turns)
 
 Options:
   --socket <path>     override the control socket
@@ -71,6 +75,7 @@ Options:
   --dry-run           (install) report what would change, write nothing
   --no-service        (install) only touch the profile, leave systemd alone
   --service-only      (install) only create the systemd unit
+  -y, --yes           (restart) skip the confirmation prompt
   -p, --print         one-shot mode; prompt from args or stdin
   --output-format <f> text | json | stream-json (default: text)
   --json              shorthand for --output-format json
@@ -104,6 +109,7 @@ function parseArgs(argv: string[]): Options {
   let dryRun = false
   let noService = false
   let serviceOnly = false
+  let yes = false
   let timeoutMs = 120_000
   let verbose = false
   let resume: string | undefined
@@ -218,6 +224,10 @@ function parseArgs(argv: string[]): Options {
       serviceOnly = true
       continue
     }
+    if (arg === '--yes' || arg === '-y') {
+      yes = true
+      continue
+    }
     if (arg === '--port') {
       const value = Number(argv[index + 1])
       if (!Number.isInteger(value) || value <= 0 || value > 65535) {
@@ -277,6 +287,7 @@ function parseArgs(argv: string[]): Options {
     ...(dryRun ? { dryRun } : {}),
     ...(noService ? { noService } : {}),
     ...(serviceOnly ? { serviceOnly } : {}),
+    ...(yes ? { yes } : {}),
   }
 }
 
@@ -308,6 +319,80 @@ function waitForInterrupt(): Promise<void> {
     process.once('SIGINT', done)
     process.once('SIGTERM', done)
   })
+}
+
+/**
+ * 重启 Host（`host/restart`，Host 会 re-exec 自己）。
+ *
+ * **这是有损操作**：Host 收到请求后立刻 `close()` 再 `process.exit(0)`，
+ * 不等任何在跑的 turn 收尾。所以：
+ *
+ * - 默认要交互确认，`--yes` 才跳过（脚本用）；
+ * - 非 TTY 且没给 `--yes` 时直接拒绝，而不是默默执行——CI 里误触一次
+ *   就会把别人的会话打断；
+ * - 请求返回后连接可能立刻断，这**是成功的信号**而不是错误，所以只
+ *   尝试等新 Host 起来，等不到也不报失败（它可能由 systemd 接管）。
+ */
+async function restart(socketPath: string, yes: boolean): Promise<void> {
+  const decision = decideRestart(yes, input.isTTY === true)
+  if (decision.kind === 'refuse') throw new DshellError('BAD_REQUEST', decision.reason)
+  if (decision.kind === 'confirm') {
+    const rl = createInterface({ input, output })
+    try {
+      const answer = await rl.question(
+        '这将重启 Host，并终止所有正在运行的会话（含当前 TUI）。继续？[y/N] ',
+      )
+      if (!isAffirmative(answer)) {
+        console.error('dshell: 已取消')
+        return
+      }
+    } finally {
+      rl.close()
+    }
+  }
+
+  const backend = new SocketBackend(socketPath)
+  let info: { pid: number; argv: string[] } | undefined
+  try {
+    await backend.connect()
+    info = await backend.restartHost()
+  } catch (error) {
+    // Host 在处理请求的过程中就退出了：socket 会先断。对重启来说这不是失败。
+    const message = error instanceof Error ? error.message : String(error)
+    if (!/closed|ECONNRESET|EPIPE|disconnected/iu.test(message)) throw error
+  } finally {
+    await backend.disconnect().catch(() => undefined)
+  }
+
+  if (info !== undefined) {
+    console.log(`dshell: Host (pid ${info.pid}) 已请求重启`)
+    console.log(`        ${process.execPath} ${info.argv.join(' ')}`)
+  } else {
+    console.log('dshell: Host 已重启')
+  }
+
+  // 等新 Host 把 socket 重新绑起来。等不到不算失败：如果 Host 由 systemd
+  // 托管，重启后可能过几秒才可用，也可能被 Restart= 策略接管。
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 400))
+    const probe = new SocketBackend(socketPath)
+    try {
+      await probe.connect()
+      const caps = probe.capabilities()
+      // 报出这次升级真正关心的两项：它们决定新版接口在不在。
+      const features = [
+        caps.list ? 'list' : undefined,
+        'sessionChildren' in caps && caps.sessionChildren ? 'session-children' : undefined,
+      ].filter((name): name is string => name !== undefined)
+      console.log(`dshell: 新 Host 已就绪${features.length === 0 ? '' : `（${features.join('、')}）`}`)
+      await probe.disconnect().catch(() => undefined)
+      return
+    } catch {
+      await probe.disconnect().catch(() => undefined)
+    }
+  }
+  console.log('dshell: 新 Host 暂未就绪（可能由 systemd 接管，稍后可用 `dshell doctor` 检查）')
 }
 
 async function workspaces(socketPath: string): Promise<void> {
@@ -634,6 +719,9 @@ export async function main(argv: string[]): Promise<void> {
       }
       case 'doctor':
         process.exitCode = await runDoctor(socketPath)
+        return
+      case 'restart':
+        await restart(socketPath, options.yes === true)
         return
       case 'list':
       case 'sessions':
