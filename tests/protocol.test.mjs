@@ -39,6 +39,9 @@ test('protocol v2 advertises the P3 capabilities', () => {
       'agents',
       'session-children',
       'session-index',
+      // 只订阅广播、不推历史。多端同步靠它：手机要看见"电脑终端上那条
+      // 会话开始跑了"，就必须 watch；用 attach 替代会每条都读日志 + 拉历史。
+      'watch',
     ],
   )
 })

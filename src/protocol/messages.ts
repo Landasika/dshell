@@ -35,6 +35,17 @@ export const CAPABILITIES = [
   'session-children',
   /** `session/index-stats`：轻索引与保留期的只读报表。 */
   'session-index',
+  /**
+   * `watch` / `unwatch`：订阅广播但**不推历史**。
+   *
+   * 协议里这两个消息一直存在，但能力表里没声明——客户端没法可靠地探测
+   * "这台 Host 支持只订阅不拉历史吗"，只能盲发然后等未知消息错误。
+   *
+   * 这个能力对多端同步是必需的：手机要看见"电脑终端上那条会话开始跑了"，
+   * 就必须订阅它；而为了看状态去 attach 每条会话，代价是每条都读日志 +
+   * 塞一整段历史进内存（几十条就卡死）。
+   */
+  'watch',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
