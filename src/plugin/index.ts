@@ -610,6 +610,39 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   /** Running-session input state, cached with the same TTL as the list. */
   const activePrompt = new Map<string, string>()
   const pendingInput = new Map<string, { at: number; value: 'approval' | 'question' | undefined }>()
+  /**
+   * 「此刻正在等用户」的会话集合，按原因分开。
+   *
+   * 存在的唯一理由是性能：列表要为 257 个会话各判一次，而
+   * `approvals.snapshot()` 每次都要摊一遍 pending 表。用集合把查询降到 O(1)。
+   *
+   * 这两个集合是**派生缓存**，真相在 `approvals` / `questionRequests` 里；
+   * 只要在开始和结束两端都维护，就不会漂。
+   */
+  const waitingApproval = new Set<string>()
+  const waitingQuestion = new Set<string>()
+  /**
+   * 严格排队：用户按"排队"发的消息**先留在这里**，等当前回合真的结束了
+   * 才交给内核。
+   *
+   * 为什么不能直接丢给内核：内核 `dsh-agent-loop` 的 `preStep` 每个 step 都会
+   * 调用 `inbox.claim('next-turn', ...)`，而 `claim` 会顺手吃掉 1 条
+   * next-turn。step 的粒度是**一次工具调用**，不是一轮对话——于是一轮里
+   * 几十个 step 中随便哪一个都会把排队消息捎走，"排队"变成了"下一步就插进去"。
+   *
+   * 实测：发一条排队消息后 0.0 秒就收到 `agent/inbox/spliced target=next-turn`，
+   * 再 0.0 秒就 accepted，用户在手机上连撤回的窗口都没有。
+   *
+   * 所以这里把它截下来，按 FIFO 存在插件侧；监听 `turn/end` / `turn/failed`，
+   * 回合真正收尾了才按顺序投递。
+   */
+  interface DeferredPrompt {
+    requestId: string
+    content: PromptContentPart[]
+    sessionId: string
+    channel: Channel
+  }
+  const deferredQueue = new Map<string, DeferredPrompt[]>()
   const titleCache = new Map<string, { at: number; title: string }>()
   const previewCache = new Map<string, { at: number; preview: string }>()
   /**
@@ -642,13 +675,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       // 而实际上只是这次查询超时了。宁可保持它上一帧。
       if (rows === null) return
       if (!channel.alive) return
-      const sessions = rows.slice(0, 30).map((row) => ({
-        id: row.sessionId,
-        title: row.title ?? '',
-        phase: phaseOf(row),
-        updatedAt: row.updatedAt ?? row.createdAt ?? 0,
-        preview: row.preview ?? '',
-      }))
+      const sessions = rows.slice(0, 30).map((row) => {
+        const perms = permissionsOf(row.sessionId)
+        return {
+          id: row.sessionId,
+          title: row.title ?? '',
+          phase: phaseOf(row),
+          updatedAt: row.updatedAt ?? row.createdAt ?? 0,
+          preview: row.preview ?? '',
+          // 带上待决审批的 requestId，客户端才能**不 attach** 就画出可点的
+          // 审批卡。没有它的话，state 只能说"这条在等审批"，却点不了。
+          ...(perms.length === 0 ? {} : { permissions: perms }),
+        }
+      })
       jsonLine(channel, {
         type: 'state',
         sessions,
@@ -736,6 +775,98 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * `running` / `status` 这类"此刻状态"索引给不了，保持 `undefined`
    * （= 不知道），而不是写成 `idle`（= 确认没在跑）。
    */
+  /**
+   * 「这个会话此刻是不是在等人」——纯内存判断，O(1)，不读文件。
+   *
+   * 两处调用方（索引主路径、慢路径）都要用它。之前只有慢路径有推断逻辑，
+   * 而索引命中时根本走不到慢路径，所以手机首页永远拿不到 needsInput。
+   */
+  /**
+   * 把待决审批转成列表可以直接下发的形状。
+   *
+   * `snapshot()` 的内部消息是发给 watcher 的完整 `approval-request`，
+   * 字段比列表需要的多（含 callId 等），这里只挑客户端画卡和作答必需的。
+   */
+  const permissionsOf = (sessionId: string): NonNullable<SessionSummary['permissions']> =>
+    approvals.snapshot(sessionId).map((raw) => {
+      const message = raw as { requestId: string; toolName?: string; reason?: string; expiresAt?: number }
+      return {
+        requestId: message.requestId,
+        ...(message.toolName === undefined ? {} : { toolName: message.toolName }),
+        ...(message.reason === undefined ? {} : { reason: message.reason }),
+        ...(message.expiresAt === undefined ? {} : { expiresAt: message.expiresAt }),
+      }
+    })
+
+  /**
+   * 放行一条排队消息。
+   *
+   * 一次只放一条，且只在回合确实结束（`agent.status !== 'running'`）时才放：
+   * 连放两条的话，内核会在新回合的第一个 step 里把第二条也 claim 走，
+   * 于是"排队"又退化回"插队"。
+   */
+  const flushDeferred = async (sessionId: string): Promise<void> => {
+    const list = deferredQueue.get(sessionId)
+    if (list === undefined || list.length === 0) return
+    const agent = ctx.agents.get(sessionId)
+    if (agent === undefined) {
+      // 会话没了（被删/进程重启），留着只会一直占内存。
+      deferredQueue.delete(sessionId)
+      return
+    }
+    if (agent.status === 'running') return
+    const next = list.shift()
+    if (next === undefined) return
+    if (list.length === 0) deferredQueue.delete(sessionId)
+    try {
+      const controller = sessionController()
+      if (controller?.prompt) {
+        await controller.prompt(
+          { sessionId: next.sessionId, requestId: next.requestId, mode: 'queue', content: next.content },
+          new AbortController().signal,
+        )
+      } else {
+        const text = next.content
+          .filter((part): part is Extract<PromptContentPart, { type: 'text' }> => part.type === 'text')
+          .map(part => part.text)
+          .join('\n')
+        agent.followup({
+          id: next.requestId,
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: { kind: 'user', rpcId: next.requestId },
+        })
+      }
+      if (next.channel.alive) {
+        jsonLine(next.channel, {
+          type: 'accepted',
+          sessionId: next.sessionId,
+          requestId: next.requestId,
+          mode: 'queue',
+          promoted: true,
+        })
+      }
+    } catch (error) {
+      if (next.channel.alive) {
+        sendError(next.channel, {
+          type: 'error',
+          code: 'QUEUE_DELIVERY_FAILED',
+          message: error instanceof Error ? error.message : 'queued prompt could not be delivered',
+        })
+      }
+    }
+  }
+
+  const liveInputOf = (sessionId: string): 'approval' | 'question' | undefined => {
+    // 注意：不要写成 `approvals.snapshot(sessionId).length > 0`。
+    // snapshot 内部是 [...pending.values()].filter(...)，对每个会话都摊一次
+    // 整张表；列表有 257 个会话时就是 257 次无谓遍历。这里用一个按会话
+    // 累加的集合，查询是 O(1)。
+    if (waitingApproval.has(sessionId)) return 'approval'
+    if (waitingQuestion.has(sessionId)) return 'question'
+    return undefined
+  }
+
   const listSessionsFromIndex = async (
     workspaceId: string | undefined,
     includeArchived: boolean,
@@ -774,6 +905,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         summary.status = liveStatus
         if (liveStatus === 'running') summary.running = true
       }
+      // 同上：索引路径是主路径，必须也带上「有人在等你」。
+      // 这里查的是两张内存表（O(1)、无 IO），不是读会话文件，所以不会
+      // 把这条毫秒级路径拖慢。
+      const waiting = liveInputOf(row.sessionId)
+      if (waiting !== undefined) summary.needsInput = waiting
+      const pendingPerms = permissionsOf(row.sessionId)
+      if (pendingPerms.length > 0) summary.permissions = pendingPerms
       summary.persisted = true
       if (row.preview !== undefined && row.preview.length > 0) summary.preview = row.preview
       sessions.push(summary)
@@ -994,6 +1132,16 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // (an idle turn cannot hold a live approval or question): an unanswered
     // approval/asked or a dangling ask_user_question call inside the open turn.
     const needsInputOf = (sessionId: string): Promise<'approval' | 'question' | undefined> => {
+      // 先问**实时表**，这是 O(1) 且永远准确的。
+      //
+      // 原来只靠读会话尾部事件推断，而那条路被 `session.running !== true`
+      // 挡着（等审批的会话 running 恰好是 false），于是永远推不出来。
+      // 现在直接看两个内存表：
+      //   - approvals   ：有人等你批准（ApprovalCoordinator 里挂着待决请求）
+      //   - questionRequests：有人等你回答问题（ask_user_question 还阻塞着）
+      // 这两张表只在真的有人等的时候才有条目，比读事件快且准。
+      const live = liveInputOf(sessionId)
+      if (live !== undefined) return Promise.resolve(live)
       const pending = pendingInput.get(sessionId)
       if (pending !== undefined && Date.now() - pending.at < SESSION_CACHE_MS) return Promise.resolve(pending.value)
       return withTimeout(ctx.sessionQuery.readSession(sessionId), 2_000, 'session tail').then((snapshot) => {
@@ -1023,9 +1171,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       }).catch(() => undefined)
     }
     await Promise.all(sessions.map(async (session) => {
-      if (session.running !== true) return
       const needs = await needsInputOf(session.sessionId)
       if (needs !== undefined) session.needsInput = needs
+      const pendingPerms = permissionsOf(session.sessionId)
+      if (pendingPerms.length > 0) session.permissions = pendingPerms
     }))
     const previewOf = async (sessionId: string): Promise<string | undefined> => {
       const cachedPreview = previewCache.get(sessionId)
@@ -2470,6 +2619,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const pending = questionRequests.get(callId)
     if (pending === undefined) return false
     questionRequests.delete(callId)
+    // 同一会话可能同时挂多条提问，所以只在最后一条也结束时才把会话移出集合，
+    // 否则早退一条就会让列表误报「没人等了」。
+    if (![...questionRequests.values()].some((entry) => entry.sessionId === pending.sessionId)) {
+      waitingQuestion.delete(pending.sessionId)
+    }
+    pendingInput.delete(pending.sessionId)
     settledAsks.add(callId)
     if (settledAsks.size > 200) {
       const oldest = settledAsks.values().next().value
@@ -2576,6 +2731,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         },
       }
       questionRequests.set(callId, questionEntry)
+      // 与审批同理：只要这条提问还挂着，列表就应把该会话标成「等人回答」。
+      waitingQuestion.add(questionEntry.sessionId)
       if (signal?.aborted === true) {
         onAbort()
         return
@@ -2867,6 +3024,18 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       ? message.requestId
       : `dshell-${randomUUID()}`
 
+    // ── 严格排队：回合还开着就先扣下 ──
+    //
+    // `mode: 'steer'`（"插一句"）不排队——它的语义本来就是立刻插进当前回合，
+    // 那个不受影响。只有 `queue` 需要等到回合结束。
+    if (mode === 'queue' && agent.status === 'running') {
+      const list = deferredQueue.get(message.sessionId) ?? []
+      list.push({ requestId, content, sessionId: message.sessionId, channel })
+      deferredQueue.set(message.sessionId, list)
+      jsonLine(channel, { type: 'accepted', sessionId: message.sessionId, requestId, mode, deferred: true })
+      return
+    }
+
     if (message.requireIdle === true) {
       const snapshot = agent.status === undefined ? await ctx.sessionQuery.readSession(message.sessionId) : undefined
       if (agent.status === 'running' || (snapshot && openTurn(snapshot.events)) || (agent.inbox?.nextTurn.length ?? 0) > 0 || (agent.inbox?.nextStep.length ?? 0) > 0) {
@@ -2956,6 +3125,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       } else agent.cancel({ kind: 'user' })
     }
     const subagents = message.killSubagents === true ? await cancelSubagents(message.sessionId) : 0
+    // 终止之后，排队的消息该不该继续跑？
+    //
+    // 旧行为是"终止 = 连排队一起清掉"：用户按了停止，队列里那条既没发出去、
+    // 也不报错，气泡在界面上永远挂着——这就是"终止之后排队的消息发不出去"。
+    //
+    // 现在的默认：**保留**。`continueQueued === false` 才是显式要求清空。
+    // 注意这里的延迟队列要一并处理，否则终止后它会永远卡在插件侧。
+    const cancelSid = message.sessionId
+    if (message.continueQueued === false) {
+      deferredQueue.delete(cancelSid)
+    } else {
+      queueMicrotask(() => { void flushDeferred(cancelSid) })
+    }
     jsonLine(channel, {
       type: 'cancelled',
       sessionId: message.sessionId,
@@ -2993,6 +3175,24 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (typeof message.sessionId !== 'string' || typeof message.requestId !== 'string') {
       sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'queue/remove needs a sessionId and requestId' })
       return
+    }
+    // 先查插件侧的延迟队列。严格排队生效后，用户刚发的消息**就待在这里**，
+    // 而不再进内核 inbox——只查内核必然 QUEUE_ITEM_NOT_FOUND，
+    // 这正是"排队撤回永远失败"的原因。
+    const deferred = deferredQueue.get(message.sessionId)
+    if (deferred !== undefined) {
+      const index = deferred.findIndex((entry) => entry.requestId === message.requestId)
+      if (index >= 0) {
+        deferred.splice(index, 1)
+        if (deferred.length === 0) deferredQueue.delete(message.sessionId)
+        jsonLine(channel, {
+          type: 'queue-updated',
+          sessionId: message.sessionId,
+          requestId: message.requestId,
+          action: 'remove',
+        })
+        return
+      }
     }
     const agent = ctx.agents.get(message.sessionId)
     const pending = agent === undefined ? undefined : queuedMessage(agent, message.requestId)
@@ -3600,7 +3800,14 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       if (typeof id === 'string') activePrompt.set(session.id, id)
       previewCache.delete(session.id)
     }
-    if (event.type === 'turn/end' || event.type === 'turn/failed') activePrompt.delete(session.id)
+    if (event.type === 'turn/end' || event.type === 'turn/failed') {
+      activePrompt.delete(session.id)
+      // 回合真正收尾了，才把排队的消息按 FIFO 放行。
+      // 用 queueMicrotask 而不是直接同步投递：此刻内核还停在 turn 收尾的
+      // 回调栈里，同步调用 followup 会被它自己"running 期间不接受新 turn"
+      // 的判断挡掉，消息就永远卡住了。
+      queueMicrotask(() => { void flushDeferred(session.id) })
+    }
     broadcast(session.id, { type: 'event', sessionId: session.id, event })
   })
 
@@ -3630,14 +3837,24 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       ...(request.reason === undefined ? {} : { reason: request.reason }),
       expiresAt: Date.now() + approvalTimeoutMs,
     }
-    return await approvals.begin({
-      requestId,
-      sessionId,
-      timeoutMs: approvalTimeoutMs,
-      ...(request.signal === undefined ? {} : { signal: request.signal }),
-      message: requestMessage,
-      next,
-    })
+    // `begin` 会一直阻塞到这个审批有结论。在这段时间里，这个会话就是
+    // 「有人在等用户」——列表必须能看见它，手机首页才画得出"待审批"。
+    waitingApproval.add(sessionId)
+    try {
+      return await approvals.begin({
+        requestId,
+        sessionId,
+        timeoutMs: approvalTimeoutMs,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+        message: requestMessage,
+        next,
+      })
+    } finally {
+      waitingApproval.delete(sessionId)
+      // 审批已有结论，之前缓存的「在等人」判定作废，否则下一帧列表还会
+      // 报 waiting-approval。清掉即可，重新计算是 O(1)。
+      pendingInput.delete(sessionId)
+    }
   }
 
   // Agent-scoped waterfalls filter ordinary listeners by context. A global

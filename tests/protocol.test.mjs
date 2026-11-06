@@ -43,6 +43,8 @@ test('protocol v2 advertises the P3 capabilities', () => {
       // 会话开始跑了"，就必须 watch；用 attach 替代会每条都读日志 + 拉历史。
       'watch',
       'state',
+      'queue-defer',
+      'list-permissions',
     ],
   )
 })

@@ -59,6 +59,22 @@ export const CAPABILITIES = [
    * 试一次、失败了再退。
    */
   'state',
+  /**
+   * 排队消息由 Host 侧延迟投递（`mode: 'queue'`），等回合真正结束才放行。
+   *
+   * 内核 `inbox.claim()` 在每个 step 都会吃掉一条 next-turn，而 step 的
+   * 粒度是一次工具调用——不拦的话"排队"实际等于"下一步就插队"，
+   * 用户连撤回的窗口都没有。声明它，客户端才知道 accepted 的 `deferred`
+   * 字段有意义。
+   */
+  'queue-defer',
+  /**
+   * `session/list` 与 `state` 都带 `permissions`（含可作答的 requestId）。
+   *
+   * 没有它时，客户端只能 attach 之后靠 live 广播画审批卡：审批若在 attach
+   * 之前发出，那条广播永远收不到，手机上就"根本没法点允许"。
+   */
+  'list-permissions',
 ] as const
 
 export type Capability = (typeof CAPABILITIES)[number]
@@ -79,6 +95,13 @@ export type DshellErrorCode =
   | 'APPROVAL_NOT_PENDING'
   | 'QUESTION_NOT_PENDING'
   | 'QUEUE_ITEM_NOT_FOUND'
+  /**
+   * 排队消息在放行时投递失败（会话已消失、内核拒绝等）。
+   *
+   * 单独一个码，是因为客户端要据此把那条"排队中"气泡**从界面上撤掉**
+   * 并显示失败——旧行为是气泡永远挂着，既不报错也不消失。
+   */
+  | 'QUEUE_DELIVERY_FAILED'
   | 'SKILLS_UNAVAILABLE'
   | 'SKILLS_FAILED'
   | 'SKILL_MISSING'
@@ -176,6 +199,23 @@ export interface SessionSummary {
   running?: boolean
   /** The open turn is waiting on the user: an approval or a question. */
   needsInput?: 'approval' | 'question'
+  /**
+   * 这个会话此刻真正可以作答的审批请求。
+   *
+   * 以前客户端只能靠 `attach` 之后收到的 live `approval-request` 广播来渲染
+   * 审批卡，于是有两个死角：
+   *   1. 列表里看不出哪条会话在等审批（needsInput 之前也算不出来）；
+   *   2. 审批在你点进会话**之前**就发出的话，那条广播你永远收不到。
+   * 现在把待决请求直接放进列表，客户端不必先 attach 也能画卡、能作答。
+   *
+   * 只包含尚未 settle 的请求；`expiresAt` 过了之后 Host 会自己清掉。
+   */
+  permissions?: Array<{
+    requestId: string
+    toolName?: string
+    reason?: string
+    expiresAt?: number
+  }>
   /** First line of the latest real user prompt, collapsed and clipped by the Host. */
   preview?: string
 }
