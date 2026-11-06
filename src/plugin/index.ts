@@ -814,7 +814,14 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       deferredQueue.delete(sessionId)
       return
     }
-    if (agent.status === 'running') return
+    if (agent.status === 'running') {
+      // `turn/end` 事件比 agent 状态落定**早一点**：日志里每次都是
+      //   status=running → 300ms 后 status=idle
+      // 如果在这里直接 return，这条消息会永远卡在插件侧（实测 50 秒都没投递）。
+      // 300ms 重试一次足够，且不会无限循环——下一次进来状态一定是 idle。
+      setTimeout(() => { void flushDeferred(sessionId) }, 300)
+      return
+    }
     const next = list.shift()
     if (next === undefined) return
     if (list.length === 0) deferredQueue.delete(sessionId)
@@ -1132,43 +1139,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // (an idle turn cannot hold a live approval or question): an unanswered
     // approval/asked or a dangling ask_user_question call inside the open turn.
     const needsInputOf = (sessionId: string): Promise<'approval' | 'question' | undefined> => {
-      // 先问**实时表**，这是 O(1) 且永远准确的。
+      // 只问**实时表**，不读会话文件。
       //
-      // 原来只靠读会话尾部事件推断，而那条路被 `session.running !== true`
-      // 挡着（等审批的会话 running 恰好是 false），于是永远推不出来。
-      // 现在直接看两个内存表：
-      //   - approvals   ：有人等你批准（ApprovalCoordinator 里挂着待决请求）
-      //   - questionRequests：有人等你回答问题（ask_user_question 还阻塞着）
-      // 这两张表只在真的有人等的时候才有条目，比读事件快且准。
-      const live = liveInputOf(sessionId)
-      if (live !== undefined) return Promise.resolve(live)
-      const pending = pendingInput.get(sessionId)
-      if (pending !== undefined && Date.now() - pending.at < SESSION_CACHE_MS) return Promise.resolve(pending.value)
-      return withTimeout(ctx.sessionQuery.readSession(sessionId), 2_000, 'session tail').then((snapshot) => {
-        const events = snapshot?.events ?? []
-        let askTool: string | undefined
-        let approval: 'approval' | undefined
-        for (let index = Math.max(0, events.length - 300); index < events.length; index += 1) {
-          const event = events[index]
-          if (event === undefined) continue
-          const type = event.type
-          if (type === 'tool/call') {
-            const name = (event.data as { name?: unknown } | null)?.name
-            if (name === 'ask_user_question') askTool = String((event.data as { callId?: unknown } | null)?.callId ?? '')
-          } else if (type === 'tool/result') {
-            const callId = String(((event.data as { message?: { toolCallId?: unknown } } | null)?.message ?? {}).toolCallId ?? '')
-            if (askTool !== undefined && (callId.length === 0 || callId === askTool)) askTool = undefined
-          } else if (type === 'approval/asked') {
-            approval = 'approval'
-          } else if (type === 'approval/decided' || type === 'turn/end' || type === 'turn/failed') {
-            approval = undefined
-            askTool = undefined
-          }
-        }
-        const value = askTool !== undefined ? 'question' : approval
-        pendingInput.set(sessionId, { at: Date.now(), value })
-        return value
-      }).catch(() => undefined)
+      // 这里原来在实时表查不到时还会 `readSession()` 回退，扫一遍尾部事件
+      // 推断——但加上「不再只看 running」之后，这个回退会对**每一个**空闲
+      // 会话都跑一次。257 个会话各读一次会话文件，直接把慢路径拖垮：
+      // 日志刷屏 `session tail timed out after 2000ms`，attach 也跟着超时。
+      //
+      // 实时表已经覆盖了全部真相：
+      //   - approvals        ：有人等你批准
+      //   - questionRequests ：有人等你回答
+      // 等审批/等回答**一定**在这两张表里有一条记录，否则就没有人在等。
+      // 所以不需要回退，也就不需要读文件。
+      return Promise.resolve(liveInputOf(sessionId))
     }
     await Promise.all(sessions.map(async (session) => {
       const needs = await needsInputOf(session.sessionId)
