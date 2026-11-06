@@ -622,6 +622,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const waitingApproval = new Set<string>()
   const waitingQuestion = new Set<string>()
   /**
+   * 待决审批的**插件侧**记录（requestId → 详情）。
+   *
+   * 与 `ApprovalCoordinator.pending` 的区别：那张表只在「有人 watch 这条
+   * 会话」时才登记（见 begin() 开头的 watchers 短路），而列表要在**没人
+   * watch** 的时候也能告诉客户端"这条会话在等审批、requestId 是这个"。
+   */
+  const pendingApprovalInfo = new Map<string, {
+    sessionId: string
+    toolName?: string
+    reason?: string
+    expiresAt?: number
+  }>()
+  /**
    * 严格排队：用户按"排队"发的消息**先留在这里**，等当前回合真的结束了
    * 才交给内核。
    *
@@ -784,19 +797,34 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   /**
    * 把待决审批转成列表可以直接下发的形状。
    *
-   * `snapshot()` 的内部消息是发给 watcher 的完整 `approval-request`，
-   * 字段比列表需要的多（含 callId 等），这里只挑客户端画卡和作答必需的。
+   * **不能**用 `approvals.snapshot()`：`ApprovalCoordinator.begin()` 开头有一句
+   *
+   *     if (this.hooks.watchers(request.sessionId) === 0) {
+   *       const outcome = await request.next()   // 直接交给 Host，不注册 pending
+   *       ...
+   *     }
+   *
+   * 也就是说，**没有 watcher 时它根本不把请求记进 pending 表**。而手机没
+   * 点进会话时恰好没有 watcher——于是 snapshot 永远是空的，列表里
+   * `needsInput=approval` 却 `permissions=[]`，审批卡画得出来却点不了。
+   * 实测正是如此。
+   *
+   * 所以这里用插件自己的 `pendingApprovalInfo`：不管有没有 watcher，
+   * 只要 handleApproval 跑过就记一条。
    */
-  const permissionsOf = (sessionId: string): NonNullable<SessionSummary['permissions']> =>
-    approvals.snapshot(sessionId).map((raw) => {
-      const message = raw as { requestId: string; toolName?: string; reason?: string; expiresAt?: number }
-      return {
-        requestId: message.requestId,
-        ...(message.toolName === undefined ? {} : { toolName: message.toolName }),
-        ...(message.reason === undefined ? {} : { reason: message.reason }),
-        ...(message.expiresAt === undefined ? {} : { expiresAt: message.expiresAt }),
-      }
-    })
+  const permissionsOf = (sessionId: string): NonNullable<SessionSummary['permissions']> => {
+    const found: NonNullable<SessionSummary['permissions']> = []
+    for (const [requestId, info] of pendingApprovalInfo) {
+      if (info.sessionId !== sessionId) continue
+      found.push({
+        requestId,
+        ...(info.toolName === undefined ? {} : { toolName: info.toolName }),
+        ...(info.reason === undefined ? {} : { reason: info.reason }),
+        ...(info.expiresAt === undefined ? {} : { expiresAt: info.expiresAt }),
+      })
+    }
+    return found
+  }
 
   /**
    * 放行一条排队消息。
@@ -3196,7 +3224,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'approval outcome must be allowed-once or rejected' })
       return
     }
-    const sessionId = approvals.sessionOf(message.requestId)
+    // 先用插件侧的表定位会话：`approvals.sessionOf()` 只在有 watcher 时
+    // 才有条目（begin() 开头会短路掉没 watcher 的请求），而手机很可能
+    // 根本没点进这条会话——那样就会误报 APPROVAL_NOT_PENDING，
+    // 用户点"允许"永远失败。
+    const known = pendingApprovalInfo.get(message.requestId)
+    const sessionId = known?.sessionId ?? approvals.sessionOf(message.requestId)
     if (sessionId === undefined) {
       sendError(channel, {
         type: 'error',
@@ -3205,15 +3238,21 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
       return
     }
-    if (watched.get(channel)?.has(sessionId) !== true) {
-      sendError(channel, {
-        type: 'error',
-        code: 'BAD_REQUEST',
-        message: 'this client is not watching the approval session',
-      })
+    // 不再要求本端先 watch：用户在手机上作答时，正是"没点进去"的状态。
+    // 作答权限由 requestId 本身保证（只有收到列表的那一端才知道它）。
+    // 这里只要求它确实还是待决的，避免对已过期的请求作答。
+    if (approvals.has(message.requestId)) {
+      approvals.answer(message.requestId, message.outcome)
       return
     }
-    approvals.answer(message.requestId, message.outcome)
+    // 没有 watcher 的那条路：`begin()` 把请求直接交给了 Host 的瀑布流，
+    // 我们手里没有可 resolve 的入口。如实告诉客户端"这条得在电脑上处理"，
+    // 而不是假装成功。
+    sendError(channel, {
+      type: 'error',
+      code: 'APPROVAL_NOT_PENDING',
+      message: 'this approval is being handled by the Host itself; answer it on the computer',
+    })
   }
 
   /**
@@ -3823,6 +3862,12 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // `begin` 会一直阻塞到这个审批有结论。在这段时间里，这个会话就是
     // 「有人在等用户」——列表必须能看见它，手机首页才画得出"待审批"。
     waitingApproval.add(sessionId)
+    pendingApprovalInfo.set(requestId, {
+      sessionId,
+      ...(request.toolName === undefined ? {} : { toolName: request.toolName }),
+      ...(request.reason === undefined ? {} : { reason: request.reason }),
+      expiresAt: requestMessage.expiresAt,
+    })
     try {
       return await approvals.begin({
         requestId,
@@ -3834,6 +3879,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       })
     } finally {
       waitingApproval.delete(sessionId)
+      pendingApprovalInfo.delete(requestId)
       // 审批已有结论，之前缓存的「在等人」判定作废，否则下一帧列表还会
       // 报 waiting-approval。清掉即可，重新计算是 O(1)。
       pendingInput.delete(sessionId)

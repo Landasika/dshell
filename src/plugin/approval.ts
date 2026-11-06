@@ -62,16 +62,26 @@ export class ApprovalCoordinator {
     next: () => Promise<string>
   }): Promise<ApprovalOutcome> {
     if (this.closed) return 'unavailable'
-    if (this.hooks.watchers(request.sessionId) === 0) {
-      // Nobody of ours is watching: stay transparent and let the Host's
-      // waterfall decide (its fallback already means "unavailable").
-      try {
-        const outcome = await request.next()
-        return ApprovalCoordinator.asOutcome(outcome)
-      } catch {
-        return 'unavailable'
-      }
-    }
+    // 这里原来有一句「没人 watch 就直接交给 Host」的短路：
+    //
+    //     if (this.hooks.watchers(request.sessionId) === 0) {
+    //       return ApprovalCoordinator.asOutcome(await request.next())
+    //     }
+    //
+    // 它让手机端**永久**无法审批。原因有两个，而且都是不可逆的：
+    //
+    //   1. 判断发生在审批产生的那一瞬间。手机没点进这条会话就没有
+    //      watcher，于是这单审批当场被判给 Host，之后补 watch 也没用。
+    //   2. 走这条路时 pending 表里不登记，`requestId` 无处可答；
+    //      客户端就算从列表里拿到了 id，作答也只会得到 not-pending。
+    //
+    // 但短路的**动机**是真实的：没有前端能作答时，不该让任务白等。
+    // 那个语义交给下面 `otherSettled` 的 otherDone + watchers===0 处理，
+    // 以及超时兜底——两条都不需要在入口处提前投降。
+    //
+    // 现在改为：Host 活着就由我们接管，交给 watcher 或等待超时。
+    // 电脑端 TUI 的作答仍然通过 `otherSettled` 里的 DECISIONS 生效，
+    // 行为不变。
 
     let resolveOutcome!: (outcome: ApprovalOutcome) => void
     const outcome = new Promise<ApprovalOutcome>((resolve) => {
@@ -118,14 +128,20 @@ export class ApprovalCoordinator {
     return this.settle(requestId, outcome, 'cli')
   }
 
-  /** A watcher set changed; close approvals nobody can answer anymore. */
+  /**
+   * A watcher set changed.
+   *
+   * 原来这里会把"没人看了"的审批立刻判为 unavailable。现在不动了：
+   * 手机端断开再重连是常态（切后台、锁屏、换网），而审批本身有时效性
+   * （默认 120 秒），断开就作废会让用户在"刚要点允许"时功亏一篑。
+   *
+   * 真正需要收摊的场景只有两个，都另有兜底：
+   *   - 会话被删 / Host 关闭  → `dispose()`
+   *   - 一直没人答            → 超时计时器
+   * 保留方法体为空实现，是因为它仍被 socket 断开路径调用，删掉会牵动调用点。
+   */
   watchersChanged(): void {
-    for (const [requestId, entry] of this.pending) {
-      if (entry.settled) continue
-      if (entry.otherDone && this.hooks.watchers(entry.sessionId) === 0) {
-        this.settle(requestId, 'unavailable', 'disconnect')
-      }
-    }
+    // 有意为之的空实现，见上面的说明。
   }
 
   /** Close everything the Host shutdown leaves behind. */
@@ -156,12 +172,15 @@ export class ApprovalCoordinator {
       this.settle(requestId, ApprovalCoordinator.asOutcome(value), 'other')
       return
     }
-    // The other frontends cannot answer. Keep waiting for our own watcher;
-    // if it is already gone, nothing can ever answer.
+    // The other frontends cannot answer. Keep waiting for our own watcher.
+    //
+    // 原来这里还有一句 `if (watchers === 0) settle('unavailable')`：别的
+    // 前端答不了、我们又没人 watch，就当作没人能答，立刻收摊。
+    //
+    // 但"此刻没人 watch"不等于"永远没人能答"——手机端正是**先看到列表里
+    // 有审批、再决定点进去**的，那一刻还没有 watcher。提前收摊等于把这个
+    // 窗口关死。真正的兜底是超时（默认 120 秒），任务不会白等。
     entry.otherDone = true
-    if (this.hooks.watchers(entry.sessionId) === 0) {
-      this.settle(requestId, 'unavailable', 'other')
-    }
   }
 
   private settle(requestId: string, outcome: ApprovalOutcome, source: ApprovalSource): boolean {
