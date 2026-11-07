@@ -65,6 +65,7 @@ import {
   isExpired,
   normalizeCleanupDays,
   previewOfText,
+  serializeRow,
   type SessionIndexRow,
 } from './session-index.js'
 import {
@@ -161,6 +162,27 @@ interface InboxLike {
   replace(id: string, message: UserMessageLike): void
 }
 
+/**
+ * dsh 内核压缩服务的最小结构。
+ *
+ * 只写 dshell 真正调用到的部分：`compactNow`。其余（范围压缩等）留给用得上
+ * 的地方再补，避免把内核一整个 API 面抄进来。
+ */
+/**
+ * dsh 内核的 commands 服务（`ctx.commands`）的最小结构。
+ *
+ * 只声明 dshell 用到的 `execute`：把一个斜杠命令行交给内核执行。
+ * `/compact`、`/goal` 这类"给人类用的命令"都由它注册，具体实现留在内核里。
+ */
+interface CommandsServiceLike {
+  execute(
+    agent: unknown,
+    line: string,
+    attachments: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<{ text?: string } | undefined>
+}
+
 interface AgentLike {
   id: string
   status?: 'idle' | 'running'
@@ -246,6 +268,8 @@ interface WorkspaceRegistryLike {
   list(): WorkspaceLike[]
   get(id: string): WorkspaceLike | undefined
   create(path: string, title?: string): Promise<WorkspaceLike>
+  /** 按路径查已登记的 workspace（内部会 realpath 归一化）。 */
+  resolveByPath?(path: string): Promise<WorkspaceLike | undefined>
 }
 
 interface ApprovalRequestLike {
@@ -591,6 +615,72 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const approvalTimeoutMs = config.approvalTimeoutMs ?? 120_000
   let closing = false
 
+  /** 目录是否真实存在（跟随软链；不是文件）。补登记前用它挡掉已删项目。 */
+  const existsAsDirectory = async (path: string): Promise<boolean> => {
+    try {
+      const { stat } = await import('node:fs/promises')
+      return (await stat(path)).isDirectory()
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 把「有会话但没登记」的目录补进 workspace 注册表。
+   *
+   * 为什么需要：历史 bug 让 `controller.create({ cwd })` 只建会话、不注册
+   * workspace（内核里 `workspace` 为空就跳过 attachSession），于是那些目录
+   * 永远进不了 workspace.json。之后任何按 workspace 过滤的会话列表都会把
+   * 它们静默丢掉——用户以为"会话又没了"，其实日志一直完好。
+   *
+   * 两道保险，缺一不可：
+   *  1. **只认父会话**。子 agent 的 cwd 与父会话相同，把它们算进来不会多出
+   *     目录，却会让统计口径混乱；更重要的是子会话本就不该出现在会话列表
+   *     （`isSubagentRow` 负责过滤），补登记也只该围绕父会话做。
+   *  2. **只注册磁盘上真实存在的目录**。删掉的项目不该被重新创建成一个
+   *     空壳 workspace——那会在选择器里留下永远打不开的条目。
+   *
+   * 幂等：已经登记的路径用 `resolveByPath` 命中后直接跳过，不 touch 记录，
+   * 所以每次启动跑一遍是安全的，也不会打乱用户手动调整过的顺序。
+   */
+  const adoptOrphanWorkspaces = async (): Promise<number> => {
+    const registry = ctx.workspaceRegistry
+    if (registry === undefined) return 0
+    const rows = await sessionIndex().rowsOf()
+    if (rows.size === 0) return 0
+    // 父会话的 cwd 去重；子会话按 isSubagentRow 排除。
+    const candidates = new Set<string>()
+    for (const row of rows.values()) {
+      if (isSubagentRow(row)) continue
+      if (row.cwd === undefined || row.cwd.length === 0) continue
+      candidates.add(row.cwd)
+    }
+    let adopted = 0
+    for (const path of candidates) {
+      // 已登记就跳过：resolveByPath 内部会 realpath 归一化，避免同一个
+      // 目录因为软链或尾部斜杠被当成两个 workspace。
+      //
+      // 注意 `resolveByPath` 是可选方法：缺失时它返回 undefined，而
+      // `undefined !== undefined` 是 false —— 直接写 `if (x !== undefined)
+      // continue` 会把**每一个**目录都当成"已登记"跳掉，补登记静默失效。
+      // 所以必须显式区分"方法不存在"和"没查到"。
+      if (registry.resolveByPath !== undefined) {
+        if (await registry.resolveByPath(path) !== undefined) continue
+      } else if (registry.list().some((workspace) => workspace.path === path)) {
+        continue
+      }
+      // 目录不存在就不登记：宁可让那条会话暂时查不到，也不留空壳 workspace。
+      if (!(await existsAsDirectory(path))) continue
+      try {
+        await registry.create(path)
+        adopted += 1
+      } catch {
+        // 单个目录失败（权限、竞态）不该阻断其余目录的补登记。
+      }
+    }
+    return adopted
+  }
+
   const workspaceList = (): WorkspaceSummary[] => {
     const registry = ctx.workspaceRegistry
     if (registry === undefined) return []
@@ -912,6 +1002,20 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const pinned = new Set(ctx.workspaceRegistry?.pinnedSessionIds ?? [])
     const workspaces = workspaceList()
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
+    // 过滤时也要认同 cwd 而不是只认 workspace 注册表。
+    //
+    // 历史原因：`controller.create({ cwd })` 只建会话、不注册 workspace，
+    // 于是这些目录从来没进过 workspace.json。旧写法
+    // `workspace?.id !== workspaceId` 在 workspace 为 undefined 时成立，
+    // 把整条会话 `continue` 掉——用户看到"会话又没了"，但磁盘上的
+    // session.v4.jsonl.zstd 一直是好的。
+    //
+    // 这里改成：注册表里查不到 workspace 时，只要 row.cwd 等于目标
+    // workspace 的 path，也算属于它。列表因此能显示这些"孤儿"会话；
+    // 真正的新建路径已在 createSession 里修好，不会再产生新的孤儿。
+    const targetPath = workspaceId === undefined
+      ? undefined
+      : workspaces.find((workspace) => workspace.id === workspaceId)?.path
     const sessions: SessionSummary[] = []
     for (const row of rows.values()) {
       // 子会话（subagent）不进展柜：它们挂在父会话下，靠索引里的父子边查。
@@ -919,7 +1023,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       const isArchived = archived.has(row.sessionId)
       if (!includeArchived && isArchived) continue
       const workspace = row.cwd === undefined ? undefined : workspaceByPath.get(row.cwd)
-      if (workspaceId !== undefined && workspace?.id !== workspaceId) continue
+      if (workspaceId !== undefined) {
+        const belongs = workspace?.id === workspaceId
+          || (targetPath !== undefined && row.cwd === targetPath)
+        if (!belongs) continue
+      }
       const summary: SessionSummary = { sessionId: row.sessionId }
       if (row.title !== undefined && row.title.length > 0) summary.title = row.title
       if (row.cwd !== undefined) summary.cwd = row.cwd
@@ -1062,11 +1170,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const workspaceByPath = new Map(workspaces.map((workspace) => [workspace.path, workspace]))
     const workspaceOf = (record: SessionRecordLike): WorkspaceSummary | undefined =>
       record.header.cwd === undefined ? undefined : workspaceByPath.get(record.header.cwd)
+    // 与索引路径同样的修正：workspace 查不到时按 cwd 归属，别把会话过滤掉。
+    const targetPath = workspaceId === undefined
+      ? undefined
+      : workspaces.find((workspace) => workspace.id === workspaceId)?.path
     const visible = records
       .filter(record => includeArchived || !archived.has(record.header.id))
       .filter((record) => record.header.origin !== 'subagent' && record.header.parentSession === undefined)
       .map((record) => ({ record, workspace: workspaceOf(record) }))
-      .filter((entry) => workspaceId === undefined || entry.workspace?.id === workspaceId)
+      .filter((entry) => workspaceId === undefined
+        || entry.workspace?.id === workspaceId
+        || (targetPath !== undefined && entry.record.header.cwd === targetPath))
       .sort((left, right) => Number(pinned.has(right.record.header.id)) - Number(pinned.has(left.record.header.id))
         || lastActivity(right.record) - lastActivity(left.record))
 
@@ -1261,8 +1375,27 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       if (header.delegationDepth !== undefined) row.delegationDepth = header.delegationDepth
       rows.push(row)
     }
-    if (rows.length === 0) return
-    await sessionIndex().appendMany(rows)
+    // 只追加**真正变了**的行。
+    //
+    // 原来这里无条件 appendMany(rows)，而 rows 包含全部会话，于是每轮刷新都把
+    // 524 行完整重写一遍。实测文件因此长到 484 MB / 226 万行（重复 4321 倍），
+    // 每次 readFile + JSON.parse 要 1.5 GB 以上，把 Node 的 4.2 GB 堆打爆，
+    // journal 里留下 8 次 `FATAL ERROR: Reached heap limit`。
+    //
+    // 判断依据用"序列化后是否逐字相同"，而不是逐字段比较：索引行字段一直在
+    // 增删（origin / parentSessionId / delegationDepth / preview …），逐字段比
+    // 每加一个字段就要记得回来改一次，漏一个就会退化成全量写入。序列化比较
+    // 天然跟着结构走，且这些行本来就要序列化，成本可以忽略。
+    const changed = rows.filter(row => {
+      const previous = existing.get(row.sessionId)
+      if (previous === undefined) return true
+      return serializeRow({ ...previous, indexedAt: 0 }) !== serializeRow({ ...row, indexedAt: 0 })
+    })
+    if (changed.length === 0) return
+    await sessionIndex().appendMany(changed)
+    // 压实：追加式写入仍会让文件随轮次变长（活跃会话每轮都会变，所以仍有增长，
+    // 只是从"每轮 524 行"降到"每轮几条"）。行数超阈值时重写成一份干净索引。
+    await sessionIndex().compact().catch(() => false)
     indexPrimed = true
   }
 
@@ -1534,6 +1667,75 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         if (!registry?.unarchiveSession) break
         await registry.unarchiveSession(sessionId)
         break
+      case 'session/compact': {
+        // 手动触发上下文压缩（等价于 dsh 的 `/compact`）。
+        //
+        // dshell 的 TUI 是硬编码 switch 的命令分发器，`/compact` 原来不在其中，
+        // 命令掉进 default 被当成 "unknown command" 丢掉——即使压缩后端
+        // （compaction-basic）其实已经由 preset 挂在会话上了。这里补上入口。
+        const live = ctx.agents.get(sessionId)
+        if (live === undefined) {
+          sendError(channel, {
+            type: 'error',
+            code: 'SESSION_NOT_FOUND',
+            message: '会话没有在运行，先打开它再压缩',
+          })
+          return
+        }
+        // 走 commands 服务执行 `/compact`，而不是自己去 ctx 上找 compaction。
+        //
+        // 这条路才是权威的：`dsh-command-compact` 把 `/compact` 注册进 commands
+        // 服务，处理时用**它自己**的 ctx（`inject = ["commands", "compaction"]`）
+        // 调 `ctx.compaction.compactNow(invocation.agent, ...)`。
+        //
+        // 自己去找 `ctx.get('compaction')` 走不通：`BasicCompactionEngine` 由
+        // preset fiber 提供，实测在 host ctx / agent.ctx / agent.scope.ctx /
+        // agent.loopCtx 上全都拿不到（strict 与非 strict 都是 undefined）。
+        // 而 commands 是 host 平面的服务，dshell 插件拿得到；命令的实现细节
+        // （包括它怎么拿到 compaction）留在内核里，不归我们操心。
+        //
+        // 用 `get` 而不是把 'commands' 加进模块级 inject：inject 是硬依赖，
+        // 声明了内核就必须解析到，否则整个插件起不来。但命令服务在精简 profile
+        // 里可能没有，dshell 不该因此整体不可用。
+        const commands = (typeof (ctx as { get?: (n: string) => unknown }).get === 'function'
+          ? (ctx as { get: (n: string) => unknown }).get('commands')
+          : undefined) as CommandsServiceLike | undefined
+        if (commands === undefined || typeof commands.execute !== 'function') {
+          sendError(channel, {
+            type: 'error',
+            code: 'CAPABILITY_MISSING',
+            message: '这个 Host 没有命令服务，无法执行 /compact',
+          })
+          return
+        }
+        const controller = new AbortController()
+        try {
+          const execution = await commands.execute(live, '/compact', [], controller.signal)
+          if (execution === undefined) {
+            sendError(channel, {
+              type: 'error',
+              code: 'COMPACT_FAILED',
+              message: 'Host 没有识别 /compact 命令（command-compact 未挂载）',
+            })
+            return
+          }
+          // 命令的结果是给人看的一句话，比如 "Compacted 12 messages, freed ~18k tokens."
+          // 直接把它转给前端，不在这里重复解释。
+          const text = typeof execution.text === 'string' ? execution.text : ''
+          jsonLine(channel, {
+            type: 'session-compacted',
+            sessionId,
+            ...(text.length > 0 ? { text } : {}),
+          })
+        } catch (error) {
+          sendError(channel, {
+            type: 'error',
+            code: 'COMPACT_FAILED',
+            message: error instanceof Error ? error.message : '压缩失败',
+          })
+        }
+        return
+      }
       case 'session/pin':
         if (!registry?.pinSession || !registry.unpinSession) break
         await (message.pinned === false ? registry.unpinSession(sessionId) : registry.pinSession(sessionId))
@@ -2910,9 +3112,27 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
 
     const controller = sessionController()
     if (controller?.create) {
-      const created = await controller.create({
-        ...(typeof message.workspaceId === 'string' ? { workspaceId: message.workspaceId } : { cwd: typeof message.cwd === 'string' ? message.cwd : process.cwd() }),
-      })
+      // 先确保 cwd 对应的 workspace 已注册，再把 workspaceId 交给 controller。
+      //
+      // 不这么做的话，`controller.create({ cwd })` 会**只建会话、不注册
+      // workspace**：内核里 `const cwd = workspace?.path ?? request.cwd`，
+      // 而 `if (workspace !== void 0) workspace.attachSession(...)` 在只传
+      // cwd 时整段跳过。后果是新目录永远不进 workspace.json，此后任何按
+      // workspace 过滤的列表（TUI 的 refreshSessions(workspaceId)）都会把
+      // 这条会话静默 `continue` 掉——用户看到的就是"会话又没了"，但磁盘上
+      // 文件完好无损。
+      //
+      // 注册之后一律传 workspaceId，让内核走"找得到 workspace"的分支，
+      // 顺便由它做 attachSession。
+      let targetWorkspaceId = typeof message.workspaceId === 'string' && message.workspaceId.length > 0
+        ? message.workspaceId
+        : undefined
+      if (targetWorkspaceId === undefined) {
+        const cwd = typeof message.cwd === 'string' && message.cwd.length > 0 ? message.cwd : process.cwd()
+        const workspace = await registry.create(cwd)
+        targetWorkspaceId = workspace.id
+      }
+      const created = await controller.create({ workspaceId: targetWorkspaceId })
       const snapshot = await ctx.sessionQuery.readSession(created.sessionId)
       // 立刻把新会话写进轻索引。
       //
@@ -3537,6 +3757,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         case 'session/restore':
         case 'session/pin':
         case 'session/fork':
+        case 'session/compact':
           await sessionAction(channel, message)
           return
         case 'session/cancel':
@@ -3986,9 +4207,13 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         const rows = await sessionIndex().rowsOf()
         if (rows.size > 0) {
           indexPrimed = true
-          return
+        } else {
+          await listSessionsFresh(undefined, false)
         }
-        await listSessionsFresh(undefined, false)
+        // 索引就位后再补登记孤儿 workspace：这一步依赖索引里的 cwd，
+        // 而且要等目录真的被扫到才有意义。历史 bug 留下的那些目录
+        // （建了会话却没进注册表）就是靠这里一次性接回来的。
+        await adoptOrphanWorkspaces().catch(() => 0)
       } catch {
         // 预热是尽力而为；失败时列表会在下次请求时自己回源。
       } finally {

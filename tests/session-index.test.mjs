@@ -244,3 +244,80 @@ test('索引体积远小于正文（结构前提）', () => {
   })
   assert.ok(line.length < 600, `索引行 ${line.length} 字节，超过预期`)
 })
+
+test('SessionIndexFile: 追加后缓存增量合并，不需要重读磁盘', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dshell-idx-'))
+  const path = join(dir, 'index.jsonl')
+  try {
+    const file = new SessionIndexFile(path)
+    await file.appendMany([{ sessionId: 'a', cwd: '/x' }, { sessionId: 'b', cwd: '/y' }])
+
+    // 先读一次，让缓存建立。
+    const first = await file.rowsOf()
+    assert.equal(first.get('a')?.cwd, '/x')
+    assert.equal(file.rows, first, '读完之后缓存应当被持有')
+
+    // 再写：缓存对象**必须是同一个**。
+    //
+    // 这条断言是这次 OOM 的护栏。原来 appendMany 末尾写的是
+    //   this.rows = undefined
+    // 于是每写一次就丢掉整份缓存，下次 rowsOf() 必须 readFile + JSON.parse
+    // 整个文件。索引是追加式的、会无界变长，两者叠加把 484 MB 的文件
+    // 反复读进内存，最终 8 次 `Reached heap limit`。
+    const before = file.rows
+    await file.appendMany([{ sessionId: 'c', cwd: '/z' }])
+    assert.equal(file.rows, before, '写入不应丢弃缓存对象，应当增量合并')
+    assert.equal(file.rows.get('c')?.cwd, '/z', '新写入的行要出现在缓存里')
+    assert.equal(file.rows.get('a')?.cwd, '/x', '旧行不能被冲掉')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('SessionIndexFile: 同一会话反复写入不会让缓存膨胀', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dshell-idx-'))
+  const path = join(dir, 'index.jsonl')
+  try {
+    const file = new SessionIndexFile(path)
+    await file.rowsOf()
+    // 模拟真实负载：每轮把同一批会话完整重写一遍。
+    for (let round = 0; round < 50; round++) {
+      await file.appendMany([
+        { sessionId: 's1', cwd: '/p', updatedAt: round },
+        { sessionId: 's2', cwd: '/q', updatedAt: round },
+      ])
+    }
+    const rows = await file.rowsOf()
+    // 磁盘上是 100 行，但内存里只有 2 个会话 —— 这正是"增量合并"的意义。
+    assert.equal(rows.size, 2)
+    assert.equal(rows.get('s1')?.updatedAt, 49, '后写的覆盖先写的')
+    const onDisk = (await readFile(path, 'utf8')).trim().split('\n')
+    assert.equal(onDisk.length, 100, '磁盘上仍然是追加式 100 行')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('SessionIndexFile: compact 复用缓存而不是强制重读', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dshell-idx-'))
+  const path = join(dir, 'index.jsonl')
+  try {
+    const file = new SessionIndexFile(path)
+    await file.appendMany([{ sessionId: 'a', cwd: '/x' }])
+    await file.rowsOf()
+    const cached = file.rows
+    // 塞够行数让它真的超阈值。
+    const filler = []
+    for (let i = 0; i < 20; i++) filler.push({ sessionId: `f${i}`, cwd: '/f' })
+    await file.appendMany(filler)
+    // 缓存必须还是同一个对象（appendMany 走增量合并）。
+    assert.equal(file.rows, cached)
+    const did = await file.compact(5)
+    assert.equal(did, true, '行数超阈值时应当压实')
+    // 压实后行数等于去重后的会话数。
+    const after = (await readFile(path, 'utf8')).trim().split('\n')
+    assert.equal(after.length, 21)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

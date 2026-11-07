@@ -141,10 +141,23 @@ export interface SessionSummary {
   preview?: string
 }
 
-export type SessionAction = 'rename' | 'archive' | 'restore' | 'pin' | 'fork'
+/**
+ * 会话级动作。
+ *
+ * `compact` 是后加的：它走 dsh 内核的压缩服务，而不是 dshell 自己的会话表，
+ * 但对前端来说"对某个会话做一件事"的形状完全一致，所以并入同一个入口，
+ * 不必为它在 TUI 里单开一条通道。
+ */
+export type SessionAction = 'rename' | 'archive' | 'restore' | 'pin' | 'fork' | 'compact'
 
 export interface SessionActionResult {
   sessionId?: string
+  /** `compact` 专用：没有可压缩的历史（会话还太短）。 */
+  empty?: boolean
+  /** `compact` 专用：本次压缩释放的 token 估算。 */
+  freedTokens?: number
+  /** `compact` 专用：内核命令的原始回执（优先展示它）。 */
+  text?: string
   title?: string
   pinned?: boolean
   archived?: boolean

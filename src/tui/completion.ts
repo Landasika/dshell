@@ -15,6 +15,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
   { name: '/archive', description: 'archive the attached session' },
   { name: '/pin', description: 'pin or unpin the attached session' },
   { name: '/fork', description: 'fork the attached session' },
+  { name: '/compact', description: 'summarize older history to free context' },
   { name: '/workspaces', description: 'switch workspace' },
   { name: '/new', description: 'create a session' },
   { name: '/attach', description: 'attach by id', needsArgument: true },

@@ -521,6 +521,23 @@ export class SocketBackend implements DshellBackend {
 
   async sessionAction(action: SessionAction, sessionId: string, value?: string | boolean): Promise<SessionActionResult> {
     const connection = this.requireControl()
+    // compact 的回复是 `session-compacted` 而不是通用的 `session-updated`：
+    // 压缩可能什么都没压（历史还太短），也可能报错，两者都需要单独的形状。
+    if (action === 'compact') {
+      const reply = await connection.request(
+        { type: 'session/compact', sessionId },
+        candidate => candidate.type === 'session-compacted' && candidate.sessionId === sessionId,
+        // 压缩要调摘要模型，比普通会话动作慢得多，给足 2 分钟。
+        120_000,
+      )
+      if (reply.type !== 'session-compacted') throw new BackendError('INTERNAL', 'invalid compact reply')
+      return {
+        sessionId,
+        ...(reply.empty === true ? { empty: true } : {}),
+        ...(reply.freedTokens === undefined ? {} : { freedTokens: reply.freedTokens }),
+        ...(typeof reply.text === 'string' && reply.text.length > 0 ? { text: reply.text } : {}),
+      }
+    }
     const type = action === 'rename' ? 'session/rename' : action === 'archive' ? 'session/archive'
       : action === 'restore' ? 'session/restore' : action === 'pin' ? 'session/pin' : 'session/fork'
     const message = await connection.request(

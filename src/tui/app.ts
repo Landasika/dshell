@@ -2091,6 +2091,31 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
           toast(row?.pinned === true ? 'session unpinned' : 'session pinned')
         } catch (error) { toast(`pin failed: ${errorText(error)}`) }
         return
+      case '/compact':
+        // 手动上下文压缩。等价于 dsh 的 `/compact`。
+        //
+        // dshell 的 runCommand 是个硬编码 switch，原来没有这一条，于是
+        // `/compact` 掉进 default 被当成 "unknown command" 丢掉——即使
+        // 压缩后端（compaction-basic）其实已经由 preset 挂在会话上了。
+        if (!state.currentId) { toast('attach a session first'); return }
+        try {
+          toast('compacting…')
+          const result = await backend.sessionAction('compact', state.currentId)
+          if (result.empty === true) {
+            toast('nothing to compact yet')
+          } else if (typeof result.text === 'string' && result.text.length > 0) {
+            // 内核命令的回执最准确（会说明压了多少条、省了多少 token），
+            // 优先用它，不在这里改写它的措辞。
+            toast(result.text)
+          } else if (typeof result.freedTokens === 'number' && result.freedTokens > 0) {
+            toast(`compacted · freed ~${result.freedTokens} tokens`)
+          } else {
+            toast('context compacted')
+          }
+          // 压缩改变了历史形状，列表里的标题/摘要都要重取。
+          await refreshSessions()
+        } catch (error) { toast(`compact failed: ${errorText(error)}`) }
+        return
       case '/fork':
         if (!state.currentId) { toast('attach a session first'); return }
         try {

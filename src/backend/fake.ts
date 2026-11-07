@@ -432,6 +432,8 @@ export class FakeBackend implements DshellBackend {
     if (action === 'archive') session.archived = true
     if (action === 'restore') session.archived = false
     if (action === 'pin') session.pinned = value !== false
+    // fake 后端只服务于测试：压缩不需要真的改历史，返回一个可断言的形状即可。
+    if (action === 'compact') return { sessionId, freedTokens: 1_000 }
     if (action === 'fork') {
       const id = `fake-${this.nextId++}`
       this.sessions.set(id, { ...session, header: { ...session.header, id, createdAt: Date.now() }, events: [...session.events] })

@@ -103,6 +103,13 @@ export type DshellErrorCode =
    */
   | 'QUEUE_DELIVERY_FAILED'
   | 'SKILLS_UNAVAILABLE'
+  /**
+   * 手动压缩失败（摘要模型报错、历史在压缩期间变化、落盘失败等）。
+   *
+   * 压缩是"可选增强"，失败不该让整个会话不可用，所以单独一个码让客户端
+   * 只提示一次、不改变会话状态。
+   */
+  | 'COMPACT_FAILED'
   | 'SKILLS_FAILED'
   | 'SKILL_MISSING'
   | 'BAD_REQUEST'
@@ -645,6 +652,7 @@ export type ClientPayload =
   | { type: 'session/archive' | 'session/restore'; sessionId: string }
   | { type: 'session/pin'; sessionId: string; pinned: boolean }
   | { type: 'session/fork'; sessionId: string }
+  | { type: 'session/compact'; sessionId: string }
   | { type: 'session/history'; sessionId: string; before?: number; limit?: number }
   | { type: 'session/cancel'; sessionId: string; requestId?: string; killSubagents?: boolean; continueQueued?: boolean }
   | { type: 'queue/edit'; sessionId: string; requestId: string; text: string }
@@ -694,8 +702,31 @@ export interface SessionUpdatedMessage {
   seq?: number
 }
 
+/**
+ * 手动压缩完成。
+ *
+ * 单独一个消息类型而不是塞进 `session-updated`：压缩的语义和"会话被动过"
+ * 不同（它可能什么都没压，也可能给出省下的 token 数），而且客户端要据此
+ * 做**不同的**呈现——不是刷新列表，而是提示一句"省了多少"。
+ */
+export interface SessionCompactedMessage {
+  type: 'session-compacted'
+  sessionId: string
+  /** 没有可压缩的历史（会话还太短）。 */
+  empty?: boolean
+  /** 本次压缩释放的 token 估算。 */
+  freedTokens?: number
+  /**
+   * 内核命令给出的原始回执，例如 "Compacted 12 messages, freed ~18k tokens."
+   *
+   * 优先用它而不是自己拼话：压缩到底做了什么的措辞归内核所有。
+   */
+  text?: string
+}
+
 export type ServerPayload =
   | SessionUpdatedMessage
+  | SessionCompactedMessage
   | WelcomeMessage
   | PongMessage
   | SessionsMessage

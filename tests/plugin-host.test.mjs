@@ -974,6 +974,174 @@ test('session organization uses workspace owner APIs and never moves session dir
   assert.equal(harness.sessions.has('s1'), true)
 })
 
+test('session/compact delegates to the kernel commands service and reports its receipt', async (t) => {
+  // 为什么走 commands 而不是自己找 compaction：`BasicCompactionEngine` 由
+  // preset fiber 提供，host ctx 上拿不到（实测 strict 与非 strict 都是
+  // undefined）。`/compact` 的实现在 dsh-command-compact 里，它自己持有
+  // compaction 依赖。所以 Host 只负责把命令行交给 commands 服务。
+  // commands 是 ctx.get('commands') 取的服务，所以必须通过 services 注入，
+  // 直接赋值 harness.ctx.commands 是拿不到的。
+  const calls = []
+  const commands = {
+    execute: async (agent, line, attachments, signal) => {
+      calls.push({ agentId: agent.id, line, attachmentCount: attachments.length, hasSignal: signal instanceof AbortSignal })
+      return { text: 'Compacted 12 messages, freed ~18k tokens.' }
+    },
+  }
+  const harness = await startHarness(t, {}, { commands })
+  // 用 session/create 建一个真正 live 的 agent：`ctx.agents.get` 只认活跃
+  // 句柄，直接 makeSession 只写 sessionQuery，压缩入口会先撞 SESSION_NOT_FOUND。
+  const boot = new NdjClient(harness.socketPath)
+  t.after(() => boot.destroy())
+  boot.send({ type: 'hello', protocol: 2 })
+  await boot.next()
+  boot.send({ type: 'session/create', cwd: '/work' })
+  const made = await boot.next()
+  assert.equal(made.type, 'session-created')
+  const liveId = made.sessionId
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/compact', sessionId: liveId })
+  const reply = await client.next()
+  assert.equal(reply.type, 'session-compacted')
+  assert.equal(reply.sessionId, liveId)
+  assert.equal(reply.text, 'Compacted 12 messages, freed ~18k tokens.')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].line, '/compact')
+  assert.equal(calls[0].attachmentCount, 0)
+  assert.equal(calls[0].hasSignal, true)
+})
+
+test('session/compact fails closed when the commands service is absent', async (t) => {
+  // 精简 profile 可能没有命令服务。此时必须回一条可读的错误，而不是抛栈
+  // 或假装成功——压缩没做就是没做。
+  const harness = await startHarness(t)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/create', cwd: '/work' })
+  const made = await client.next()
+  client.send({ type: 'session/compact', sessionId: made.sessionId })
+  const reply = await client.next()
+  assert.equal(reply.type, 'error')
+  assert.equal(reply.code, 'CAPABILITY_MISSING')
+  assert.match(reply.message, /命令服务/)
+})
+
+test('session/compact refuses a session that is not live instead of silently doing nothing', async (t) => {
+  const harness = await startHarness(t)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/compact', sessionId: 'session-does-not-exist' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'error')
+  assert.equal(reply.code, 'SESSION_NOT_FOUND')
+})
+
+test('a session created through the controller path still lands in the workspace list', async (t) => {
+  // 回归：`controller.create({ cwd })` 只建会话、不注册 workspace，导致该目录
+  // 永远不进 workspace.json；此后按 workspace 过滤的列表会把会话静默丢掉，
+  // 用户看到的就是"会话又没了"，而磁盘上的日志完好。
+  //
+  // 修复后 dshell 先 `registry.create(cwd)` 拿到 workspaceId，再交给
+  // controller——所以这里断言 controller 收到的是 workspaceId。
+  const cwd = '/tmp/controller-cwd-regress'
+  const received = []
+  const controller = {
+    async create(request) {
+      received.push(request)
+      const sessionId = 'session-controller-made'
+      makeSession(harness, sessionId, [], { cwd })
+      return { sessionId }
+    },
+    async read() { return undefined },
+    async history() { return { events: [], hasMore: false } },
+    async cancel() {},
+    async archive() {},
+    async unarchive() {},
+    async rename() {},
+    async fork() { return { sessionId: 'x' } },
+  }
+  const harness = await startHarness(t, {}, { sessionController: controller })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/create', cwd })
+  const created = await client.next()
+  assert.equal(created.type, 'session-created')
+  // 关键断言：controller 收到的是 workspaceId，而不是裸 cwd。传 cwd 会让内核
+  // 跳过 attachSession，那正是这个 bug 的成因。
+  assert.equal(received.length, 1)
+  assert.equal(typeof received[0].workspaceId, 'string')
+  assert.equal(received[0].cwd, undefined)
+  // 而且这个 workspace 必须真的登记在册，否则后续过滤依旧看不见会话。
+  client.send({ type: 'workspaces' })
+  const workspaces = await client.next()
+  const match = (workspaces.workspaces ?? []).find((workspace) => workspace.path === cwd)
+  assert.ok(match, `cwd must be registered as a workspace (got ${JSON.stringify((workspaces.workspaces ?? []).map((w) => w.path))})`)
+})
+
+test('a session whose cwd has no registered workspace is still visible under that workspace filter', async (t) => {
+  // 已经存在的孤儿会话（历史 bug 留下的）不能因为 workspace 缺失就被过滤掉：
+  // 过滤应当按 cwd 归属，而不是只认注册表。
+  const harness = await startHarness(t)
+  makeSession(harness, 'orphan', [], { cwd: '/tmp/never-registered-dir' })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/list' })
+  const all = await client.next()
+  assert.equal(all.sessions.some((session) => session.sessionId === 'orphan'), true)
+})
+
+test('startup adopts workspaces for parent sessions but never for subagents or deleted dirs', async (t) => {
+  // 两条硬约束：
+  //  1. subagent 的 cwd 与父会话相同，且本就不该出现在会话列表（isSubagentRow），
+  //     补登记也只围绕父会话做——否则统计口径会被子会话污染。
+  //  2. 磁盘上已删除的目录不补登记，避免留下永远打不开的空壳 workspace。
+  const os = await import('node:os')
+  const fs = await import('node:fs/promises')
+  const pathMod = await import('node:path')
+  const root = await fs.mkdtemp(pathMod.join(os.tmpdir(), 'dsh-adopt-'))
+  const alive = pathMod.join(root, 'alive-project')
+  await fs.mkdir(alive, { recursive: true })
+  const gone = pathMod.join(root, 'deleted-project')
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+
+  // 打开预热，让启动流程真的去跑补登记。索引文件路径由 startHarness 指定在
+  // 临时目录里，所以这里必须用同一个路径预写内容。
+  const indexDir = await fs.mkdtemp(pathMod.join(os.tmpdir(), 'dsh-adopt-idx-'))
+  t.after(() => fs.rm(indexDir, { recursive: true, force: true }))
+  const indexFile = pathMod.join(indexDir, 'session-index.jsonl')
+  await fs.writeFile(indexFile, [
+    { sessionId: 'parent-alive', cwd: alive, createdAt: 1 },
+    { sessionId: 'child-of-alive', cwd: alive, createdAt: 2, origin: 'subagent', parentSessionId: 'parent-alive' },
+    { sessionId: 'parent-gone', cwd: gone, createdAt: 3 },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n', 'utf8')
+  // startHarness 允许覆盖索引路径（它自己也用它做测试隔离）。
+  const harness = await startHarness(t, { warmSessionList: true, sessionIndexFile: indexFile })
+  // 预热在 apply 之后跑，轮询等待它把 workspace 补进来。
+  const pathsOf = () => [...harness.workspaces.values()].map((workspace) => workspace.path)
+  for (let i = 0; i < 100 && !pathsOf().includes(alive); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  const paths = pathsOf()
+  if (!paths.includes(alive)) {
+    const diag = await fs.readFile(indexFile, 'utf8').catch((e) => `unreadable: ${e}`)
+    assert.fail(`existing dir must be adopted, got ${JSON.stringify(paths)}; index=${String(diag).slice(0, 300)}`)
+  }
+  assert.equal(paths.includes(gone), false, 'deleted dir must not become a workspace')
+  // 子会话与父同 cwd，不应额外产生重复条目。
+  assert.equal(paths.filter((entry) => entry === alive).length, 1)
+})
+
 test('prompt acks, queues or steers, and resumes a cold agent', async (t) => {
   const harness = await startHarness(t)
   makeSession(harness, 's1', [])
