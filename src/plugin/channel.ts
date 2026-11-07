@@ -87,6 +87,7 @@ export class UnixSocketChannel implements Channel {
     socket.on('data', (chunk: string) => {
       this.buffer += chunk
       for (;;) {
+        if (this.closed) return
         const newline = this.buffer.indexOf('\n')
         if (newline < 0) break
         const line = this.buffer.slice(0, newline)
@@ -127,7 +128,9 @@ export class UnixSocketChannel implements Channel {
   }
 
   close(): void {
+    if (this.closed) return
     this.closed = true
+    this.onClose?.()
     this.socket.destroy()
   }
 }

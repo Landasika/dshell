@@ -524,6 +524,10 @@ export interface AcceptedMessage {
   sessionId: string
   requestId: string
   mode: 'queue' | 'steer'
+  /** Held by the Host until the current turn ends. */
+  deferred?: boolean
+  /** A previously deferred prompt has been handed to the agent. */
+  promoted?: boolean
 }
 
 export interface CancelledMessage {

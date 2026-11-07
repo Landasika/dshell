@@ -17,13 +17,12 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
-  openSync,
-  closeSync,
 } from 'node:fs'
 import { createServer, Socket, type Server } from 'node:net'
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http'
 
 import { UnixSocketChannel, type Channel } from './channel.js'
+import { acquireFileLock } from './file-lock.js'
 import { acceptUpgrade, WebSocketChannel } from './websocket.js'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 
@@ -699,7 +698,6 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const sessionCache = new Map<string, { at: number; sessions: SessionSummary[] }>()
   /** Running-session input state, cached with the same TTL as the list. */
   const activePrompt = new Map<string, string>()
-  const pendingInput = new Map<string, { at: number; value: 'approval' | 'question' | undefined }>()
   /**
    * 「此刻正在等用户」的会话集合，按原因分开。
    *
@@ -711,13 +709,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    */
   const waitingApproval = new Set<string>()
   const waitingQuestion = new Set<string>()
-  /**
-   * 待决审批的**插件侧**记录（requestId → 详情）。
-   *
-   * 与 `ApprovalCoordinator.pending` 的区别：那张表只在「有人 watch 这条
-   * 会话」时才登记（见 begin() 开头的 watchers 短路），而列表要在**没人
-   * watch** 的时候也能告诉客户端"这条会话在等审批、requestId 是这个"。
-   */
+  /** Pending approval details for session-list cards, including unwatched sessions. */
   const pendingApprovalInfo = new Map<string, {
     sessionId: string
     toolName?: string
@@ -746,6 +738,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     channel: Channel
   }
   const deferredQueue = new Map<string, DeferredPrompt[]>()
+  const deferredTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  // Keep the reservation through admission and the entire resulting turn.
+  const deferredFlights = new Map<string, { started: boolean }>()
   const titleCache = new Map<string, { at: number; title: string }>()
   const previewCache = new Map<string, { at: number; preview: string }>()
   /**
@@ -884,24 +879,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * 两处调用方（索引主路径、慢路径）都要用它。之前只有慢路径有推断逻辑，
    * 而索引命中时根本走不到慢路径，所以手机首页永远拿不到 needsInput。
    */
-  /**
-   * 把待决审批转成列表可以直接下发的形状。
-   *
-   * **不能**用 `approvals.snapshot()`：`ApprovalCoordinator.begin()` 开头有一句
-   *
-   *     if (this.hooks.watchers(request.sessionId) === 0) {
-   *       const outcome = await request.next()   // 直接交给 Host，不注册 pending
-   *       ...
-   *     }
-   *
-   * 也就是说，**没有 watcher 时它根本不把请求记进 pending 表**。而手机没
-   * 点进会话时恰好没有 watcher——于是 snapshot 永远是空的，列表里
-   * `needsInput=approval` 却 `permissions=[]`，审批卡画得出来却点不了。
-   * 实测正是如此。
-   *
-   * 所以这里用插件自己的 `pendingApprovalInfo`：不管有没有 watcher，
-   * 只要 handleApproval 跑过就记一条。
-   */
+  /** Build actionable approval cards from the pending request details. */
   const permissionsOf = (sessionId: string): NonNullable<SessionSummary['permissions']> => {
     const found: NonNullable<SessionSummary['permissions']> = []
     for (const [requestId, info] of pendingApprovalInfo) {
@@ -924,6 +902,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
    * 于是"排队"又退化回"插队"。
    */
   const flushDeferred = async (sessionId: string): Promise<void> => {
+    if (closing || deferredFlights.has(sessionId) || deferredTimers.has(sessionId)) return
     const list = deferredQueue.get(sessionId)
     if (list === undefined || list.length === 0) return
     const agent = ctx.agents.get(sessionId)
@@ -933,16 +912,19 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       return
     }
     if (agent.status === 'running') {
-      // `turn/end` 事件比 agent 状态落定**早一点**：日志里每次都是
-      //   status=running → 300ms 后 status=idle
-      // 如果在这里直接 return，这条消息会永远卡在插件侧（实测 50 秒都没投递）。
-      // 300ms 重试一次足够，且不会无限循环——下一次进来状态一定是 idle。
-      setTimeout(() => { void flushDeferred(sessionId) }, 300)
+      const timer = setTimeout(() => {
+        deferredTimers.delete(sessionId)
+        void flushDeferred(sessionId)
+      }, 300)
+      timer.unref()
+      deferredTimers.set(sessionId, timer)
       return
     }
     const next = list.shift()
     if (next === undefined) return
     if (list.length === 0) deferredQueue.delete(sessionId)
+    const flight = { started: false }
+    deferredFlights.set(sessionId, flight)
     try {
       const controller = sessionController()
       if (controller?.prompt) {
@@ -972,6 +954,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         })
       }
     } catch (error) {
+      if (deferredFlights.get(sessionId) === flight) deferredFlights.delete(sessionId)
       if (next.channel.alive) {
         sendError(next.channel, {
           type: 'error',
@@ -1448,75 +1431,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     finally { if (resuming.get(sessionId) === operation) resuming.delete(sessionId) }
   }
 
-  /**
-   * 给子会话补标题（按需，只补请求里的那几条）。
-   *
-   * 子会话 header 没有 title，标题在事件流的 `session/title` 里。列表只给前
-   * 24 行解析标题，266 个子会话永远轮不到，所以索引里 title 全是空。
-   *
-   * 约束：
-   *  - **并发 4 路**：一次 readSession 要几百毫秒，73 个子会话串行要几十秒；
-   *  - **总预算 3 秒**：超时就放弃，宁可显示 ID 也不能让接口挂住；
-   *  - **补到就写回索引**：索引是追加式的，下次就不用再读日志了；
-   *  - **失败静默**：标题是展示信息，读不到不该影响这条子任务本身。
-   */
   const childTitleCache = new Map<string, string>()
 
-  /**
-   * 从事件流里取会话标题。
-   *
-   * 两个来源，优先前者：
-   *  - `session/title` 事件 —— Host 自己算好并落盘的标题（实测存在，
-   *    形如 `{data:{title:"任务：在互联网上寻找…"}}`）；
-   *  - 第一条真实用户消息 —— 老会话可能没有 title 事件，用首行兜底。
-   *
-   * 两者都没有就返回 undefined，让调用方显示 ID 前 8 位，而不是编一个假标题。
-   */
-  const titleFromEvents = (events: readonly { type?: string; data?: unknown }[]): string | undefined => {
-    for (let i = events.length - 1; i >= 0; i -= 1) {
-      const event = events[i]
-      if (event?.type !== 'session/title') continue
-      const data = event.data as { title?: unknown } | undefined
-      const title = typeof data?.title === 'string' ? data.title.trim() : ''
-      if (title.length > 0) return title
-    }
-    for (const event of events) {
-      if (event?.type !== 'user/message') continue
-      const data = event.data as { message?: { source?: { kind?: string } } } | undefined
-      const source = data?.message?.source
-      if (source?.kind !== 'user') continue
-      const text = latestUserPreview([event as never], { maxChars: 40 })
-      if (text !== undefined && text.length > 0) return text
-    }
-    return undefined
-  }
-
-  /**
-   * 给子会话补标题（按需，只补请求里的那几条）。
-   *
-   * ## 为什么需要这一步
-   *
-   * 子会话 header 里**没有 title 字段**（实测：只有 type/version/id/createdAt/
-   * cwd/isSeeded/delegationDepth/agentPreset），标题是后来从事件流的
-   * `session/title` 算出来的。而列表只给前 24 行解析标题，266 个子会话永远
-   * 轮不到——索引里 title 全是空。不补的话，App 里那 73 条子任务会显示成
-   * 一串 `session-xxx` ID，用户等于看到一列乱码。
-   *
-   * ## 为什么用 readTitleSnapshots 而不是 readSession
-   *
-   * 实测：`readSession` 要**投影整个事件流**，单条就超过 1.5 秒（日志里刷的
-   * 全是 `child title timed out after 1500ms`）。73 条串行要几分钟，并行也会
-   * 打爆投影存储——上游注释明确写了「projection store serializes snapshot
-   * reads」。`readTitleSnapshots` 是**只算标题**的专用路径，几百毫秒一条，
-   * 而且它内部有缓存。
-   *
-   * ## 约束
-   *
-   *  - **并发 6 路** + **总预算 12 秒**：补不到就放弃，宁可显示 ID 也不能
-   *    让接口挂住；
-   *  - **补到就写回索引**：索引是追加式的，下次不必再算；
-   *  - **失败静默**：标题是展示信息，读不到不该影响这条子任务本身。
-   */
   /**
    * 直接读会话日志里的 `session/title`，绕开 Host 的投影。
    *
@@ -1567,8 +1483,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         } catch { /* 坏行跳过 */ }
       }
       if (fallback === undefined && line.includes('"user/message"')) {
-        const preview = latestUserPreview([JSON.parse(line) as never], { maxChars: 40 })
-        if (preview !== undefined && preview.length > 0) fallback = preview
+        try {
+          const preview = latestUserPreview([JSON.parse(line) as never], { maxChars: 40 })
+          if (preview !== undefined && preview.length > 0) fallback = preview
+        } catch { /* Skip truncated log records. */ }
       }
     }
     return fallback
@@ -1673,15 +1591,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         // dshell 的 TUI 是硬编码 switch 的命令分发器，`/compact` 原来不在其中，
         // 命令掉进 default 被当成 "unknown command" 丢掉——即使压缩后端
         // （compaction-basic）其实已经由 preset 挂在会话上了。这里补上入口。
-        const live = ctx.agents.get(sessionId)
-        if (live === undefined) {
-          sendError(channel, {
-            type: 'error',
-            code: 'SESSION_NOT_FOUND',
-            message: '会话没有在运行，先打开它再压缩',
-          })
-          return
-        }
+        const live = await liveAgent(sessionId)
         // 走 commands 服务执行 `/compact`，而不是自己去 ctx 上找 compaction。
         //
         // 这条路才是权威的：`dsh-command-compact` 把 `/compact` 注册进 commands
@@ -2178,10 +2088,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     }
     // Fallback for Hosts without configEditor: serialize dshell writers and detect external edits.
     const lock = file + '.dshell-lock'
-    let fd: number | undefined
+    let release: (() => void) | undefined
     const temporary = file + '.dshell-' + randomUUID()
     try {
-      fd = openSync(lock, 'wx', 0o600)
+      release = acquireFileLock(lock)
       if (safeRead(file) !== before) {
         sendError(channel, { type: 'error', code: 'CONFIG_CONFLICT', message: 'configuration changed; reload providers and retry' })
         return false
@@ -2190,7 +2100,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       renameSync(temporary, file)
       return true
     } finally {
-      if (fd !== undefined) { closeSync(fd); try { unlinkSync(lock) } catch {} }
+      release?.()
       try { unlinkSync(temporary) } catch {}
     }
   }
@@ -2837,7 +2747,6 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     if (![...questionRequests.values()].some((entry) => entry.sessionId === pending.sessionId)) {
       waitingQuestion.delete(pending.sessionId)
     }
-    pendingInput.delete(pending.sessionId)
     settledAsks.add(callId)
     if (settledAsks.size > 200) {
       const oldest = settledAsks.values().next().value
@@ -3255,21 +3164,9 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       ? message.requestId
       : `dshell-${randomUUID()}`
 
-    // ── 严格排队：回合还开着就先扣下 ──
-    //
-    // `mode: 'steer'`（"插一句"）不排队——它的语义本来就是立刻插进当前回合，
-    // 那个不受影响。只有 `queue` 需要等到回合结束。
-    if (mode === 'queue' && agent.status === 'running') {
-      const list = deferredQueue.get(message.sessionId) ?? []
-      list.push({ requestId, content, sessionId: message.sessionId, channel })
-      deferredQueue.set(message.sessionId, list)
-      jsonLine(channel, { type: 'accepted', sessionId: message.sessionId, requestId, mode, deferred: true })
-      return
-    }
-
     if (message.requireIdle === true) {
       const snapshot = agent.status === undefined ? await ctx.sessionQuery.readSession(message.sessionId) : undefined
-      if (agent.status === 'running' || (snapshot && openTurn(snapshot.events)) || (agent.inbox?.nextTurn.length ?? 0) > 0 || (agent.inbox?.nextStep.length ?? 0) > 0) {
+      if (agent.status === 'running' || deferredFlights.has(message.sessionId) || deferredQueue.has(message.sessionId) || (snapshot && openTurn(snapshot.events)) || (agent.inbox?.nextTurn.length ?? 0) > 0 || (agent.inbox?.nextStep.length ?? 0) > 0) {
         sendError(channel, { type: 'error', code: 'SESSION_ACTIVE', message: 'print requires an idle session; use --new or wait for the current turn' })
         return
       }
@@ -3279,7 +3176,21 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(channel, { type: 'error', code: 'UNSUPPORTED_CAPABILITY', message: 'this Host cannot admit image or file prompt content' })
       return
     }
+    // ── 严格排队：回合还开着就先扣下 ──
+    //
+    // `mode: 'steer'`（"插一句"）不排队——它的语义本来就是立刻插进当前回合，
+    // 那个不受影响。只有 `queue` 需要等到回合结束。
+    if (mode === 'queue' && (agent.status === 'running' || deferredFlights.has(message.sessionId) || deferredQueue.has(message.sessionId))) {
+      const list = deferredQueue.get(message.sessionId) ?? []
+      list.push({ requestId, content, sessionId: message.sessionId, channel })
+      deferredQueue.set(message.sessionId, list)
+      jsonLine(channel, { type: 'accepted', sessionId: message.sessionId, requestId, mode, deferred: true })
+      return
+    }
+
     if (message.requireIdle === true) activePrompt.set(message.sessionId, requestId)
+    const flight = { started: false }
+    if (mode === 'queue') deferredFlights.set(message.sessionId, flight)
     try {
       if (controller?.prompt) {
         await controller.prompt({ sessionId: message.sessionId, requestId, mode, content }, new AbortController().signal)
@@ -3290,6 +3201,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         else agent.followup(userMessage)
       }
     } catch (error) {
+      if (deferredFlights.get(message.sessionId) === flight) deferredFlights.delete(message.sessionId)
       if (activePrompt.get(message.sessionId) === requestId) activePrompt.delete(message.sessionId)
       throw error
     }
@@ -3388,14 +3300,20 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'queue/edit needs sessionId, requestId and text' })
       return
     }
+    if (message.text.trim().length === 0) {
+      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'a queued prompt cannot be empty' })
+      return
+    }
+    const deferred = deferredQueue.get(message.sessionId)?.find(entry => entry.requestId === message.requestId)
+    if (deferred !== undefined) {
+      deferred.content = [{ type: 'text', text: message.text }]
+      jsonLine(channel, { type: 'queue-updated', sessionId: message.sessionId, requestId: message.requestId, action: 'edit' })
+      return
+    }
     const agent = ctx.agents.get(message.sessionId)
     const pending = agent === undefined ? undefined : queuedMessage(agent, message.requestId)
     if (agent === undefined || agent.inbox === undefined || pending === undefined) {
       sendError(channel, { type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'that prompt is no longer queued' })
-      return
-    }
-    if (message.text.trim().length === 0) {
-      sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'a queued prompt cannot be empty' })
       return
     }
     agent.inbox.replace(message.requestId, { ...pending, content: [{ type: 'text', text: message.text }] })
@@ -3444,10 +3362,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(channel, { type: 'error', code: 'BAD_REQUEST', message: 'approval outcome must be allowed-once or rejected' })
       return
     }
-    // 先用插件侧的表定位会话：`approvals.sessionOf()` 只在有 watcher 时
-    // 才有条目（begin() 开头会短路掉没 watcher 的请求），而手机很可能
-    // 根本没点进这条会话——那样就会误报 APPROVAL_NOT_PENDING，
-    // 用户点"允许"永远失败。
+    // Requests remain answerable even before the client watches their session.
     const known = pendingApprovalInfo.get(message.requestId)
     const sessionId = known?.sessionId ?? approvals.sessionOf(message.requestId)
     if (sessionId === undefined) {
@@ -3465,13 +3380,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       approvals.answer(message.requestId, message.outcome)
       return
     }
-    // 没有 watcher 的那条路：`begin()` 把请求直接交给了 Host 的瀑布流，
-    // 我们手里没有可 resolve 的入口。如实告诉客户端"这条得在电脑上处理"，
-    // 而不是假装成功。
+    // The request may have settled between the metadata lookup and the answer.
     sendError(channel, {
       type: 'error',
       code: 'APPROVAL_NOT_PENDING',
-      message: 'this approval is being handled by the Host itself; answer it on the computer',
+      message: `approval "${message.requestId}" is no longer pending`,
     })
   }
 
@@ -3656,14 +3569,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
                 })
             }
           }
-          // 子会话的 header 里**没有 title 字段**（实测确认：header 只有
-          // type/version/id/createdAt/cwd/isSeeded/delegationDepth/agentPreset），
-          // 标题是后来从事件流的 `session/title` 事件里算出来的。而列表只给
-          // 前 24 行解析标题，266 个子会话根本轮不到——索引里 title 全是空。
-          //
-          // 不补的话，App 里这 73 条子任务会显示成一串 `session-xxx` ID，
-          // 用户等于看到一列乱码。这里按需补：只补当前这个父会话的，
-          // 并发 4 路、总预算 3 秒，补不到的留空（绝不因此让整个请求挂掉）。
+          // Fill missing child titles from logs before returning the requested family.
           await fillChildTitles(kids)
           const children = kids
             .map(row => ({
@@ -4043,13 +3949,17 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       if (typeof id === 'string') activePrompt.set(session.id, id)
       previewCache.delete(session.id)
     }
+    if (event.type === 'turn/start') {
+      const flight = deferredFlights.get(session.id)
+      if (flight !== undefined) flight.started = true
+    }
     if (event.type === 'turn/end' || event.type === 'turn/failed') {
       activePrompt.delete(session.id)
-      // 回合真正收尾了，才把排队的消息按 FIFO 放行。
-      // 用 queueMicrotask 而不是直接同步投递：此刻内核还停在 turn 收尾的
-      // 回调栈里，同步调用 followup 会被它自己"running 期间不接受新 turn"
-      // 的判断挡掉，消息就永远卡住了。
-      queueMicrotask(() => { void flushDeferred(session.id) })
+      const flight = deferredFlights.get(session.id)
+      if (flight === undefined || flight.started) {
+        deferredFlights.delete(session.id)
+        queueMicrotask(() => { void flushDeferred(session.id) })
+      }
     }
     broadcast(session.id, { type: 'event', sessionId: session.id, event })
   })
@@ -4099,11 +4009,8 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
         next,
       })
     } finally {
-      waitingApproval.delete(sessionId)
       pendingApprovalInfo.delete(requestId)
-      // 审批已有结论，之前缓存的「在等人」判定作废，否则下一帧列表还会
-      // 报 waiting-approval。清掉即可，重新计算是 O(1)。
-      pendingInput.delete(sessionId)
+      if (![...pendingApprovalInfo.values()].some(info => info.sessionId === sessionId)) waitingApproval.delete(sessionId)
     }
   }
 
@@ -4121,6 +4028,14 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     disposeAgentStatus()
     disposeApproval()
     disposeQuestion()
+    closing = true
+    for (const timer of deferredTimers.values()) clearTimeout(timer)
+    for (const peer of [...clients]) peer.close()
+    approvals.dispose()
+    if (wsServer !== undefined) {
+      wsServer.closeAllConnections()
+      await new Promise<void>(resolve => wsServer.close(() => resolve()))
+    }
     await closeServer(server)
     throw error
   }
@@ -4142,6 +4057,10 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   const close = async (): Promise<void> => {
     if (closing) return
     closing = true
+    for (const timer of deferredTimers.values()) clearTimeout(timer)
+    deferredTimers.clear()
+    deferredFlights.clear()
+    deferredQueue.clear()
     disposeSessionEvent()
     disposeAssistantStream()
     disposeAgentStatus()
@@ -4163,6 +4082,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     // WS 监听必须一起关：否则卸载插件（或测试结束）后端口仍被占着，
     // 进程也退不出去——这是个真实的句柄泄漏，不是测试环境特有的。
     if (wsServer !== undefined) {
+      wsServer.closeAllConnections()
       await new Promise<void>((resolve) => wsServer.close(() => resolve()))
     }
     for (const handle of handles.values()) {

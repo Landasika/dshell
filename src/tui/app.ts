@@ -244,7 +244,7 @@ interface AppState {
   /** Last reasoning level picked per `provider/model`. */
   modelEfforts: Record<string, string>
   /** Prompts handed to the running turn, shown until they reach the transcript. */
-  queued: { requestId: string; text: string; at: number; mode: 'queue' | 'steer' }[]
+  queued: { requestId: string; text: string; at: number; mode: 'queue' | 'steer'; deferred?: boolean }[]
   /** Pending inbox folded from `agent/inbox/spliced` — every client's queue. */
   inbox: InboxState
   /** Rows this client removed, hidden until the Host confirms (or 5s pass). */
@@ -254,7 +254,7 @@ interface AppState {
   /** Index into the navigable transcript items (blocks, then queued rows). */
   focus?: number
   /** A queued prompt pulled back into the composer for editing. */
-  editingQueued?: { requestId: string; text: string; mode: 'queue' | 'steer'; local: boolean }
+  editingQueued?: { requestId: string; text: string; mode: 'queue' | 'steer'; local: boolean; deferred?: boolean }
   /** Provider rows read from the Host's patch file. */
   providers?: ProviderList
   /** Full content behind each folded paste placeholder in the composer. */
@@ -275,6 +275,7 @@ interface AppState {
 
 /** One row under the transcript: a prompt waiting in the Host's inbox. */
 interface QueueEntry {
+  deferred?: boolean
   requestId: string
   text: string
   at: number
@@ -492,6 +493,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let modelChange: { sessionId: string; generation: number; selection: ModelSelection; recovering: boolean; overlay: Overlay | null } | undefined
   let savingModelDefault = false
   let cancellingHandle: SessionHandle | undefined
+  let queuedEditBusy = false
+  let speedTurn: string | undefined
   let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
   let lastTurnFailure: string | undefined
   /** Call id already announced as waiting behind another panel. */
@@ -582,8 +585,15 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     resolveDone?.(code)
   }
 
+  const sessionQueues = new Map<string, {
+    queued: AppState['queued']
+    editingQueued: AppState['editingQueued']
+  }>()
+
   const captureSessionState = (): void => {
     if (state.currentId === undefined) return
+    if (state.overlay?.kind === 'questions') state.questionDrafts.set(state.overlay.callId, state.overlay)
+    sessionQueues.set(state.currentId, { queued: state.queued, editingQueued: state.editingQueued })
     stateStore.set(state.currentId, {
       draft: state.editor.text,
       approvalMode: state.approvalMode,
@@ -593,6 +603,18 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const restoreSessionState = (sessionId: string): void => {
     const saved = stateStore.get(sessionId)
+    const queue = sessionQueues.get(sessionId)
+    state.queued = queue?.queued ?? []
+    state.editingQueued = queue?.editingQueued
+    state.approvalBusy = false
+    state.modelOverride = undefined
+    state.inbox = foldInbox([])
+    state.hiddenQueued.clear()
+    state.queueText.clear()
+    state.overlay = null
+    state.focus = undefined
+    state.tpsSamples = []
+    state.speedPrevious = undefined
     state.editor = createEditor(saved?.draft ?? '')
     state.approvalMode = saved?.approvalMode ?? 'ask'
     state.attachments = new Map(saved?.attachments.map(item => [item.placeholder, item.text]) ?? [])
@@ -653,6 +675,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (view.status !== 'running') {
       state.speedPrevious = undefined
       return
+    }
+    const turn = `${view.sessionId}:${currentMetrics().turnStartedAt ?? ''}`
+    if (speedTurn !== turn || state.speedPrevious === undefined) {
+      state.tpsSamples = []
+      state.speedPrevious = undefined
+      speedTurn = turn
     }
     const now = Date.now()
     const next = nextSpeedSample(
@@ -733,7 +761,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       if (started.has(entry.requestId)) return false
       // Idle for a few seconds without the prompt starting means the Host
       // discarded it (a cancel with the inbox dropped); stop showing it.
-      return view.status === 'running' || now - entry.at < 5_000
+      return entry.deferred === true || view.status === 'running' || now - entry.at < 5_000
     })
   }
 
@@ -853,6 +881,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       const item = [...state.inbox.nextTurn, ...state.inbox.nextStep].find((entry) => entry.id === id)
       if (item === undefined || item.text === text) state.queueText.delete(id)
     }
+    if (view.promptAdmission?.promoted) {
+      const entry = state.queued.find(item => item.requestId === view.promptAdmission!.requestId)
+      if (entry?.deferred) {
+        entry.deferred = false
+        entry.at = Date.now()
+      }
+    }
     pruneQueued(view)
     sampleSpeed(view)
     const approvals = view.pendingApprovals?.length ? view.pendingApprovals : view.pendingApproval === undefined ? [] : [view.pendingApproval]
@@ -865,7 +900,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         if (selectedApproval !== undefined && approvals.some(item => item.requestId === selectedApproval)) {
           // Keep the reader on the approval they selected.
         } else {
-        state.overlay = { kind: 'approval', requestId: approvals[0]!.requestId, details: false }
+          if (state.overlay?.kind === 'questions') state.questionDrafts.set(state.overlay.callId, state.overlay)
+          state.overlay = { kind: 'approval', requestId: approvals[0]!.requestId, details: false }
         }
       }
     } else if (state.overlay?.kind === 'approval') {
@@ -906,11 +942,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         next.dispose()
         return
       }
+      captureSessionState()
       state.handle?.dispose()
       state.handle = next
       state.currentId = sessionId
       restoreSessionState(sessionId)
-      state.approvalBusy = false
       state.error = undefined
       state.modelOverride = undefined
       applyView(next.snapshot())
@@ -1085,6 +1121,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    const handle = state.handle
+    const generation = sessionGeneration
+    const content = expandAttachments(trimmed)
+    const attachments = [...state.attachments].map(([placeholder, text]) => ({ kind: 'text' as const, placeholder, text }))
+    const isCurrent = (): boolean => state.handle === handle && sessionGeneration === generation && !state.quitting
     state.history.push(trimmed)
     if (state.history.length > 100) state.history.shift()
     state.historyIndex = -1
@@ -1098,28 +1139,42 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     reportHerdr(state.view, 'working')
     schedule()
     try {
-      const handle = state.handle
       // The writer lease can change hands right as we send (a Host restart
       // finishing, another writer's turn ending); retry briefly so /continue
       // and auto-continue survive the handoff instead of erroring the turn.
       const receipt = await retryOnWriterHeld(
-        () => handle.send(expandAttachments(trimmed), { mode }),
+        () => handle.send(content, { mode }),
         {
           onRetry: (attempt, total) => {
+            if (!isCurrent()) return
             toast(`session held by another writer · retrying ${attempt}/${total}`)
             schedule()
           },
         },
       )
-      if (wasRunning) {
+      if (wasRunning || receipt.deferred) {
         // The transcript only shows the message once the Host delivers it, so
         // keep it visible until its user/message arrives.
-        state.queued.push({ requestId: receipt.requestId, text: trimmed, at: Date.now(), mode: receipt.mode ?? mode })
+        const queued = isCurrent() ? state.queued : sessionQueues.get(handle.id)?.queued
+        const promoted = isCurrent() && state.view?.promptAdmission?.requestId === receipt.requestId && state.view.promptAdmission.promoted
+        queued?.push({ requestId: receipt.requestId, text: trimmed, at: Date.now(), mode: receipt.mode ?? mode, deferred: receipt.deferred === true && !promoted })
+        if (isCurrent() && state.view !== undefined) pruneQueued(state.view)
       }
-      state.status = 'waiting for turn'
+      if (isCurrent()) state.status = 'waiting for turn'
     } catch (error) {
-      state.error = errorText(error)
-      state.status = 'error'
+      if (isCurrent()) {
+        state.editor = createEditor([trimmed, state.editor.text].filter(Boolean).join('\n'))
+        for (const item of attachments) state.attachments.set(item.placeholder, item.text)
+        state.error = errorText(error)
+        state.status = 'error'
+      } else {
+        const saved = stateStore.get(handle.id)
+        stateStore.set(handle.id, {
+          draft: [trimmed, saved?.draft].filter(Boolean).join('\n'),
+          approvalMode: saved?.approvalMode ?? 'ask',
+          attachments: [...(saved?.attachments ?? []), ...attachments],
+        })
+      }
     }
     schedule()
   }
@@ -1149,16 +1204,19 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     const requestId = state.overlay?.kind === 'approval' ? state.overlay.requestId : state.view?.pendingApproval?.requestId
     const pending = state.view?.pendingApprovals?.find(item => item.requestId === requestId) ?? state.view?.pendingApproval
     if (pending === undefined || state.handle === undefined || state.approvalBusy) return
+    const handle = state.handle
+    const generation = sessionGeneration
     state.approvalBusy = true
     state.status = outcome === 'allowed-once' ? 'approving' : 'rejecting'
     schedule()
     try {
-      await state.handle.answerApproval(pending.requestId, outcome)
+      await handle.answerApproval(pending.requestId, outcome)
+      if (state.handle !== handle || sessionGeneration !== generation) return
       toast(outcome === 'allowed-once' ? 'allowed once' : 'rejected')
     } catch (error) {
-      state.error = errorText(error)
+      if (state.handle === handle && sessionGeneration === generation) state.error = errorText(error)
     } finally {
-      state.approvalBusy = false
+      if (state.handle === handle && sessionGeneration === generation) state.approvalBusy = false
       schedule()
     }
   }
@@ -1174,14 +1232,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (pending === undefined || state.handle === undefined || state.approvalBusy) return
     if (state.approvalMode !== 'auto') return
     const requestId = pending.requestId
+    const handle = state.handle
+    const generation = sessionGeneration
+    const isCurrent = (): boolean => state.handle === handle && sessionGeneration === generation
     state.approvalBusy = true
-    void state.handle.answerApproval(requestId, 'allowed-once')
-      .then(() => toast(`allowed ${pending.toolName ?? 'tool'} · allow all`))
+    void handle.answerApproval(requestId, 'allowed-once')
+      .then(() => { if (isCurrent()) toast(`allowed ${pending.toolName ?? 'tool'} · allow all`) })
       .catch((error: unknown) => {
-        state.error = errorText(error)
+        if (isCurrent()) state.error = errorText(error)
       })
       .finally(() => {
-        state.approvalBusy = false
+        if (isCurrent()) state.approvalBusy = false
         schedule()
       })
   }
@@ -2035,195 +2096,203 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const runCommand = async (text: string): Promise<void> => {
-    const [command, ...rest] = text.trim().split(/\s+/)
-    const argument = rest.join(' ')
-    switch (command) {
-      case '/quit':
-      case '/exit':
-        quit(0)
-        return
-      case '/help':
-      case '/?':
-        state.overlay = { kind: 'help' }
-        schedule()
-        return
-      case '/sessions':
-      case '/session':
-      case '/resume':
-        state.status = 'listing sessions'
-        schedule()
-        await refreshSessions()
-        state.status = 'idle'
-        state.overlay = { kind: 'sessions', index: 0 }
-        schedule()
-        return
-      case '/archived':
-        state.status = 'listing archived sessions'
-        schedule()
-        try {
-          state.sessions = await backend.listSessions(undefined, true)
-          state.overlay = { kind: 'sessions', index: 0, archived: true }
-        } catch (error) { toast(`archived sessions failed: ${errorText(error)}`) }
-        state.status = 'idle'
-        schedule()
-        return
-      case '/rename':
-        if (!state.currentId || !argument.trim()) { toast('/rename needs a title and an attached session'); return }
-        try {
-          await backend.sessionAction('rename', state.currentId, argument.trim())
-          if (state.view) state.view = { ...state.view, header: { ...state.view.header, title: argument.trim() } }
-          await refreshSessions(workspaceIdForCwd(canonicalPath(state.view?.header.cwd ?? options.cwd)))
-          toast('session renamed')
-        } catch (error) { toast(`rename failed: ${errorText(error)}`) }
-        schedule()
-        return
-      case '/archive':
-        if (!state.currentId) { toast('attach a session first'); return }
-        try { await backend.sessionAction('archive', state.currentId); await refreshSessions(); toast('session archived') }
-        catch (error) { toast(`archive failed: ${errorText(error)}`) }
-        return
-      case '/pin':
-        if (!state.currentId) { toast('attach a session first'); return }
-        try {
-          const row = (await backend.listSessions(undefined, true)).find(item => item.sessionId === state.currentId)
-          await backend.sessionAction('pin', state.currentId, row?.pinned !== true)
+    try {
+      const [command, ...rest] = text.trim().split(/\s+/)
+      const argument = rest.join(' ')
+      switch (command) {
+        case '/quit':
+        case '/exit':
+          quit(0)
+          return
+        case '/help':
+        case '/?':
+          state.overlay = { kind: 'help' }
+          schedule()
+          return
+        case '/sessions':
+        case '/session':
+        case '/resume':
+          state.status = 'listing sessions'
+          schedule()
           await refreshSessions()
-          toast(row?.pinned === true ? 'session unpinned' : 'session pinned')
-        } catch (error) { toast(`pin failed: ${errorText(error)}`) }
-        return
-      case '/compact':
-        // 手动上下文压缩。等价于 dsh 的 `/compact`。
-        //
-        // dshell 的 runCommand 是个硬编码 switch，原来没有这一条，于是
-        // `/compact` 掉进 default 被当成 "unknown command" 丢掉——即使
-        // 压缩后端（compaction-basic）其实已经由 preset 挂在会话上了。
-        if (!state.currentId) { toast('attach a session first'); return }
-        try {
-          toast('compacting…')
-          const result = await backend.sessionAction('compact', state.currentId)
-          if (result.empty === true) {
-            toast('nothing to compact yet')
-          } else if (typeof result.text === 'string' && result.text.length > 0) {
-            // 内核命令的回执最准确（会说明压了多少条、省了多少 token），
-            // 优先用它，不在这里改写它的措辞。
-            toast(result.text)
-          } else if (typeof result.freedTokens === 'number' && result.freedTokens > 0) {
-            toast(`compacted · freed ~${result.freedTokens} tokens`)
-          } else {
-            toast('context compacted')
+          state.status = 'idle'
+          state.overlay = { kind: 'sessions', index: 0 }
+          schedule()
+          return
+        case '/archived':
+          state.status = 'listing archived sessions'
+          schedule()
+          try {
+            state.sessions = await backend.listSessions(undefined, true)
+            state.overlay = { kind: 'sessions', index: 0, archived: true }
+          } catch (error) { toast(`archived sessions failed: ${errorText(error)}`) }
+          state.status = 'idle'
+          schedule()
+          return
+        case '/rename':
+          if (!state.currentId || !argument.trim()) { toast('/rename needs a title and an attached session'); return }
+          try {
+            await backend.sessionAction('rename', state.currentId, argument.trim())
+            if (state.view) state.view = { ...state.view, header: { ...state.view.header, title: argument.trim() } }
+            await refreshSessions(workspaceIdForCwd(canonicalPath(state.view?.header.cwd ?? options.cwd)))
+            toast('session renamed')
+          } catch (error) { toast(`rename failed: ${errorText(error)}`) }
+          schedule()
+          return
+        case '/archive':
+          if (!state.currentId) { toast('attach a session first'); return }
+          try { await backend.sessionAction('archive', state.currentId); await refreshSessions(); toast('session archived') }
+          catch (error) { toast(`archive failed: ${errorText(error)}`) }
+          return
+        case '/pin':
+          if (!state.currentId) { toast('attach a session first'); return }
+          try {
+            const row = (await backend.listSessions(undefined, true)).find(item => item.sessionId === state.currentId)
+            await backend.sessionAction('pin', state.currentId, row?.pinned !== true)
+            await refreshSessions()
+            toast(row?.pinned === true ? 'session unpinned' : 'session pinned')
+          } catch (error) { toast(`pin failed: ${errorText(error)}`) }
+          return
+        case '/compact':
+          // 手动上下文压缩。等价于 dsh 的 `/compact`。
+          //
+          // dshell 的 runCommand 是个硬编码 switch，原来没有这一条，于是
+          // `/compact` 掉进 default 被当成 "unknown command" 丢掉——即使
+          // 压缩后端（compaction-basic）其实已经由 preset 挂在会话上了。
+          if (!state.currentId) { toast('attach a session first'); return }
+          try {
+            toast('compacting…')
+            const result = await backend.sessionAction('compact', state.currentId)
+            if (result.empty === true) {
+              toast('nothing to compact yet')
+            } else if (typeof result.text === 'string' && result.text.length > 0) {
+              // 内核命令的回执最准确（会说明压了多少条、省了多少 token），
+              // 优先用它，不在这里改写它的措辞。
+              toast(result.text)
+            } else if (typeof result.freedTokens === 'number' && result.freedTokens > 0) {
+              toast(`compacted · freed ~${result.freedTokens} tokens`)
+            } else {
+              toast('context compacted')
+            }
+            // 压缩改变了历史形状，列表里的标题/摘要都要重取。
+            await refreshSessions()
+          } catch (error) { toast(`compact failed: ${errorText(error)}`) }
+          return
+        case '/fork':
+          if (!state.currentId) { toast('attach a session first'); return }
+          try {
+            const result = await backend.sessionAction('fork', state.currentId)
+            if (result.sessionId) await openSession(result.sessionId)
+          } catch (error) { toast(`fork failed: ${errorText(error)}`) }
+          return
+        case '/workspaces':
+          state.status = 'listing sessions'
+          schedule()
+          await refreshSessions()
+          state.status = 'idle'
+          state.overlay = { kind: 'workspaces', index: 0 }
+          schedule()
+          return
+        case '/new':
+          await createSession(argument.length === 0 ? options.cwd : argument)
+          return
+        case '/attach':
+          if (argument.length === 0) {
+            toast('/attach needs a session id')
+            return
           }
-          // 压缩改变了历史形状，列表里的标题/摘要都要重取。
-          await refreshSessions()
-        } catch (error) { toast(`compact failed: ${errorText(error)}`) }
-        return
-      case '/fork':
-        if (!state.currentId) { toast('attach a session first'); return }
-        try {
-          const result = await backend.sessionAction('fork', state.currentId)
-          if (result.sessionId) await openSession(result.sessionId)
-        } catch (error) { toast(`fork failed: ${errorText(error)}`) }
-        return
-      case '/workspaces':
-        state.status = 'listing sessions'
-        schedule()
-        await refreshSessions()
-        state.status = 'idle'
-        state.overlay = { kind: 'workspaces', index: 0 }
-        schedule()
-        return
-      case '/new':
-        await createSession(argument.length === 0 ? options.cwd : argument)
-        return
-      case '/attach':
-        if (argument.length === 0) {
-          toast('/attach needs a session id')
+          await openSession(argument)
+          return
+        case '/cancel':
+          await cancel()
+          return
+        case '/continue':
+        case '/resume-task': {
+          if (state.view?.status === 'running') {
+            toast('a turn is already running')
+            return
+          }
+          if (state.view === undefined || !lastTurnInterrupted(state.view.events)) {
+            toast('the last turn was not interrupted; type your next request instead')
+            return
+          }
+          const note = argument.trim()
+          await send(note.length === 0 ? '继续' : `继续：${note}`)
           return
         }
-        await openSession(argument)
-        return
-      case '/cancel':
-        await cancel()
-        return
-      case '/continue':
-      case '/resume-task': {
-        if (state.view?.status === 'running') {
-          toast('a turn is already running')
+        case '/clear':
+          state.clearedAtSeq = state.view?.cursor ?? -1
+          viewport.reset()
+          toast('local transcript cleared; durable history is unchanged')
+          schedule()
+          return
+        case '/reconnect':
+          if (!backend.connected) await backend.connect()
+          if (state.quitting) { await backend.disconnect(); return }
+          if (state.currentId !== undefined) {
+            const id = state.currentId
+            state.handle?.dispose()
+            state.handle = undefined
+            await openSession(id)
+          }
+          return
+        case '/verbose':
+          state.verbose = !state.verbose
+          toast(`verbose ${state.verbose ? 'on' : 'off'}`)
+          schedule()
+          return
+        case '/mode': {
+          // A bare `/mode` flips; `/mode ask` and `/mode allow-all` set outright,
+          // so a scripted start never depends on the current state.
+          const wanted = argument.trim().toLowerCase()
+          if (wanted.length === 0) setApprovalMode(state.approvalMode === 'auto' ? 'ask' : 'auto')
+          else if (wanted === 'ask' || wanted === 'on' || wanted === 'auto' || wanted === 'allow-all' || wanted === 'allowall') {
+            setApprovalMode(wanted === 'ask' ? 'ask' : 'auto')
+          } else {
+            toast('usage: /mode [ask|allow-all]')
+          }
           return
         }
-        if (state.view === undefined || !lastTurnInterrupted(state.view.events)) {
-          toast('the last turn was not interrupted; type your next request instead')
+        case '/rewind':
+          openRewind()
           return
-        }
-        const note = argument.trim()
-        await send(note.length === 0 ? '继续' : `继续：${note}`)
-        return
+        case '/history':
+          openHistory()
+          return
+        case '/panel':
+        case '/status':
+          state.overlay = { kind: 'dashboard' }
+          schedule()
+          return
+        case '/agents':
+          openAgents()
+          return
+        case '/skills':
+        case '/skill':
+          await openSkills(argument)
+          return
+        case '/model':
+          await switchModel(argument)
+          return
+        case '/provider':
+        case '/providers':
+          await openProviderList()
+          return
+        case '/harness':
+        case '/preset':
+        case '/presets':
+          await openHarness()
+          return
+        default:
+          if (await invokeSkill(text, command.slice(1))) return
+          toast(`unknown command ${command}; try /help`)
       }
-      case '/clear':
-        state.clearedAtSeq = state.view?.cursor ?? -1
-        viewport.reset()
-        toast('local transcript cleared; durable history is unchanged')
-        schedule()
-        return
-      case '/reconnect':
-        if (!backend.connected) await backend.connect()
-        if (state.quitting) { await backend.disconnect(); return }
-        if (state.currentId !== undefined) {
-          const id = state.currentId
-          state.handle?.dispose()
-          state.handle = undefined
-          await openSession(id)
-        }
-        return
-      case '/verbose':
-        state.verbose = !state.verbose
-        toast(`verbose ${state.verbose ? 'on' : 'off'}`)
-        schedule()
-        return
-      case '/mode': {
-        // A bare `/mode` flips; `/mode ask` and `/mode allow-all` set outright,
-        // so a scripted start never depends on the current state.
-        const wanted = argument.trim().toLowerCase()
-        if (wanted.length === 0) setApprovalMode(state.approvalMode === 'auto' ? 'ask' : 'auto')
-        else if (wanted === 'ask' || wanted === 'on' || wanted === 'auto' || wanted === 'allow-all' || wanted === 'allowall') {
-          setApprovalMode(wanted === 'ask' ? 'ask' : 'auto')
-        } else {
-          toast('usage: /mode [ask|allow-all]')
-        }
-        return
-      }
-      case '/rewind':
-        openRewind()
-        return
-      case '/history':
-        openHistory()
-        return
-      case '/panel':
-      case '/status':
-        state.overlay = { kind: 'dashboard' }
-        schedule()
-        return
-      case '/agents':
-        openAgents()
-        return
-      case '/skills':
-      case '/skill':
-        await openSkills(argument)
-        return
-      case '/model':
-        await switchModel(argument)
-        return
-      case '/provider':
-      case '/providers':
-        await openProviderList()
-        return
-      case '/harness':
-      case '/preset':
-      case '/presets':
-        await openHarness()
-        return
-      default:
-        if (await invokeSkill(text, command.slice(1))) return
-        toast(`unknown command ${command}; try /help`)
+    } catch (error) {
+      if (state.quitting) return
+      state.error = errorText(error)
+      state.status = 'error'
+      toast(state.error)
+      schedule()
     }
   }
 
@@ -3296,7 +3365,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
-    if (key.type === 'enter' && viewport.scrollOffset > 0 && state.focus === undefined) {
+    if (key.type === 'enter' && viewport.scrollOffset > 0 && state.focus === undefined
+      && state.editor.text.length === 0 && state.completion === undefined && state.editingQueued === undefined) {
       // Enter also returns to the live tail, unless a block is focused: then it
       // opens that block, which is what the focus hint promises.
       viewport.reset()
@@ -3673,7 +3743,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   /** Pull one queued prompt back into the composer so it can be rewritten. */
   const beginQueuedEdit = (entry: QueueEntry): void => {
     state.queued = state.queued.filter((item) => item.requestId !== entry.requestId)
-    state.editingQueued = { requestId: entry.requestId, text: entry.text, mode: entry.mode, local: entry.local }
+    state.editingQueued = { requestId: entry.requestId, text: entry.text, mode: entry.mode, local: entry.local, deferred: entry.deferred }
     state.editor = createEditor(entry.text)
     state.focus = undefined
     toast('editing a queued prompt · enter saves · esc keeps it queued')
@@ -3685,7 +3755,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (editing === undefined) return
     state.editingQueued = undefined
     if (editing.local) {
-      state.queued.push({ requestId: editing.requestId, text: editing.text, at: Date.now(), mode: editing.mode })
+      state.queued.push({ requestId: editing.requestId, text: editing.text, at: Date.now(), mode: editing.mode, deferred: editing.deferred })
     }
     state.editor = createEditor()
     toast('queued prompt kept as it was')
@@ -3700,21 +3770,26 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       toast('a queued prompt cannot be empty')
       return
     }
-    state.editingQueued = undefined
-    state.editor = createEditor()
-    state.historyIndex = -1
-    schedule()
-    if (trimmed !== editing.text && state.handle !== undefined) {
+    const handle = state.handle
+    if (handle === undefined || queuedEditBusy) return
+    queuedEditBusy = true
+    if (trimmed !== editing.text) {
       try {
-        await state.handle.editQueued(editing.requestId, trimmed)
+        await handle.editQueued(editing.requestId, trimmed)
       } catch (error) {
-        state.error = errorText(error)
+        if (state.handle === handle) state.error = errorText(error)
+        queuedEditBusy = false
         schedule()
         return
       }
     }
+    queuedEditBusy = false
+    if (state.handle !== handle || state.editingQueued !== editing) return
+    state.editingQueued = undefined
+    if (state.editor.text === text) state.editor = createEditor()
+    state.historyIndex = -1
     if (editing.local) {
-      state.queued.push({ requestId: editing.requestId, text: trimmed, at: Date.now(), mode: editing.mode })
+      state.queued.push({ requestId: editing.requestId, text: trimmed, at: Date.now(), mode: editing.mode, deferred: editing.deferred })
     } else {
       state.queueText.set(editing.requestId, trimmed)
     }

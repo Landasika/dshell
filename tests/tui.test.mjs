@@ -1138,8 +1138,8 @@ test('composer wrap keeps typed spaces so the cursor moves after a space', () =>
   // the cursor; a trailing space must survive the wrap (bug: cursor froze).
   assert.deepEqual(composerLines('abc ', 20), ['abc '])
   assert.deepEqual(composerLines('ab   cd', 20), ['ab   cd'])
-  // Spaces beyond the width budget are clamped, never dropped silently.
-  assert.deepEqual(composerLines('ab      ', 4), ['ab  '])
+  // Spaces beyond one row wrap so every typed space remains visible.
+  assert.deepEqual(composerLines('ab      ', 4), ['ab  ', '    '])
   const wrapped = composerLines('ab      cd', 4)
   assert.equal(wrapped.every((line) => displayWidth(line) <= 4), true)
 })
@@ -4796,4 +4796,27 @@ test('multiple approvals and questions can be cycled without hiding older pendin
     await Promise.race([app, new Promise((resolve) => setTimeout(resolve, 1500))])
     await backend.disconnect()
   }
+})
+
+test('audit: line-start keys at offset zero preserve a prompt beginning with a newline', () => {
+  const state = { text: '\nimportant prompt', cursor: 0 }
+  for (const key of ['home', 'ctrl-a', 'ctrl-u']) assert.deepEqual(editKey(state, key).state, state)
+  const full = createEditor('first\nsecond')
+  assert.deepEqual(editKey(full, 'ctrl-u').state, { text: 'first\n', cursor: 6 })
+})
+
+test('audit: composer cursor occupies the next line at an exact wrap boundary', () => {
+  for (const text of ['x'.repeat(18), '中'.repeat(9), ' '.repeat(18)]) {
+    const frame = renderComposer(theme, createEditor(text), 20, 7)
+    assert.equal(frame.cursorRow, 2)
+    assert.equal(frame.cursorColumn, 3)
+    assert.equal(frame.lines.length, 4)
+  }
+})
+
+test('audit: live TPS expires when the model stops producing text', async () => {
+  const { currentTps } = await import('../dist/tui/metrics.js')
+  assert.equal(currentTps([{ at: 1000, tps: 50 }], 100, 1000, 2000), 50)
+  assert.equal(currentTps([{ at: 1000, tps: 50 }], 100, 6000, 7000), 0)
+  assert.equal(currentTps([], 0, 1, 7000), 0)
 })

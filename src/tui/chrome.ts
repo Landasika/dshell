@@ -178,8 +178,13 @@ export function renderComposer(
   const textWidth = Math.max(4, total - gutter)
   const all = composerLines(editor.text, textWidth)
   const before = composerLines(editor.text.slice(0, editor.cursor), textWidth)
-  const visualLine = Math.max(0, before.length - 1)
-  const visualColumn = displayWidth(before.at(-1) ?? '')
+  let visualLine = Math.max(0, before.length - 1)
+  let visualColumn = displayWidth(before.at(-1) ?? '')
+  if (visualColumn >= textWidth) {
+    visualLine += 1
+    visualColumn = 0
+    if (visualLine >= all.length) all.push('')
+  }
   const limit = Math.max(1, maxLines)
   const visibleCount = Math.min(limit, Math.max(1, all.length))
   const offset = all.length <= visibleCount
@@ -202,7 +207,7 @@ export function renderComposer(
     lines.push(pad(paint(theme, 'muted', truncate(`  ${hint}`, total)), total))
   }
   const cursorRow = 1 + Math.max(0, visualLine - offset)
-  const cursorColumn = Math.min(total - 1, Math.max(3, 3 + visualColumn))
+  const cursorColumn = Math.min(total, Math.max(3, 3 + visualColumn))
   return { lines, cursorRow, cursorColumn, height: lines.length }
 }
 

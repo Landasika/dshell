@@ -86,6 +86,19 @@ function tryTable(
   const cellsOf = (row: readonly string[]): string[] =>
     Array.from({ length: columnCount }, (_, index) => cleanCell(row[index] ?? ''))
   const body = rows.map(cellsOf)
+  // A grid needs at least three content cells per column. Stack the cells
+  // when its borders alone would leave too little room to show every column.
+  if (width < 6 * columnCount + 1) {
+    const lines: string[] = []
+    for (const row of body) {
+      if (lines.length > 0) lines.push('')
+      for (let index = 0; index < columnCount; index += 1) {
+        lines.push(...wrapText(`${cleanCell(head[index] ?? '')}: ${row[index] ?? ''}`, width))
+      }
+    }
+    if (body.length === 0) for (const cell of head) lines.push(...wrapText(cleanCell(cell), width))
+    return { lines, end }
+  }
 
   // Natural width per column, then shrink the widest ones until the table fits.
   const widths = head.map((cell, index) => {
@@ -95,7 +108,7 @@ function tryTable(
   // Each column contributes two padding cells and the table has one border
   // per column plus the outer pair.
   const chrome = 3 * columnCount + 1
-  const available = Math.max(columnCount * 3, width - chrome)
+  const available = width - chrome
   let excess = widths.reduce((sum, value) => sum + value, 0) - available
   while (excess > 0) {
     let widest = 0

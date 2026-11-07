@@ -31,7 +31,9 @@
  * - **不阻塞**：本模块不碰日志正文，也不做任何网络或 Host 交互。
  */
 
-import { appendFile, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+import { appendFile, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 
 /** 索引里为每个会话保存的那一行。 */
 export interface SessionIndexRow {
@@ -127,6 +129,12 @@ export class SessionIndexFile {
 
   /** 读取索引；文件不存在等价于空索引，不抛错。 */
   async read(): Promise<SessionIndexSnapshot> {
+    const operation = this.chain.then(() => this.load())
+    this.chain = operation.then(() => undefined)
+    return operation
+  }
+
+  private async load(): Promise<SessionIndexSnapshot> {
     let text: string
     let mtimeMs: number | undefined
     try {
@@ -153,71 +161,41 @@ export class SessionIndexFile {
    * 共用一个 Host，只有 Host 会写索引，所以正常情况下不需要。
    */
   async rowsOf(reload = false): Promise<Map<string, SessionIndexRow>> {
+    await this.chain
     if (this.rows !== undefined && !reload) return this.rows
     const snapshot = await this.read()
     return snapshot.rows
   }
 
-  /** 追加一行（新值覆盖旧值）。返回写入是否成功，失败不抛。 */
+  /** Append only changed records; all writes and compactions share one queue. */
   async append(row: SessionIndexRow): Promise<boolean> {
-    const merged = { ...row, indexedAt: row.indexedAt ?? Date.now() }
-    const line = serializeRow(merged)
-    let ok = true
-    this.chain = this.chain.then(async () => {
-      try {
-        await appendFile(this.path, line, 'utf8')
-      } catch {
-        ok = false
-        return
-      }
-      this.physicalRows += 1
-      // 增量合并（理由见 appendMany）。原来这里是 this.rows = undefined，
-      // 单行更新也会让整份缓存失效。
-      if (this.rows !== undefined) {
-        this.rows.set(merged.sessionId, merged)
-        this.loadedMtimeMs = Date.now()
-      }
-    })
-    await this.chain
-    return ok
+    return this.appendMany([row])
   }
 
-  /**
-   * 批量追加，合并成一次写。
-   *
-   * 这里曾经在写完后执行 `this.rows = undefined`，本意是"别让内存里的旧值
-   * 盖住刚写的"。但那等于**每写一次就丢掉整份缓存**，下一次 rowsOf() 必须
-   * 重新 readFile + JSON.parse 整个文件。
-   *
-   * 索引只追加时文件会一直变长（同一会话被反复覆盖）。两者叠加就是放大器：
-   *
-   *     每轮写 522 行 → rows 失效 → 重读整个文件 → 再写 → 再失效 …
-   *
-   * 实测这套循环把 dshell-ws/session-index.jsonl 撑到 484 MB / 226 万行，
-   * 单次 readFile + parse 就要 1.5 GB 以上，直接把 Node 的 4.2 GB 堆打爆
-   * （journal 里 8 次 `FATAL ERROR: Reached heap limit`）。
-   *
-   * 正确做法是**增量合并**：刚写的行本来就在手边，直接并进内存映射即可，
-   * 完全不需要重读磁盘。
-   */
   async appendMany(rows: readonly SessionIndexRow[]): Promise<boolean> {
     if (rows.length === 0) return true
-    const now = Date.now()
-    const stamped = rows.map(row => ({ ...row, indexedAt: row.indexedAt ?? now }))
-    const text = stamped.map(row => serializeRow(row)).join('')
     let ok = true
     this.chain = this.chain.then(async () => {
+      const current = this.rows ?? (await this.load()).rows
+      const pending = new Map(current)
+      const changed: SessionIndexRow[] = []
+      for (const row of rows) {
+        const previous = pending.get(row.sessionId)
+        const { indexedAt: _nextAt, ...nextFields } = row
+        const { indexedAt: _previousAt, ...previousFields } = previous ?? {}
+        if (previous !== undefined && isDeepStrictEqual(nextFields, previousFields)) continue
+        const stamped = { ...row, indexedAt: row.indexedAt ?? Date.now() }
+        changed.push(stamped)
+        pending.set(stamped.sessionId, stamped)
+      }
+      if (changed.length === 0) return
       try {
-        await appendFile(this.path, text, 'utf8')
+        await appendFile(this.path, changed.map(serializeRow).join(''), 'utf8')
+        for (const row of changed) current.set(row.sessionId, row)
+        this.physicalRows += changed.length
+        this.loadedMtimeMs = Date.now()
       } catch {
         ok = false
-        return
-      }
-      this.physicalRows += rows.length
-      // 增量合并而不是丢弃。缓存不存在时保持 undefined（下次读盘是对的）。
-      if (this.rows !== undefined) {
-        for (const row of stamped) this.rows.set(row.sessionId, row)
-        this.loadedMtimeMs = Date.now()
       }
     })
     await this.chain
@@ -232,34 +210,27 @@ export class SessionIndexFile {
    * 永远看到一份完整索引。
    */
   async compact(maxRows = 6_000): Promise<boolean> {
-    // 阈值定在会话数的 ~11 倍：每轮会全量重写一遍索引（见 appendMany 的注释），
-    // 所以"重复倍数"就是"跑了多少轮没压实"。6,000 行对应 526 个会话约 11 轮，
-    // 文件约 1.4 MB —— 远小于把堆打爆的量级，同时压实频率也不高（约 5 分钟一次）。
-    //
-    // 之前这个值写成 20,000 太宽松：实测每 30 秒涨 524 行，要一个多小时才压一次，
-    // 期间文件会到 5 MB 以上，虽然不至于 OOM，但没有必要留着。
-    //
-    // 先看阈值再决定要不要读盘：低于阈值时直接返回，避免为了一次整数比较
-    // 去 readFile 整个文件（这正是之前把内存打爆的那条路径）。
-    if (this.physicalRows <= maxRows) return false
-    // 缓存还在就直接复用。原来固定传 true，等于强制重读一遍全量文件；
-    // 而 append/appendMany 现在做的是增量合并，缓存本来就是最新的。
-    const rows = this.rows ?? (await this.rowsOf(true))
-    // 压实要按**磁盘上的行数**判断，而不是去重后的行数：追加式写入的膨胀
-    // 正是"同一个 id 被反复覆盖"，去重后的 size 恒等于会话数，用它会永远
-    // 判定为"不需要压实"。
-    if (this.physicalRows <= maxRows) return false
-    const text = [...rows.values()].map(row => serializeRow(row)).join('')
-    const temporary = `${this.path}.tmp-${String(process.pid)}`
-    try {
-      await writeFile(temporary, text, 'utf8')
-      await rename(temporary, this.path)
-      this.rows = undefined
-      this.physicalRows = rows.size
-      return true
-    } catch {
-      return false
-    }
+    let compacted = false
+    this.chain = this.chain.then(async () => {
+      if (this.physicalRows <= maxRows) return
+      const rows = this.rows ?? (await this.load()).rows
+      const text = [...rows.values()].map(row => serializeRow(row)).join('')
+      const temporary = `${this.path}.tmp-${randomUUID()}`
+      try {
+        await writeFile(temporary, text, { encoding: 'utf8', flag: 'wx' })
+        await rename(temporary, this.path)
+        this.rows = rows
+        this.loadedMtimeMs = Date.now()
+        this.physicalRows = rows.size
+        compacted = true
+      } catch {
+        // This derived index can be rebuilt after a failed write.
+      } finally {
+        await unlink(temporary).catch(() => undefined)
+      }
+    })
+    await this.chain
+    return compacted
   }
 
   /** 索引是否比给定时间旧。用于判断要不要回源补几行。 */

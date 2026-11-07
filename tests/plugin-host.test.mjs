@@ -72,10 +72,11 @@ function createFakeCtx(services = {}) {
         if (record === undefined) throw Object.assign(new Error(`session ${sessionId} not found`), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
         return { session: record.header, events: [...record.events] }
       },
-      observeSession: async () => ({
-        projections: { values: {} },
-        [Symbol.dispose]() {},
-      }),
+      observeSession: async sessionId => {
+        const record = sessions.get(sessionId)
+        if (record === undefined) throw Object.assign(new Error(`session ${sessionId} not found`), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+        return { header: record.header, projections: { values: {} }, [Symbol.dispose]() {} }
+      },
     },
     workspaceRegistry: {
       get archivedSessionIds() { return [...archivedSessionIds] },
@@ -1031,7 +1032,7 @@ test('session/compact fails closed when the commands service is absent', async (
   assert.match(reply.message, /命令服务/)
 })
 
-test('session/compact refuses a session that is not live instead of silently doing nothing', async (t) => {
+test('session/compact reports a missing session instead of silently doing nothing', async (t) => {
   const harness = await startHarness(t)
   const client = new NdjClient(harness.socketPath)
   t.after(() => client.destroy())
@@ -2078,4 +2079,133 @@ test('新建会话立刻出现在 list 里（不用等索引全量刷新）', as
   assert.equal(reply.type, 'sessions')
   const ids = reply.sessions.map((s) => s.sessionId)
   assert.ok(ids.includes(sid), `新建的会话应当立刻出现在列表里，实际只有：${ids.join(',')}`)
+})
+
+test('audit: cancel and repeated turn completion events promote exactly one deferred prompt per turn', async t => {
+  const calls = []
+  const harness = await startHarness(t, {}, { sessionController: { prompt: async request => { calls.push(request) } } })
+  makeSession(harness, 's1')
+  const unit = makeAgent('s1')
+  unit.agent.status = 'running'
+  harness.agents.set('s1', unit.agent)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  for (const requestId of ['q1', 'q2', 'q3']) {
+    client.send({ type: 'prompt', sessionId: 's1', requestId, text: requestId, mode: 'queue' })
+    assert.equal((await client.next()).deferred, true)
+  }
+  client.send({ type: 'queue/edit', sessionId: 's1', requestId: 'q1', text: 'edited first' })
+  assert.equal((await client.next()).action, 'edit')
+  client.send({ type: 'queue/remove', sessionId: 's1', requestId: 'q3' })
+  assert.equal((await client.next()).action, 'remove')
+  client.send({ type: 'session/cancel', sessionId: 's1', continueQueued: true })
+  assert.equal((await client.next()).type, 'cancelled')
+  await harness.emit('session/event', { id: 's1' }, { type: 'turn/failed', seq: 1, data: {} })
+  await harness.emit('session/event', { id: 's1' }, { type: 'turn/end', seq: 2, data: {} })
+  unit.agent.status = 'idle'
+  await new Promise(resolve => setTimeout(resolve, 650))
+  assert.equal(calls.length, 1, 'overlapping retry timers must share one admission reservation')
+  assert.equal(calls[0].requestId, 'q1')
+  assert.equal(calls[0].content[0].text, 'edited first')
+  await harness.emit('session/event', { id: 's1' }, { type: 'turn/failed', seq: 2, data: {} })
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.equal(calls.length, 1, 'late completion of the previous turn must not release the next prompt')
+  unit.agent.status = 'running'
+  await harness.emit('session/event', { id: 's1' }, { type: 'turn/start', seq: 3, data: {} })
+  unit.agent.status = 'idle'
+  await harness.emit('session/event', { id: 's1' }, { type: 'turn/end', seq: 4, data: {} })
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.deepEqual(calls.map(call => call.requestId), ['q1', 'q2'])
+})
+
+test('audit: print idle and media capability checks precede deferred admission', async t => {
+  const harness = await startHarness(t)
+  makeSession(harness, 's1')
+  const unit = makeAgent('s1')
+  unit.agent.status = 'running'
+  harness.agents.set('s1', unit.agent)
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'prompt', sessionId: 's1', text: 'print', mode: 'queue', requireIdle: true })
+  assert.equal((await client.next()).code, 'SESSION_ACTIVE')
+  client.send({ type: 'prompt', sessionId: 's1', mode: 'queue', content: [{ type: 'image', mediaType: 'image/png', data: 'aGVsbG8=' }] })
+  assert.equal((await client.next()).code, 'UNSUPPORTED_CAPABILITY')
+})
+
+test('audit: compact resumes an attached cold session through the same agent path as prompts', async t => {
+  const calls = []
+  const harness = await startHarness(t, {}, { commands: { execute: async agent => { calls.push(agent.session.id); return { text: 'compacted' } } } })
+  makeSession(harness, 'cold')
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'attach', sessionId: 'cold' })
+  await client.next()
+  client.send({ type: 'session/compact', sessionId: 'cold' })
+  let reply
+  do { reply = await client.next() } while (reply.type === 'status')
+  assert.equal(reply.type, 'session-compacted')
+  assert.deepEqual(calls, ['cold'])
+})
+
+test('audit: failed Unix bind releases the WebSocket listener and all plugin subscriptions', async t => {
+  const { createServer } = await import('node:net')
+  const probe = createServer()
+  await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve))
+  const port = probe.address().port
+  await new Promise(resolve => probe.close(resolve))
+  const directory = await mkdtemp(join(tmpdir(), 'dshell-startup-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const harness = createFakeCtx()
+  // The WS bind is initiated before listen(server, path). Force the latter
+  // to fail synchronously after prepareSocketPath has already succeeded.
+  const socketPath = join(directory, 'sock')
+  const { mkdirSync } = await import('node:fs')
+  const originalOn = harness.ctx.on
+  harness.ctx.on = (...args) => {
+    const off = originalOn(...args)
+    if (args[0] === 'approval/request') {
+      // A directory at the bind path makes listen fail after startup setup.
+      mkdirSync(socketPath)
+    }
+    return off
+  }
+  await assert.rejects(apply(harness.ctx, { socketPath, wsPort: port,
+    wsHost: '127.0.0.1', deviceFile: join(directory, 'devices.json'), warmSessionList: false }))
+  assert.equal([...harness.listeners.values()].flat().length, 0)
+  const replacement = createServer()
+  t.after(() => new Promise(resolve => replacement.close(resolve)))
+  await new Promise((resolve, reject) => { replacement.once('error', reject); replacement.listen(port, '127.0.0.1', resolve) })
+})
+
+test('audit: malformed user log records do not hide a later child session title', async t => {
+  const { mkdir, writeFile } = await import('node:fs/promises')
+  const { zstdCompressSync } = await import('node:zlib')
+  const directory = await mkdtemp(join(tmpdir(), 'dshell-child-title-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = directory
+  t.after(async () => {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    await rm(directory, { recursive: true, force: true })
+  })
+  const harness = await startHarness(t)
+  makeSession(harness, 'child', [], { origin: 'subagent', parentSession: 'parent', cwd: '/work' })
+  const logDir = join(directory, 'sessions', '--work--', 'child')
+  await mkdir(logDir, { recursive: true })
+  await writeFile(join(logDir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(
+    '{"type":"user/message",broken\n' + JSON.stringify({ type: 'session/title', data: { title: 'Recovered child title' } }) + '\n')))
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'session/children', sessionId: 'parent' })
+  const reply = await client.next()
+  assert.equal(reply.type, 'session-children')
+  assert.equal(reply.children[0].title, 'Recovered child title')
 })

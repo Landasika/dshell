@@ -598,3 +598,54 @@ test('SocketBackend reads the model catalog and forwards selections', async (t) 
   )
   await backend.disconnect()
 })
+
+test('audit: session actions on old Hosts consistently report an unsupported capability', async t => {
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test',
+      socketPath: 'test.sock', sessions: [], capabilities: [] })
+    else write(socket, { type: 'error', code: 'BAD_REQUEST', message: `unknown message type: ${message.type}` })
+  })
+  const backend = new SocketBackend(server.socketPath)
+  t.after(async () => { await backend.disconnect(); await server.close() })
+  await backend.connect()
+  for (const action of ['rename', 'archive', 'restore', 'pin', 'fork', 'compact']) {
+    await assert.rejects(backend.sessionAction(action, 's1', 'title'),
+      error => error instanceof BackendError && error.code === 'UNSUPPORTED_CAPABILITY' && /restart/i.test(error.action))
+  }
+})
+
+test('audit: prompt admission flags survive the socket adapter and fake prompts retain request correlation', async t => {
+  let sessionSocket
+  const server = await socketServer((message, socket) => {
+    if (message.type === 'hello') write(socket, { type: 'welcome', protocol: 2, pluginVersion: 'test', dshVersion: 'test',
+      socketPath: 'test.sock', sessions: [], capabilities: ['prompt', 'attach'] })
+    else if (message.type === 'attach') { sessionSocket = socket; write(socket, { type: 'attached', sessionId: 's1', header: { id: 's1' }, cursor: -1, events: [] }) }
+    else if (message.type === 'prompt') write(socket, { type: 'accepted', sessionId: 's1', requestId: message.requestId, mode: 'queue', deferred: true })
+  })
+  const backend = new SocketBackend(server.socketPath)
+  t.after(async () => { await backend.disconnect(); await server.close() })
+  await backend.connect()
+  const handle = await backend.openSession('s1')
+  assert.deepEqual(await handle.send('queued', { requestId: 'explicit' }), { requestId: 'explicit', mode: 'queue', deferred: true })
+  const promoted = new Promise(resolve => {
+    const off = handle.subscribe(view => {
+      if (view.promptAdmission?.promoted) { off(); resolve(view.promptAdmission) }
+    })
+  })
+  write(sessionSocket, { type: 'accepted', sessionId: 's1', requestId: 'explicit', mode: 'queue', promoted: true })
+  assert.deepEqual(await promoted, { requestId: 'explicit', mode: 'queue', promoted: true })
+  const fake = new FakeBackend([{ sessionId: 's1' }])
+  await fake.connect()
+  t.after(() => fake.disconnect())
+  const fakeHandle = await fake.openSession('s1')
+  t.after(() => fakeHandle.dispose())
+  const receipt = await fakeHandle.send('first', { requestId: 'explicit' })
+  const message = fakeHandle.snapshot().events.find(event => event.type === 'user/message').data.message
+  assert.equal(receipt.requestId, 'explicit')
+  assert.equal(message.id, receipt.requestId)
+  assert.equal(message.source.rpcId, receipt.requestId)
+  fake.emit('s1', { type: 'turn/start', seq: 10, data: {} })
+  fake.askApproval('s1', { requestId: 'approval', sessionId: 's1' })
+  await fakeHandle.answerApproval('approval', 'allowed-once')
+  assert.equal(fakeHandle.snapshot().status, 'running')
+})

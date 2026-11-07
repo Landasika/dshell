@@ -605,9 +605,9 @@ export function nextSpeedSample(
 }
 
 /** Most recent sample, or the live estimate when no sample exists yet. */
-export function currentTps(samples: readonly TpsSample[], liveTokens: number, elapsedMs: number): number {
+export function currentTps(samples: readonly TpsSample[], liveTokens: number, elapsedMs: number, now = Date.now()): number {
   const last = samples.at(-1)
-  if (last !== undefined) return last.tps
+  if (last !== undefined) return now - last.at <= 2_000 ? last.tps : 0
   if (elapsedMs > 500 && liveTokens > 0) return liveTokens / (elapsedMs / 1000)
   return 0
 }

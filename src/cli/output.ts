@@ -1,6 +1,7 @@
 import type { AttachedMessage, SessionSummary, WorkspaceSummary } from '../protocol/index.js'
 import type { SessionEvent } from '../backend/events.js'
 import { adaptSessionEvent } from '../backend/events.js'
+import { isInjectedContext } from '../shared/session-events.js'
 
 type JsonObject = Record<string, any>
 
@@ -25,16 +26,6 @@ function userText(data: JsonObject): { text: string; sourceKind: string } {
     text: textOfContent(message.content),
     sourceKind: String(message.source?.kind ?? ''),
   }
-}
-
-function isInjectedContext(text: string): boolean {
-  return (
-    text.startsWith('<system-reminder>') ||
-    text.startsWith('Current runtime context.') ||
-    text.startsWith('Time sampled while preparing') ||
-    text.startsWith('The approval policy changed') ||
-    text.startsWith('Session context compacted')
-  )
 }
 
 /** Print one durable session event in a terminal-friendly form. */

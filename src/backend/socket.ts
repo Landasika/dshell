@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import { DshellError, HostConnection } from '../client/socket-client.js'
 import type {
+  AcceptedMessage,
   AgentRosterMessage,
   AttachedMessage,
   ErrorMessage,
@@ -61,10 +62,19 @@ import {
 function lastTurnOpen(events: readonly SessionEvent[]): boolean {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const type = events[index]?.type
-    if (type === 'turn/end') return false
+    if (type === 'turn/end' || type === 'turn/failed') return false
     if (type === 'turn/start') return true
   }
   return false
+}
+
+function promptReceipt(receipt: AcceptedMessage): SendReceipt {
+  return {
+    requestId: receipt.requestId,
+    mode: receipt.mode,
+    ...(receipt.deferred === undefined ? {} : { deferred: receipt.deferred }),
+    ...(receipt.promoted === undefined ? {} : { promoted: receipt.promoted }),
+  }
 }
 
 function mapError(error: unknown): BackendError {
@@ -521,40 +531,42 @@ export class SocketBackend implements DshellBackend {
 
   async sessionAction(action: SessionAction, sessionId: string, value?: string | boolean): Promise<SessionActionResult> {
     const connection = this.requireControl()
-    // compact 的回复是 `session-compacted` 而不是通用的 `session-updated`：
-    // 压缩可能什么都没压（历史还太短），也可能报错，两者都需要单独的形状。
-    if (action === 'compact') {
-      const reply = await connection.request(
-        { type: 'session/compact', sessionId },
-        candidate => candidate.type === 'session-compacted' && candidate.sessionId === sessionId,
-        // 压缩要调摘要模型，比普通会话动作慢得多，给足 2 分钟。
-        120_000,
-      )
-      if (reply.type !== 'session-compacted') throw new BackendError('INTERNAL', 'invalid compact reply')
-      return {
-        sessionId,
-        ...(reply.empty === true ? { empty: true } : {}),
-        ...(reply.freedTokens === undefined ? {} : { freedTokens: reply.freedTokens }),
-        ...(typeof reply.text === 'string' && reply.text.length > 0 ? { text: reply.text } : {}),
+    try {
+      // compact 的回复是 `session-compacted` 而不是通用的 `session-updated`：
+      // 压缩可能什么都没压（历史还太短），也可能报错，两者都需要单独的形状。
+      if (action === 'compact') {
+        const reply = await connection.request(
+          { type: 'session/compact', sessionId },
+          candidate => candidate.type === 'session-compacted' && candidate.sessionId === sessionId,
+          // 压缩要调摘要模型，比普通会话动作慢得多，给足 2 分钟。
+          120_000,
+        )
+        if (reply.type !== 'session-compacted') throw new BackendError('INTERNAL', 'invalid compact reply')
+        return {
+          sessionId,
+          ...(reply.empty === true ? { empty: true } : {}),
+          ...(reply.freedTokens === undefined ? {} : { freedTokens: reply.freedTokens }),
+          ...(typeof reply.text === 'string' && reply.text.length > 0 ? { text: reply.text } : {}),
+        }
       }
+      const message = await connection.request(
+        action === 'rename'
+          ? { type: 'session/rename', sessionId, title: typeof value === 'string' ? value : '' }
+          : action === 'pin'
+            ? { type: 'session/pin', sessionId, pinned: value !== false }
+            : action === 'archive'
+              ? { type: 'session/archive', sessionId }
+              : action === 'restore'
+                ? { type: 'session/restore', sessionId }
+                : { type: 'session/fork', sessionId },
+        candidate => candidate.type === 'session-updated' && candidate.sessionId === sessionId,
+        15_000,
+      )
+      if (message.type !== 'session-updated') throw new BackendError('INTERNAL', 'invalid session action reply')
+      return { sessionId: message.newSessionId ?? message.sessionId, ...(message.title === undefined ? {} : { title: message.title }) }
+    } catch (error) {
+      throw mapError(error)
     }
-    const type = action === 'rename' ? 'session/rename' : action === 'archive' ? 'session/archive'
-      : action === 'restore' ? 'session/restore' : action === 'pin' ? 'session/pin' : 'session/fork'
-    const message = await connection.request(
-      action === 'rename'
-        ? { type: 'session/rename', sessionId, title: typeof value === 'string' ? value : '' }
-        : action === 'pin'
-          ? { type: 'session/pin', sessionId, pinned: value !== false }
-          : action === 'archive'
-            ? { type: 'session/archive', sessionId }
-            : action === 'restore'
-              ? { type: 'session/restore', sessionId }
-              : { type: 'session/fork', sessionId },
-      candidate => candidate.type === 'session-updated' && candidate.sessionId === sessionId,
-      15_000,
-    )
-    if (message.type !== 'session-updated') throw new BackendError('INTERNAL', 'invalid session action reply')
-    return { sessionId: message.newSessionId ?? message.sessionId, ...(message.title === undefined ? {} : { title: message.title }) }
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -641,6 +653,7 @@ export class SocketSessionHandle implements SessionHandle {
   private offClose: (() => void) | null = null
   private pendingApproval: SessionView['pendingApproval']
   private pendingAsk: SessionView['pendingAsk']
+  private promptAdmission: SendReceipt | undefined
   private historyLoading: Promise<boolean> | null = null
   private pendingApprovalAnswer: string | null = null
   private pendingQuestionAnswer: string | null = null
@@ -650,10 +663,6 @@ export class SocketSessionHandle implements SessionHandle {
   private off: (() => void) | null = null
   private readyResolve: (() => void) | null = null
   private readyReject: ((error: Error) => void) | null = null
-  private pendingAccepted: {
-    resolve: (receipt: SendReceipt) => void
-    reject: (error: Error) => void
-  } | null = null
 
   constructor(sessionId: string, connection: HostConnection, private readonly onDispose: () => void = () => {}) {
     this.id = sessionId
@@ -672,7 +681,6 @@ export class SocketSessionHandle implements SessionHandle {
       this.disconnected = true
       const error = new BackendError('HOST_NOT_RUNNING', 'session connection closed')
       this.readyReject?.(error)
-      this.pendingAccepted?.reject(error)
       this.emit()
     }) ?? null
     this.connection.send({ type: 'attach', sessionId: this.id })
@@ -698,6 +706,7 @@ export class SocketSessionHandle implements SessionHandle {
     const modelSelection = this.modelState.pending ?? this.modelState.lastUsed
     return {
       sessionId: this.id,
+      ...(this.promptAdmission === undefined ? {} : { promptAdmission: { ...this.promptAdmission } }),
       ...(modelSelection === undefined ? {} : { modelSelection: { ...modelSelection } }),
       hasMoreHistory: this.hasMoreHistory,
       connected: !this.disconnected,
@@ -737,9 +746,6 @@ export class SocketSessionHandle implements SessionHandle {
     if (content.some(part => part.type !== 'text') && !this.connection.welcome?.capabilities.includes('prompt-content')) {
       throw new BackendError('UNSUPPORTED_CAPABILITY', 'this Host does not accept image or file prompt content')
     }
-    if (this.pendingAccepted !== null) {
-      throw new BackendError('BAD_REQUEST', 'a prompt is already awaiting acceptance')
-    }
     try {
       const receipt = await this.connection.request({
         type: 'prompt', sessionId: this.id, content, mode: options.mode ?? 'queue',
@@ -747,7 +753,7 @@ export class SocketSessionHandle implements SessionHandle {
         ...(options.requireIdle ? { requireIdle: true } : {}),
       }, candidate => candidate.type === 'accepted', 10_000)
       if (receipt.type !== 'accepted') throw new BackendError('INTERNAL', 'invalid prompt receipt')
-      return { requestId: receipt.requestId, mode: receipt.mode }
+      return promptReceipt(receipt)
     } catch (error) { throw mapError(error) }
   }
 
@@ -847,7 +853,6 @@ export class SocketSessionHandle implements SessionHandle {
     this.offClose = null
     this.listeners.clear()
     this.readyReject?.(new BackendError('SESSION_DISPOSED', 'session handle was disposed'))
-    this.pendingAccepted?.reject(new BackendError('SESSION_DISPOSED', 'session handle was disposed'))
     this.connection.close()
     this.events.length = 0
     this.buffered.length = 0
@@ -897,6 +902,11 @@ export class SocketSessionHandle implements SessionHandle {
   }
 
   private applyMessage(message: ServerMessage): void {
+    if (message.type === 'accepted' && message.sessionId === this.id) {
+      this.promptAdmission = promptReceipt(message)
+      this.emit()
+      return
+    }
     if (message.type === 'event' && message.sessionId === this.id) {
       const event = adaptSessionEvent(message.event)
       if (event.seq <= this.cursor) return
@@ -924,12 +934,7 @@ export class SocketSessionHandle implements SessionHandle {
       this.emit()
       return
     }
-    if (message.type === 'accepted' && message.sessionId === this.id) {
-      const pending = this.pendingAccepted
-      this.pendingAccepted = null
-      pending?.resolve({ requestId: message.requestId, mode: message.mode })
-      return
-    }
+
     if (message.type === 'history' && message.sessionId === this.id) {
       const known = new Set(this.events.map((event) => event.seq))
       const older = adaptSessionEvents(message.events).filter((event) => !known.has(event.seq))
@@ -987,11 +992,6 @@ export class SocketSessionHandle implements SessionHandle {
       return
     }
     if (message.type === 'error') {
-      const error = new BackendError(message.code, message.message, message.action)
-      if (this.pendingAccepted !== null) {
-        this.pendingAccepted.reject(error)
-        this.pendingAccepted = null
-      }
       if (this.pendingQuestionAnswer !== null) {
         this.pendingQuestionAnswer = null
       }

@@ -480,3 +480,138 @@ test('a Host-generated message identity shows one queued row and removes it when
   await until(() => !ui.output.lines.some(line => line?.includes('◷ queued')), 'started prompt leaves the queue immediately')
   assert.ok(ui.output.lines.some(line => line?.includes('identity-sensitive question')), 'the prompt remains visible in the transcript')
 })
+
+test('audit: a failed explicit reconnect stays inside the TUI and leaves commands usable', async t => {
+  const ui = await fakeJourney(t)
+  ui.backend.connect = async () => { throw new Error('host is offline') }
+  ui.backend.simulateDisconnect()
+  ui.input.push('/reconnect\r')
+  await until(() => ui.output.text.includes('host is offline'), 'visible reconnect failure')
+  ui.input.push('/help\r')
+  await until(() => ui.output.lines.some(line => line?.includes('help & shortcuts')), 'TUI still accepts commands')
+})
+
+test('audit: an approval interrupt preserves selected answers and custom text', async t => {
+  const ui = await fakeJourney(t)
+  ui.backend.askQuestion('s1', 'ask-interrupted', [{ id: 'q', question: 'choose features', multiSelect: true,
+    options: [{ label: 'first' }, { label: 'second' }] }])
+  await until(() => ui.output.text.includes('choose features'), 'question form')
+  ui.input.push('1cmy detailed answer')
+  await until(() => ui.output.text.includes('my detailed answer'), 'custom answer typed')
+  ui.backend.askApproval('s1', { requestId: 'interrupt', sessionId: 's1', toolName: 'bash' })
+  await until(() => ui.output.text.includes('approval required'), 'approval interrupts question')
+  ui.input.push('r')
+  await until(() => ui.output.lines.some(line => line?.includes('my detailed answer')), 'question draft returns')
+  ui.input.push('\r')
+  await until(() => ui.backend.answeredQuestions.length === 1, 'preserved answer submits')
+  assert.deepEqual(ui.backend.answeredQuestions[0].answers, [{ id: 'q', selected: ['first'], custom: 'my detailed answer' }])
+})
+
+test('audit: failed queue edits keep the modified prompt available for retry', async t => {
+  const edits = []
+  const ui = await journey(t, { running: true, command(request, { reply }) {
+    if (request.type === 'prompt') reply({ type: 'accepted', sessionId: request.sessionId, requestId: request.requestId, mode: 'queue', deferred: true })
+    if (request.type === 'queue/edit') {
+      edits.push(request)
+      reply(edits.length === 1 ? { type: 'error', code: 'BAD_REQUEST', message: 'temporary edit failure' }
+        : { type: 'queue-updated', sessionId: request.sessionId, requestId: request.requestId, action: 'edit' })
+    }
+  } })
+  ui.input.push('original queued text\u001b\r')
+  await until(() => ui.output.text.includes('◷ queued'), 'queued prompt')
+  ui.input.push('\u001b[1;3A\r')
+  await until(() => ui.output.text.includes('editing a queued prompt'), 'queue editor')
+  ui.input.push(' revised\r')
+  await until(() => ui.output.text.includes('temporary edit failure'), 'edit failure shown')
+  assert.ok(ui.output.lines.some(line => line?.includes('❯ original queued text revised')), 'the failed edit must stay in the composer')
+  ui.input.push('\r')
+  await until(() => edits.length === 2 && ui.output.text.includes('queued prompt updated'), 'retry without retyping')
+  assert.equal(edits[1].text, 'original queued text revised')
+})
+
+test('audit: switching sessions while editing a queued prompt cannot edit the old request from the new session', async t => {
+  const prompts = []
+  const edits = []
+  const ui = await journey(t, { running: true, command(request, { reply }) {
+    if (request.type === 'prompt') {
+      prompts.push(request)
+      reply({ type: 'accepted', sessionId: request.sessionId, requestId: request.requestId, mode: request.mode, deferred: request.mode === 'queue' })
+    } else if (request.type === 'queue/edit') {
+      edits.push(request)
+      reply({ type: 'error', code: 'QUEUE_ITEM_NOT_FOUND', message: 'wrong session' })
+    }
+  } })
+  ui.input.push('first session queue\u001b\r')
+  await until(() => ui.output.text.includes('◷ queued'), 'first session queue')
+  ui.input.push('\u001b[1;3A\r')
+  await until(() => ui.output.text.includes('editing a queued prompt'), 'queue editor')
+  ui.input.push('\u0015/attach s2\u001b\r')
+  await until(() => ui.output.lines[0]?.includes('s2'), 'second session')
+  assert.ok(!ui.output.lines.some(line => line?.includes('first session queue')), 'the old queue must not appear in the new session')
+  ui.input.push('second session prompt\r')
+  await until(() => prompts.length === 2, 'new session prompt sent')
+  assert.equal(prompts[1].sessionId, 's2')
+  assert.equal(prompts[1].content[0].text, 'second session prompt')
+  assert.deepEqual(edits, [])
+})
+
+test('audit: a late prompt receipt cannot put an old queued message in a new session', async t => {
+  let acknowledge
+  const ui = await journey(t, { running: true, command(request, { reply }) {
+    if (request.type === 'prompt') acknowledge = () => reply({ type: 'accepted', sessionId: request.sessionId,
+      requestId: request.requestId, mode: 'queue', deferred: true })
+  } })
+  ui.input.push('late old prompt\u001b\r')
+  await until(() => acknowledge !== undefined, 'prompt in flight')
+  ui.input.push('/attach s2\r')
+  await until(() => ui.output.lines[0]?.includes('s2'), 'new session attached')
+  acknowledge()
+  await pause(80)
+  assert.ok(!ui.output.lines.some(line => line?.includes('late old prompt')))
+})
+
+test('audit: a rejected prompt restores its text alongside text typed while waiting', async t => {
+  let reject
+  const ui = await journey(t, { command(request, { reply }) {
+    if (request.type === 'prompt') reject = () => reply({ type: 'error', code: 'BAD_REQUEST', message: 'admission refused' })
+  } })
+  ui.input.push('recover this prompt\r')
+  await until(() => reject !== undefined, 'prompt awaiting acceptance')
+  ui.input.push('new draft')
+  reject()
+  await until(() => ui.output.text.includes('admission refused'), 'send failure')
+  assert.ok(ui.output.lines.some(line => line?.includes('recover this prompt')))
+  assert.ok(ui.output.lines.some(line => line?.includes('new draft')))
+})
+
+test('audit: commands accept their first Enter while the transcript is scrolled up', async t => {
+  const ui = await journey(t, { events: Array.from({ length: 40 }, (_, seq) => ({ type: 'assistant/message', seq,
+    data: { message: { content: [{ type: 'text', text: `paragraph ${seq}\nmore details` }] } } })) })
+  ui.input.push('\u001b[5~')
+  await pause(30)
+  ui.input.push('/help\r')
+  await until(() => ui.output.lines.some(line => line?.includes('help & shortcuts')), 'first Enter opens help')
+})
+
+test('audit: text typed during a slow reattach survives when the snapshot arrives', async t => {
+  const ui = await fakeJourney(t)
+  ui.backend.openSessionDelayMs = 120
+  ui.input.push('/reconnect\r')
+  await pause(30)
+  ui.input.push('typed while attaching')
+  await pause(180)
+  assert.ok(ui.output.lines.some(line => line?.includes('typed while attaching')))
+})
+
+test('audit: a Host-confirmed deferred prompt survives idle views beyond the old five-second timeout', async t => {
+  const ui = await journey(t, { command(request, { reply }) {
+    if (request.type === 'prompt') reply({ type: 'accepted', sessionId: request.sessionId, requestId: request.requestId,
+      mode: 'queue', deferred: true })
+  } })
+  ui.input.push('waiting in the Host queue\r')
+  await until(() => ui.output.lines.some(line => line?.includes('◷ queued')), 'deferred queue marker')
+  await pause(5100)
+  ui.emit('s1', 'step/start', {})
+  await pause(60)
+  assert.ok(ui.output.lines.some(line => line?.includes('◷ queued') && line.includes('waiting in the Host queue')))
+})

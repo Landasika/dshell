@@ -46,7 +46,7 @@ const DEFAULT_MAX_PAYLOAD = 64 * 1024 * 1024
  *
  * 成功返回 true（此时已写出 101 响应）；失败返回 false（已写出错误响应并断开）。
  */
-export function acceptUpgrade(req: IncomingMessage, socket: Duplex, maxPayloadBytes = DEFAULT_MAX_PAYLOAD): boolean {
+export function acceptUpgrade(req: IncomingMessage, socket: Duplex): boolean {
   const key = req.headers['sec-websocket-key']
   const version = req.headers['sec-websocket-version']
   const upgrade = String(req.headers.upgrade ?? '').toLowerCase()
@@ -104,6 +104,8 @@ export class FrameParser {
   private buffer: Buffer = Buffer.alloc(0)
   private fragments: Buffer[] = []
   private fragmentOpcode: number | undefined
+  private fragmentBytes = 0
+  private closed = false
   private readonly maxPayloadBytes: number
   private readonly onMessage: (payload: string | Buffer, binary: boolean) => void
   private readonly onClose: (payload: Buffer) => void
@@ -122,11 +124,18 @@ export class FrameParser {
   }
 
   push(chunk: Buffer): void {
+    if (this.closed) return
     this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]) as Buffer
     for (;;) {
       const frame = this.readFrame()
       if (frame === undefined) return
       this.dispatch(frame)
+      if (this.closed) {
+        this.buffer = Buffer.alloc(0)
+        this.fragments = []
+        this.fragmentBytes = 0
+        return
+      }
     }
   }
 
@@ -158,6 +167,10 @@ export class FrameParser {
       offset += 8
     }
     if (length > this.maxPayloadBytes) throw new Error('frame exceeds payload limit')
+    if (opcode >= 0x8 && (!fin || length > 125)) throw new Error('invalid control frame')
+    if (opcode === OPCODE.CONTINUATION && this.fragmentBytes + length > this.maxPayloadBytes) {
+      throw new Error('message exceeds payload limit')
+    }
 
     if (buf.length < offset + 4 + length) return undefined
     const mask = buf.subarray(offset, offset + 4)
@@ -179,15 +192,19 @@ export class FrameParser {
       case OPCODE.PONG:
         return
       case OPCODE.CLOSE:
+        this.closed = true
         this.onClose(payload)
         return
       case OPCODE.CONTINUATION: {
         if (this.fragmentOpcode === undefined) throw new Error('continuation without a start frame')
-        this.fragments.push(payload)
+        if (payload.length > 0 && this.fragments.length >= 4096) throw new Error('too many message fragments')
+        this.fragmentBytes += payload.length
+        if (payload.length > 0) this.fragments.push(payload)
         if (!fin) return
         const whole = Buffer.concat(this.fragments)
         const type = this.fragmentOpcode
         this.fragments = []
+        this.fragmentBytes = 0
         this.fragmentOpcode = undefined
         if (type === OPCODE.TEXT) this.onMessage(whole.toString('utf8'), false)
         else this.onMessage(whole, true)
@@ -195,8 +212,10 @@ export class FrameParser {
       }
       case OPCODE.TEXT:
       case OPCODE.BINARY: {
+        if (this.fragmentOpcode !== undefined) throw new Error('data frame during a fragmented message')
         if (!fin) {
-          this.fragments = [payload]
+          this.fragments = payload.length > 0 ? [payload] : []
+          this.fragmentBytes = payload.length
           this.fragmentOpcode = opcode
           return
         }
@@ -240,16 +259,13 @@ export class WebSocketChannel implements Channel {
       onMessage: (payload, binary) => {
         if (binary || typeof payload !== 'string') return
         for (const line of payload.split('\n')) {
+          if (this.closed) break
           if (line.trim().length > 0) this.onLine?.(line)
         }
       },
       onClose: () => this.close(),
       onPing: (payload) => {
-        try {
-          if (!this.socket.destroyed) this.socket.write(encodeFrame(payload, OPCODE.PONG))
-        } catch {
-          this.close()
-        }
+        this.writeFrame(payload, OPCODE.PONG)
       },
     })
     socket.on('data', (chunk: Buffer) => {
@@ -276,20 +292,28 @@ export class WebSocketChannel implements Channel {
   write(value: unknown): void {
     if (!this.alive) return
     try {
-      this.socket.write(encodeFrame(JSON.stringify(value)))
+      this.writeFrame(JSON.stringify(value), OPCODE.TEXT)
     } catch {
       // 对端可能在校验和写入之间重置
     }
   }
 
-  /** 发一个 ping 帧；客户端不回 pong 就说明它已经不在了。 */
-  ping(): void {
+  private writeFrame(payload: Buffer | string, opcode: number): void {
     if (!this.alive) return
     try {
-      this.socket.write(encodeFrame(Buffer.alloc(0), OPCODE.PING))
+      if (this.socket.writableLength > 16 * 1024 * 1024) {
+        this.close()
+        return
+      }
+      this.socket.write(encodeFrame(payload, opcode))
     } catch {
       this.close()
     }
+  }
+
+  /** 发一个 ping 帧；客户端不回 pong 就说明它已经不在了。 */
+  ping(): void {
+    this.writeFrame(Buffer.alloc(0), OPCODE.PING)
   }
 
   close(): void {
@@ -298,6 +322,7 @@ export class WebSocketChannel implements Channel {
       return
     }
     this.closed = true
+    this.onClose?.()
     try {
       if (!this.socket.destroyed && this.socket.writable) {
         this.socket.write(encodeFrame(Buffer.alloc(0), OPCODE.CLOSE))

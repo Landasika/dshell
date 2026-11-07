@@ -76,3 +76,10 @@ test('a pipe row without a separator stays plain text', () => {
   assert.equal(lines.some((line) => line.startsWith('┌')), false)
   assert.equal(lines.join('\n').includes('a | b | c'), true)
 })
+
+test('audit: narrow many-column tables preserve the final column without overflowing', () => {
+  const source = '| a | b | c | d |\n| --- | --- | --- | --- |\n| first | second | third | last-value |'
+  const lines = renderMarkdown(source, 16, theme)
+  assert.ok(lines.every(line => displayWidth(line) <= 16))
+  assert.match(lines.join('\n'), /d: last-value/)
+})

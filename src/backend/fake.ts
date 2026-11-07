@@ -761,12 +761,12 @@ class FakeSessionHandle implements SessionHandle {
       throw new BackendError('BAD_REQUEST', 'prompt must not be empty')
     }
     const text = content.filter((part): part is Extract<PromptContentPart, { type: 'text' }> => part.type === 'text').map(part => part.text).join('\n')
-    const requestId = randomUUID()
+    const requestId = options.requestId ?? randomUUID()
     if (this.session.status === 'running') {
       // Queue waits for the next turn; steer joins the running one.
       const mode: 'queue' | 'steer' = options.mode ?? 'queue'
       this.backend.queuePrompt(this.id, requestId, content, mode)
-      return { requestId, mode }
+      return { requestId, mode, ...(mode === 'queue' ? { deferred: true } : {}) }
     }
     const turn = this.session.events.filter((event) => event.type === 'turn/start').length + 1
     this.append({ type: 'turn/start', seq: this.session.cursor + 1, data: { turn } })
@@ -775,10 +775,10 @@ class FakeSessionHandle implements SessionHandle {
       seq: this.session.cursor + 1,
       data: {
         message: {
-          id: randomUUID(),
+          id: requestId,
           role: 'user',
           content,
-          source: { kind: 'user' },
+          source: { kind: 'user', rpcId: requestId },
         },
       },
     })
@@ -850,7 +850,6 @@ class FakeSessionHandle implements SessionHandle {
     }
     this.session.pendingApprovals = (this.session.pendingApprovals ?? []).filter(item => item.requestId !== requestId)
     this.session.pendingApproval = this.session.pendingApprovals[0]
-    if (this.session.pendingApproval === undefined && this.session.pendingAsk === undefined) this.session.status = 'idle'
     this.emitChange()
     this.append({
       type: 'approval/decided',

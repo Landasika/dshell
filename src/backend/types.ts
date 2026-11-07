@@ -184,6 +184,8 @@ export interface PendingAskView {
 
 export interface SessionView {
   sessionId: string
+  /** Latest admission or promotion pushed by the Host for this session. */
+  promptAdmission?: SendReceipt
   /** Confirmed model for the next request, including pending durable selections. */
   modelSelection?: ModelSelection
   header: SessionHeader
@@ -218,6 +220,8 @@ export type PromptInput = string | readonly PromptContentPart[]
 export interface SendReceipt {
   requestId: string
   mode?: 'queue' | 'steer'
+  deferred?: boolean
+  promoted?: boolean
 }
 
 export interface CancelOptions {

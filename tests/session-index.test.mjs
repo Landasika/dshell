@@ -321,3 +321,33 @@ test('SessionIndexFile: compact 复用缓存而不是强制重读', async () => 
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('audit: interleaved appends, reads and compactions retain every committed session', async () => {
+  await withTempDir(async dir => {
+    const path = join(dir, 'index.jsonl')
+    const file = new SessionIndexFile(path)
+    // Force compaction to enter its write path before starting the race.
+    for (let i = 0; i < 8; i += 1) await file.append({ sessionId: 'seed', title: String(i) })
+    const operations = []
+    for (let i = 0; i < 60; i += 1) {
+      operations.push(file.append({ sessionId: `s${i}`, title: `title ${i}` }))
+      operations.push(file.compact(3))
+      if (i % 7 === 0) operations.push(file.read())
+    }
+    await Promise.all(operations)
+    const rows = (await new SessionIndexFile(path).read()).rows
+    assert.equal(rows.size, 61)
+    for (let i = 0; i < 60; i += 1) assert.equal(rows.get(`s${i}`).title, `title ${i}`)
+  })
+})
+
+test('audit: concurrent equivalent index updates do not append timestamp-only duplicates', async () => {
+  await withTempDir(async dir => {
+    const path = join(dir, 'index.jsonl')
+    const file = new SessionIndexFile(path)
+    await Promise.all(Array.from({ length: 30 }, (_, indexedAt) => file.append({ sessionId: 'same', title: 'title', indexedAt })))
+    assert.equal((await readFile(path, 'utf8')).trim().split('\n').length, 1)
+    await file.append({ sessionId: 'same', title: 'changed' })
+    assert.equal((await new SessionIndexFile(path).rowsOf()).get('same').title, 'changed')
+  })
+})

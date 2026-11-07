@@ -97,7 +97,7 @@ export function editKey(
       return { state: moveVertical(state, 1), handled: true, historyIndex }
     }
     case 'home': {
-      const lineStart = state.text.lastIndexOf('\n', Math.max(0, state.cursor - 1)) + 1
+      const lineStart = state.text.slice(0, state.cursor).lastIndexOf('\n') + 1
       return { state: { ...state, cursor: lineStart }, handled: true, historyIndex }
     }
     case 'end': {
@@ -132,7 +132,7 @@ export function editKey(
       }
     }
     case 'ctrl-u': {
-      const lineStart = state.text.lastIndexOf('\n', Math.max(0, state.cursor - 1)) + 1
+      const lineStart = state.text.slice(0, state.cursor).lastIndexOf('\n') + 1
       return {
         state: { text: state.text.slice(0, lineStart) + state.text.slice(state.cursor), cursor: lineStart },
         handled: true,
@@ -151,7 +151,7 @@ export function editKey(
       }
     }
     case 'ctrl-a': {
-      const lineStart = state.text.lastIndexOf('\n', Math.max(0, state.cursor - 1)) + 1
+      const lineStart = state.text.slice(0, state.cursor).lastIndexOf('\n') + 1
       return { state: { ...state, cursor: lineStart }, handled: true, historyIndex }
     }
     case 'ctrl-e': {
@@ -173,29 +173,17 @@ function wrapComposerLine(paragraph: string, width: number): string[] {
   const out: string[] = []
   let current = ''
   let currentWidth = 0
-  let pending = 0
-  for (const char of graphemes(paragraph)) {
-    if (char === ' ') {
-      pending += 1
-      continue
+  for (const cluster of graphemes(paragraph)) {
+    const cells = displayWidth(cluster)
+    if (current.length > 0 && currentWidth + cells > width) {
+      out.push(current)
+      current = ''
+      currentWidth = 0
     }
-    const cells = displayWidth(char)
-    if (currentWidth + pending + cells > width) {
-      // Break here. Spaces that still fit on this line stay typed content;
-      // the rest are consumed by the break itself, like any editor.
-      const keep = Math.max(0, Math.min(pending, width - currentWidth))
-      out.push(current + ' '.repeat(keep))
-      current = char
-      currentWidth = cells
-      pending = 0
-      continue
-    }
-    current += ' '.repeat(pending) + char
-    currentWidth += pending + cells
-    pending = 0
+    current += cluster
+    currentWidth += cells
   }
-  const tail = current + ' '.repeat(Math.min(pending, Math.max(0, width - currentWidth)))
-  out.push(tail)
+  out.push(current)
   return out
 }
 
