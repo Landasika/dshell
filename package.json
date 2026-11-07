@@ -1,6 +1,6 @@
 {
   "name": "@landasika/dshell",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "A Claude Code-style terminal frontend for DeepSeek Harness",
   "type": "module",
   "private": false,
