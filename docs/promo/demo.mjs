@@ -1,12 +1,11 @@
 /**
  * Scripted dshell session for the promo video.
  *
- * The real TUI is driven over a real TTY (tmux pane), but the Host is a
- * FakeBackend fed by this script, so every take is identical: no model
- * latency, no differing answers, no waiting.
+ * Drives the real TUI with scripted input and a FakeBackend, then records
+ * its ANSI output for the video renderer. No model calls or credentials.
  *
  *   1. docs/promo/record.sh      — records and encodes everything
- *   2. node docs/promo/demo.mjs  — run by that script inside tmux
+ *   2. node docs/promo/demo.mjs  — record terminal frames and captions only
  */
 import { writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -17,6 +16,7 @@ import { runTui } from '../../dist/tui/app.js'
 import { FakeBackend } from '../../dist/backend/index.js'
 
 const HERE = fileURLToPath(new URL('.', import.meta.url))
+process.env.DSHELL_NO_HERDR = '1'
 const startedAt = Date.now()
 const captions = []
 const chapters = []
@@ -38,6 +38,7 @@ function chapter(text) {
 
 const COLUMNS = 110
 const ROWS = 28
+const DEMO_CWD = '/workspaces/config-demo'
 
 /** Records every frame dshell paints, so the encoder can rebuild the screen. */
 const writes = []
@@ -73,10 +74,8 @@ const key = (sequence) => input.emit('data', sequence)
 const ENTER = '\r'
 const ESC = '\u001b'
 const ALT_UP = '\u001b[1;3A'
-const ALT_DOWN = '\u001b[1;3B'
 const ALT_Q = '\u001bq'
 const CTRL_O = '\u000f'
-const CTRL_C = '\u0003'
 
 // ---------------------------------------------------------------- fixtures
 
@@ -98,7 +97,7 @@ const s1Events = [
 const s2Events = [
   ['turn/start', { turn: 1 }],
   ['user/message', user('u-2', '整理一下终端里 markdown 的渲染差异')],
-  ['assistant/message', assistant('主要在三个地方不一样：\n\n| 元素 | dshell 的处理 |\n| --- | --- |\n| 表格 | 按终端宽度重排，列内换行 |\n| 代码块 | 左侧竖线 + 变灰，不折行 |\n| 链接 | 展开成 `文字 (url)` |\n\n结论：按 80 列设计，超长行优先在单元格内换行，不要截断。')],
+  ['assistant/message', assistant('主要在三个地方不一样：\n\n| 元素 | dshell 的处理 |\n| --- | --- |\n| 表格 | 按终端宽度重排，列内换行 |\n| 代码块 | 保留缩进，过宽的行截断显示 |\n| 链接 | 展开成 `文字 (url)` |\n\n结论：长段落和表格都能跟随终端宽度。')],
   ['turn/end', { reason: { kind: 'completed' } }],
 ]
 
@@ -114,7 +113,7 @@ const seed = (sessionId, title, events, ageMinutes) => {
   const out = events.map(([type, data]) => ({ type, seq: seq++, data }))
   return {
     sessionId,
-    cwd: process.cwd(),
+    cwd: DEMO_CWD,
     title,
     createdAt: Date.now() - ageMinutes * 60_000,
     updatedAt: Date.now() - ageMinutes * 60_000,
@@ -128,13 +127,9 @@ const backend = new FakeBackend([
   seed('s3', 'Provider 列表整理', s3Events, 90),
 ])
 
-const seqs = new Map([['s1', s1Events.length], ['s2', s2Events.length], ['s3', s3Events.length]])
-const nextSeq = (sessionId) => {
-  const seq = seqs.get(sessionId) ?? 0
-  seqs.set(sessionId, seq + 1)
-  return seq
-}
-const emit = (sessionId, type, data) => backend.emit(sessionId, { type, seq: nextSeq(sessionId), data })
+const emit = (sessionId, type, data) => backend.emit(sessionId, {
+  type, seq: backend.requireSession(sessionId).cursor + 1, data,
+})
 const stream = (sessionId, value) => backend.stream(sessionId, value)
 
 const slowly = async (sessionId, value, ms) => {
@@ -149,7 +144,7 @@ const slowly = async (sessionId, value, ms) => {
 
 /** Queue of scripted replies, keyed by the text that was submitted. */
 let onSend = async () => {}
-let sendReceipt = null
+let onCancel = async () => {}
 
 const handleProxy = (handle) => new Proxy(handle, {
   get(target, prop) {
@@ -162,9 +157,11 @@ const handleProxy = (handle) => new Proxy(handle, {
       }
     }
     if (prop === 'cancel') {
-      return async () => {
+      return async (...args) => {
         cancelled = true
-        return target.cancel()
+        stream(target.id, '')
+        await target.cancel(...args)
+        await onCancel(target.id, args[2])
       }
     }
     const value = target[prop]
@@ -187,9 +184,9 @@ const backendProxy = new Proxy(backend, {
 
 // ---------------------------------------------------------------- turns
 
-const REPLY = `问题清楚了：\`loadConfig()\` 每次调用都会同步读盘再解析，热路径上重复很多。
+const EXPLANATION = '问题清楚了：配置加载每次调用都会同步读盘，再把原始文件解析成对象。在同一次会话里，模型切换、工具初始化和配置校验都可能反复读取这一份文件。可以先把读盘改成异步，再按文件路径和修改时间保存校验后的结果。如果修改时间没有变化，直接返回上一次的结果；如果文件刚被编辑，就重新读盘并校验，成功之后才替换缓存。这样能减少频繁调用的开销，同时避免把读到一半的文件或校验失败的结果留在缓存里。测试至少覆盖首次读取、重复读取、文件修改、无效配置四种情况。'
 
-改动集中在三处：
+const DETAILS = `\n\n改动集中在三处：
 
 | 位置 | 改动 |
 | --- | --- |
@@ -208,6 +205,8 @@ export async function loadConfig(cwd = process.cwd()) {
 
 要我直接动手改吗？`
 
+const REPLY = EXPLANATION + DETAILS
+
 let busy = false
 let cancelled = false
 
@@ -224,7 +223,14 @@ const refactorTurn = async (submitted, requestId) => {
   await sleep(900)
   emit('s1', 'tool/result', { message: { toolCallId: 'c2', isError: false, content: text('export function loadConfig(cwd = process.cwd()) {\n  const file = join(cwd, "dshell.config.json")\n  return JSON.parse(readFileSync(file, "utf8"))\n}') } })
   await sleep(700)
-  await slowly('s1', REPLY, 4200)
+  for (let index = 0; index < EXPLANATION.length; index += 2) {
+    stream('s1', EXPLANATION.slice(0, index + 2))
+    await sleep(48)
+  }
+  for (let index = 0; index < DETAILS.length; index += 12) {
+    stream('s1', EXPLANATION + DETAILS.slice(0, index + 12))
+    await sleep(50)
+  }
   stream('s1', '')
   await sleep(150)
   emit('s1', 'assistant/message', assistant(REPLY))
@@ -239,9 +245,8 @@ const longTurn = async (submitted, requestId) => {
   await sleep(200)
   emit('s1', 'user/message', user(requestId, submitted))
   const body = '正在梳理依赖：先跑一遍现有的测试，确认改动前的基线，然后把 load.ts 的同步读盘拆成异步加载 + 缓存，再补上缓存失效的用例。随后核对 schema 的默认值合并逻辑，确认缓存层不会绕过校验；最后把 README 里配置一节同步更新，标出新参数与迁移说明。' 
-  for (let index = 1; index <= body.length; index += 1) {
-    if (cancelled) break
-    stream('s1', body.slice(0, index))
+  for (let index = 1; !cancelled; index += 1) {
+    if (index <= body.length) stream('s1', body.slice(0, index))
     await sleep(85)
     if (steer !== null && Date.now() - steer.at > 1600) {
       const pending = steer
@@ -266,6 +271,7 @@ const skillTurn = async (submitted, requestId) => {
 }
 
 let steer = null
+let queued = false
 
 const shortTurn = async (submitted, requestId) => {
   const reply = '好，这轮结束后先跑 `pnpm test`，把基线留住再动 load.ts。'
@@ -285,11 +291,27 @@ onSend = async (submitted, mode, requestId) => {
     steer = { requestId, text: submitted, at: Date.now() }
     return
   }
-  if (mode === 'queue' && busy) return
+  if (mode === 'queue' && busy) {
+    backend.queuePrompt('s1', requestId, submitted, mode)
+    queued = true
+    return
+  }
   if (submitted.includes('配置加载')) return refactorTurn(submitted, requestId)
   if (submitted.includes('测试')) return shortTurn(submitted, requestId)
   if (submitted.includes('一起做掉')) return longTurn(submitted, requestId)
   if (submitted.includes('release-checklist')) return skillTurn(submitted, requestId)
+}
+
+onCancel = async (sessionId, options) => {
+  if (!queued || !options?.continueQueued || sessionId !== 's1') return
+  queued = false
+  // FakeBackend already promoted the queued prompt. Finish its new turn.
+  await sleep(650)
+  const reply = '队列里的测试任务已接续。先跑完现有测试，再开始修改配置加载。'
+  await slowly(sessionId, reply, 1600)
+  stream(sessionId, '')
+  emit(sessionId, 'assistant/message', assistant(reply))
+  emit(sessionId, 'turn/end', { reason: { kind: 'completed' } })
 }
 
 // ---------------------------------------------------------------- timeline
@@ -297,7 +319,7 @@ onSend = async (submitted, mode, requestId) => {
 const main = async () => {
   await backend.connect()
   const app = runTui(backendProxy, {
-    cwd: process.cwd(),
+    cwd: DEMO_CWD,
     resume: 's1',
     color: true,
     input,
@@ -317,9 +339,11 @@ const main = async () => {
   caption('说人话就行 · Enter 发送')
   await type('把配置加载改成异步的，顺便加一层缓存')
   await sleep(700)
-  caption('真流式输出，工具调用收成一行')
+  caption('工具调用收成一行；按需展开详情')
   key(ENTER)
-  await sleep(15000)
+  await sleep(4200)
+  caption('v0.7.1：连续中文边输出边折行')
+  await sleep(7100)
   caption('Markdown 表格按终端宽度重排，代码块原样保留')
   await sleep(5200)
   caption('Alt+↑ 选中一个块，Enter 看详情')
@@ -331,7 +355,11 @@ const main = async () => {
   key(ENTER)
   await sleep(3000)
   key(ESC)
-  await sleep(900)
+  await sleep(250)
+  key(ESC) // Clear the tool block focus after closing the help panel.
+  await sleep(150)
+  key('\u001b[F')
+  await sleep(500)
   caption('Ctrl+O 展开 / 收起工具输出')
   key(CTRL_O)
   await sleep(2600)
@@ -356,7 +384,7 @@ const main = async () => {
   await type('跑一遍 pnpm test')
   key(ALT_Q)
   await sleep(2800)
-  caption('Esc 打断这一轮，子代理保留；Ctrl-C 才退出并连它们一起停')
+  caption('Esc 停止当前回合并继续队列；Ctrl+Z 只分离界面')
   key(ESC)
   await sleep(5200)
 
@@ -386,15 +414,11 @@ const main = async () => {
   await sleep(700)
   key(ENTER)
   await sleep(3200)
-  caption('单选即光标；最下面的 Submit 行才提交')
+  caption('方向键移动，Enter 选中单选答案')
   backend.askQuestion('s1', 'q1', [
     { id: 'pkg', question: '包名用哪个？', header: '包名', options: [{ label: 'dshell', description: '保持现状' }, { label: 'tide', description: '换新名字' }] },
   ])
   await sleep(1800)
-  key('\u001b[B')
-  await sleep(1100)
-  key('\u001b[B')
-  await sleep(700)
   key('\u001b[B')
   await sleep(700)
   key(ENTER)
@@ -409,7 +433,7 @@ const main = async () => {
   await sleep(1000)
   key(ENTER)
   await sleep(2800)
-  caption('会话属于 Host：换个终端、换台机器都能接上')
+  caption('会话属于 Host：分离后可以接回原会话')
   await sleep(3200)
 
   chapter('06 · 审批也在终端里')
@@ -430,8 +454,10 @@ const main = async () => {
   await sleep(8600)
   writeFileSync(`${HERE}out/frames.jsonl`, writes.map((write) => JSON.stringify(write)).join('\n'))
   writeFileSync(`${HERE}out/meta.json`, JSON.stringify({ columns: COLUMNS, rows: ROWS, durationMs: Date.now() - startedAt }))
-  process.exit(0)
-  void app
+  input.emit('end')
+  await app
+  await backend.disconnect()
+  process.exit(0) // Mock input has no real TTY lifecycle to end background UI timers.
 }
 
 main().catch((error) => {

@@ -524,9 +524,9 @@ def main() -> int:
         stale.unlink()
 
     intro = painter.card(
-        "dshell",
+        "dshell v0.7.1",
         "DeepSeek Harness 的终端前端",
-        ["真流式 · 工具折叠 · 多端共享同一个会话"],
+        ["中文流式输出 · 工具折叠 · 会话共享"],
         0.0,
         duration,
     )
@@ -534,7 +534,7 @@ def main() -> int:
         "一个命令开始",
         "dshell",
         [
-            "Enter 发送/插话 · Alt+Q 排队 · Ctrl-C 打断",
+            "Enter 发送/插话 · Alt+Q 排队 · Ctrl+Z 分离",
             "Alt+↑/↓ 选块 · Enter 详情 · Ctrl+O 展开工具输出",
             "github.com/Landasika/dshell",
         ],
@@ -618,7 +618,7 @@ def main() -> int:
     )
     poster = OUT / "poster.png"
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "18", "-i", str(target), "-frames:v", "1", str(poster)],
+        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "20", "-i", str(target), "-frames:v", "1", str(poster)],
         check=True,
     )
     print(f"wrote {target}")

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/promo/out/dshell-promo.mp4"><img alt="demo" src="https://img.shields.io/badge/%E2%96%B6_demo-1m50s-1f6feb?style=flat-square"></a>
+  <a href="docs/promo/out/dshell-promo.mp4"><img alt="demo" src="https://img.shields.io/badge/%E2%96%B6_demo-1m42s-1f6feb?style=flat-square"></a>
   <img alt="node" src="https://img.shields.io/badge/node-%5E22.19_%7C_%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.2-4d6bfe?style=flat-square">
   <a href="https://github.com/Landasika/dshell/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/Landasika/dshell/ci.yml?branch=main&style=flat-square&label=ci"></a>
@@ -67,11 +67,11 @@ without adding a second brain:
     <img src="docs/promo/out/poster.png" width="720" alt="watch the dshell demo" />
   </a>
   <br/>
-  <sub>1:50 · streaming + folded tools · steering & queueing · $ skills · one-Enter /model · radio asks · sessions & approvals</sub>
+  <sub>v0.7.1 · 1:42 · Chinese text streaming, Markdown, folded tools, steering, queueing, skills, and approvals</sub>
 </p>
 
-The video is silent; the narration is in the captions. Storyboard and
-re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
+The silent demo uses the real TUI with scripted responses and Chinese captions.
+See the [storyboard and recording notes](docs/promo/STORYBOARD.md).
 
 ## Highlights
 
@@ -121,26 +121,28 @@ and the [changelog](CHANGELOG.md).
 
 - Linux (x64 tested)
 - Node `^22.19.0 || >=24.0.0`
-- DeepSeek Harness (DSH `0.2.1-rc.2` is the reference runtime)
-- pnpm 11.x if you build from source
+- npm and pnpm on your `PATH` (`dsh plugin` uses pnpm)
 
-### 1. Load the Host plugin
+### 1. Install DeepSeek Harness from npm
 
-`dshell` is a DSH bundle, so installing it updates `dsh.profile.bundles`:
+Use `0.2.1-rc.2`, the reference version for this guide:
 
 ```bash
-git clone https://github.com/Landasika/dshell.git
-cd dshell
-pnpm install
-pnpm build
-
-dsh plugin --profile web add "$PWD"
+npm install -g @deepseek-ai/dsh@0.2.1-rc.2
+dsh --version
 ```
 
-The plugin must be present **when the Host boots** — it cannot be injected into
-an already-running Host.
+### 2. Install the dshell CLI and Host plugin
 
-### 2. Start the Host
+```bash
+npm install -g @landasika/dshell@0.7.1
+dsh plugin --profile web add @landasika/dshell@0.7.1
+```
+
+The second command adds the plugin bundle to the `web` profile. If that
+profile is already running, restart it so it can load the plugin.
+
+### 3. Start the Host
 
 ```bash
 dsh --profile web
@@ -152,21 +154,21 @@ Look for:
 [dshell-host] listening on /home/<user>/.dsh/run/dshell.sock
 ```
 
-### 3. Install the CLI
+### 4. Open dshell in a second terminal
 
 ```bash
-npm install -g @landasika/dshell
 dshell doctor
 dshell
 ```
 
-If you built the checkout in step 1, you can run `node dist/bin/dshell.js`
-directly. Add `doctor` to check the Host connection.
+Run both terminals as the same Linux user. The Host and CLI use the same
+`DSH_HOME` (default: `~/.dsh`).
 
-### No global `dsh`? Use the dev wrappers
+### Run from source
 
-They boot a Host with the plugin inside an isolated `.dsh-dev/` home (never
-touching `~/.dsh`) and auto-detect a bundled DSH runtime:
+For development, clone the repository, run `pnpm install` and `pnpm build`,
+then use the wrappers below. They boot a Host with the checkout's plugin in
+an isolated `.dsh-dev/` home and can detect a bundled DSH runtime:
 
 ```bash
 # terminal 1 — Host and Web UI
