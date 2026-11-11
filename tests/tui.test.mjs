@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { createTheme } from '../dist/tui/theme.js'
-import { displayWidth, pad, sanitizeText, stripAnsi, truncate, wrapText } from '../dist/tui/width.js'
+import { displayWidth, graphemes, pad, sanitizeText, stripAnsi, truncate, wrapText } from '../dist/tui/width.js'
 import { renderMarkdown, renderDiff } from '../dist/tui/markdown.js'
 import { centerBlock, panelRule } from '../dist/tui/chrome.js'
 import { askAnswerLines, askQuestionLines, buildBlocks, pendingQuestions, prettyFailureMessage, renderBlocks, renderTranscript, summarizeTool, toolLabel, turnFailureMessage } from '../dist/tui/events.js'
@@ -41,6 +41,31 @@ test('wrapText hard-breaks long tokens and keeps CJK within the width', () => {
   assert.equal(long.every((line) => displayWidth(line) <= 6), true)
   const cjk = wrapText('中文中文中文', 5)
   assert.equal(cjk.every((line) => displayWidth(line) <= 5), true)
+})
+
+test('text measurement and wrapping preserve graphemes in CJK and complex Unicode', () => {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+  const samples = [
+    ['中文标点，。ひらがなカタカナ한글ＡＢＣ', undefined],
+    ['e\u0301中', 3],
+    ['か\u3099', 2],
+    ['한', 2],
+    ['👩🏽‍💻', 2],
+    ['🇨🇳', 2],
+    ['1\uFE0F\u20E3', 2],
+    ['a\r\nb', undefined],
+  ]
+  for (const [text, width] of samples) {
+    const clusters = [...segmenter.segment(text)].map(part => part.segment)
+    assert.deepEqual(graphemes(text), clusters, JSON.stringify(text))
+    if (width !== undefined) assert.equal(displayWidth(text), width, JSON.stringify(text))
+  }
+  for (const text of ['中文标点，。'.repeat(50), '👩🏽‍💻e\u0301か\u3099'.repeat(20)]) {
+    const lines = wrapText(text, 9)
+    assert.equal(lines.join(''), text)
+    assert.ok(lines.every(line => displayWidth(line) <= 9))
+    assert.deepEqual(lines.flatMap(graphemes), graphemes(text), 'wrapping must preserve whole graphemes')
+  }
 })
 
 test('panelRule keeps the frame to one rule so copies carry no border columns', () => {

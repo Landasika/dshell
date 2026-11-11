@@ -5,6 +5,11 @@ const ANSI = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g
 
+// These BMP characters are each a complete grapheme on their own. Keep
+// combining marks (including kana dakuten), jamo, variation selectors and
+// emoji out of this set so complex text still uses the Unicode segmenter.
+const SIMPLE_TEXT = /^[\x20-\x7e\t\n\u3000-\u3029\u3030-\u3098\u309b-\u30ff\u3400-\u9fff\uac00-\ud7a3\uf900-\ufaff\uff01-\uff60\uffe0-\uffe6]*$/
+
 export function stripAnsi(input: string): string {
   return input.replace(ANSI, '')
 }
@@ -50,6 +55,7 @@ function isZeroWidth(codePoint: number): boolean {
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
 export function graphemes(text: string): string[] {
+  if (SIMPLE_TEXT.test(text)) return text.split('')
   return [...segmenter.segment(text)].map(part => part.segment)
 }
 function clusterWidth(cluster: string): number {
@@ -67,7 +73,16 @@ function clusterWidth(cluster: string): number {
 export function displayWidth(input: string): number {
   const plain = stripAnsi(input)
   if (/^[\x20-\x7e]*$/.test(plain)) return plain.length
-  return graphemes(plain).reduce((sum, cluster) => sum + clusterWidth(cluster), 0)
+  let width = 0
+  if (SIMPLE_TEXT.test(plain)) {
+    for (let index = 0; index < plain.length; index += 1) {
+      const code = plain.charCodeAt(index)
+      width += code === 10 ? 0 : code === 9 ? 4 : isWide(code) ? 2 : 1
+    }
+    return width
+  }
+  for (const part of segmenter.segment(plain)) width += clusterWidth(part.segment)
+  return width
 }
 export function truncate(input: string, width: number): string {
   if (width <= 0) return ''
@@ -140,7 +155,9 @@ export function wrapText(input: string, width: number): string[] {
         continue
       }
       for (const char of graphemes(word)) {
-        const charWidth = displayWidth(char)
+        // `char` is already a sanitized grapheme: measuring it must not
+        // invoke the segmenter again for every character of a long CJK word.
+        const charWidth = clusterWidth(char)
         if (currentWidth + charWidth > width && current.length > 0) {
           push(current)
           current = ''

@@ -3,6 +3,18 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## [0.7.1] — 2026-11-11
+
+### Fixed
+
+- Reduced TUI stalls while long answers stream, especially Chinese paragraphs
+  without line breaks. Ordinary wide characters no longer need repeated
+  Unicode segmentation, and frames with unchanged text reuse the last layout.
+- Reduced repeated transcript layout and footer calculations during a live
+  turn by caching settled blocks and updating live token estimates separately.
+- Updated the README with installation checks, session commands, and the
+  steps to switch to a new TUI without stopping the current Host turn.
+
 ## [0.5.2] — 2026-11-04
 
 A full audit of the CLI, print path, socket protocol, Host plugin, configuration

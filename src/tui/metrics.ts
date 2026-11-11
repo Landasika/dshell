@@ -146,6 +146,10 @@ export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(displayWidth(text) / 3.5))
 }
 
+function tokensForWidth(width: number): number {
+  return Math.max(1, Math.ceil(width / 3.5))
+}
+
 function contentOf(message: Json): unknown[] {
   const content = message.content
   return Array.isArray(content) ? content : []
@@ -234,48 +238,89 @@ function toolCallId(data: Json): string {
   return typeof id === 'string' ? id : ''
 }
 
+/** Running context-segment totals over a prefix of the event log. */
+export interface SegmentsFold {
+  /** Events already folded. */
+  count: number
+  /** `seq` of the last folded event, to detect a shifted prefix (history merge). */
+  lastSeq: number
+  segments: ContextSegments
+}
+
+function accumulateSegments(segments: ContextSegments, event: SessionEvent): void {
+  const data = asObject(event.data) ?? {}
+  switch (event.type) {
+    case 'system/message': {
+      segments.system += estimateTokens(textOf(contentOf(messageOf(data))))
+      break
+    }
+    case 'user/message': {
+      const message = messageOf(data)
+      const text = textOf(contentOf(message))
+      const source = asObject(message.source)
+      if (source?.kind === 'user') segments.prompt += estimateTokens(text)
+      else segments.system += estimateTokens(text)
+      break
+    }
+    case 'assistant/message': {
+      const message = messageOf(data)
+      const content = contentOf(message)
+      segments.assistant += estimateTokens(textOf(content))
+      segments.thinking += estimateTokens(reasoningOf(content))
+      break
+    }
+    case 'tool/call': {
+      const args = data.arguments ?? data.input
+      segments.tools += estimateTokens(typeof args === 'string' ? args : JSON.stringify(args ?? {}))
+      break
+    }
+    case 'tool/result': {
+      const message = messageOf(data)
+      const output = textOf(contentOf(message))
+      if (output.length > 0) segments.tools += estimateTokens(output)
+      else if (typeof data.output === 'string') segments.tools += estimateTokens(data.output)
+      break
+    }
+    default:
+      break
+  }
+}
+
+/** True when `previous` still describes exactly `events[0..count)` (append-only). */
+function prefixValid(previous: SegmentsFold | undefined, events: readonly SessionEvent[]): boolean {
+  if (previous === undefined) return false
+  if (previous.count > events.length) return false
+  if (previous.count === 0) return true
+  return events[previous.count - 1]?.seq === previous.lastSeq
+}
+
+/**
+ * Fold segment totals over `events`, resuming from `previous` when its prefix
+ * still matches. Token-estimating every message in a long CJK session is the
+ * single most expensive pass the footer runs; resuming makes it O(new events).
+ */
+export function foldSegments(
+  events: readonly SessionEvent[],
+  previous?: SegmentsFold,
+): SegmentsFold {
+  const resume = prefixValid(previous, events)
+  const segments: ContextSegments = resume ? { ...(previous as SegmentsFold).segments } : { ...EMPTY_SEGMENTS }
+  for (let index = resume ? (previous as SegmentsFold).count : 0; index < events.length; index += 1) {
+    const event = events[index]
+    if (event === undefined) continue
+    accumulateSegments(segments, event)
+  }
+  const last = events[events.length - 1]
+  return { count: events.length, lastSeq: last?.seq ?? 0, segments }
+}
+
+const segmentFolds = new WeakMap<readonly SessionEvent[], SegmentsFold>()
+
 /** Collect context composition estimates from the durable transcript. */
 export function estimateSegments(events: readonly SessionEvent[]): ContextSegments {
-  const segments: ContextSegments = { ...EMPTY_SEGMENTS }
-  for (const event of events) {
-    const data = asObject(event.data) ?? {}
-    switch (event.type) {
-      case 'system/message': {
-        segments.system += estimateTokens(textOf(contentOf(messageOf(data))))
-        break
-      }
-      case 'user/message': {
-        const message = messageOf(data)
-        const text = textOf(contentOf(message))
-        const source = asObject(message.source)
-        if (source?.kind === 'user') segments.prompt += estimateTokens(text)
-        else segments.system += estimateTokens(text)
-        break
-      }
-      case 'assistant/message': {
-        const message = messageOf(data)
-        const content = contentOf(message)
-        segments.assistant += estimateTokens(textOf(content))
-        segments.thinking += estimateTokens(reasoningOf(content))
-        break
-      }
-      case 'tool/call': {
-        const args = data.arguments ?? data.input
-        segments.tools += estimateTokens(typeof args === 'string' ? args : JSON.stringify(args ?? {}))
-        break
-      }
-      case 'tool/result': {
-        const message = messageOf(data)
-        const output = textOf(contentOf(message))
-        if (output.length > 0) segments.tools += estimateTokens(output)
-        else if (typeof data.output === 'string') segments.tools += estimateTokens(data.output)
-        break
-      }
-      default:
-        break
-    }
-  }
-  return segments
+  const fold = foldSegments(events, segmentFolds.get(events))
+  segmentFolds.set(events, fold)
+  return { ...fold.segments }
 }
 
 function sumSegments(segments: ContextSegments): number {
@@ -513,6 +558,57 @@ export function collectMetrics(view: SessionView | undefined, now = Date.now()):
     cost,
     agents,
     jobs,
+  }
+}
+
+/**
+ * Cached projection of one SessionView into footer metrics.
+ *
+ * Everything in `collectMetrics` except `liveTokens` depends only on durable
+ * state (cursor, status, approvals) — but a streaming frame changes the view
+ * many times per second, and recomputing the O(history) passes per frame is
+ * what made long sessions feel frozen. The cache key therefore excludes the
+ * stream length (keeping only a has-streamed flag, which the activity verb
+ * needs) and `liveTokens` is overlaid fresh on every projection.
+ */
+export class MetricsProjector {
+  private cache: { key: string; value: SessionMetrics } | undefined
+  private live: { text: string; width: number; tokens: number } | undefined
+
+  project(view: SessionView | undefined, now = Date.now()): SessionMetrics {
+    if (view === undefined) return collectMetrics(undefined, now)
+    const hasStream = view.streamText.trim().length > 0 ? 1 : 0
+    const key = `${view.sessionId}:${view.cursor}:${view.status}:${view.pendingApproval?.requestId ?? ''}:${hasStream}`
+    if (this.cache?.key !== key) this.cache = { key, value: collectMetrics(view, now) }
+    const durable = this.cache.value
+    const liveTokens = this.estimateLiveTokens(view.streamText)
+    if (liveTokens === durable.liveTokens) return durable
+    return { ...durable, liveTokens }
+  }
+
+  /**
+   * The stream only appends between frames, so the display width of the new
+   * tail is added to the cached total instead of re-segmenting the whole
+   * (CJK-heavy) answer per frame. A stream that shrinks or rewrites its
+   * prefix (a new turn) falls back to one full scan.
+   */
+  private estimateLiveTokens(text: string): number {
+    if (text.length === 0) {
+      this.live = undefined
+      return 0
+    }
+    const previous = this.live
+    if (previous !== undefined && text === previous.text) return previous.tokens
+    if (previous !== undefined && text.length > previous.text.length && text.startsWith(previous.text)) {
+      const width = previous.width + displayWidth(text.slice(previous.text.length))
+      const tokens = tokensForWidth(width)
+      this.live = { text, width, tokens }
+      return tokens
+    }
+    const width = displayWidth(text)
+    const tokens = tokensForWidth(width)
+    this.live = { text, width, tokens }
+    return tokens
   }
 }
 

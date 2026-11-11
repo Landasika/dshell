@@ -33,6 +33,8 @@ import {
   askAnswerLines,
   askQuestionLines,
   buildBlocks,
+  createBlockRenderCache,
+  foldBlocks,
   isInjectedContext,
   pendingQuestions,
   renderBlocks,
@@ -42,10 +44,12 @@ import {
   lastTurnInterrupted,
   turnFailureMessage,
   type Block,
+  type BlockFold,
   type BlockRange,
+  type BlockRenderCache,
 } from './events.js'
 import { foldInbox, type InboxState } from './inbox.js'
-import { renderMarkdown } from './markdown.js'
+import { renderMarkdown, renderMarkdownStream, type MarkdownStreamState } from './markdown.js'
 import { TerminalScreen, Viewport } from './screen.js'
 import { paint, type Theme, type ThemeStyle } from './theme.js'
 import { createTheme } from './theme.js'
@@ -54,12 +58,12 @@ import {
   averageTps,
   collectMetrics,
   currentTps,
-  estimateTokens,
   formatDuration,
   formatPercent,
   formatTokens,
   nextSpeedSample,
   todoCounts,
+  MetricsProjector,
   type AgentInfo,
   type SessionMetrics,
   type TpsSample,
@@ -288,6 +292,8 @@ const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 
 
 /** How long a first `Ctrl-C` stays armed before it has to be pressed again. */
 const CTRL_C_WINDOW_MS = 2_000
+/** Minimum spacing between TPS samples; also the speed-estimate gate. */
+const SPEED_SAMPLE_MS = 700
 
 const PROVIDER_CREATE_FIELDS = ['id', 'displayName', 'baseURL', 'api', 'apiKeyEnv', 'models'] as const
 type ProviderCreateField = (typeof PROVIDER_CREATE_FIELDS)[number]
@@ -484,7 +490,6 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let gitFetchedAt = 0
   const herdrReporter: HerdrReporter | undefined = createHerdrReporter()
   let herdrResume: { id: string; argv: string[] | undefined } | undefined
-  let metricsCache: { key: string; value: SessionMetrics } | undefined
   let lastBodyHeight = 3
   /** First screen row of the transcript body, so a selection can be clamped. */
   let lastBodyTop = 3
@@ -495,6 +500,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   let cancellingHandle: SessionHandle | undefined
   let queuedEditBusy = false
   let speedTurn: string | undefined
+  /** Stream length at the last speed sample; a shrink means the stream restarted. */
+  let speedStreamLen = 0
   let lastFailureToast: { text: string; at: number } = { text: '', at: 0 }
   let lastTurnFailure: string | undefined
   /** Call id already announced as waiting behind another panel. */
@@ -523,10 +530,13 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   const schedule = (): void => {
-    captureSessionState()
     if (renderTimer !== undefined) return
     renderTimer = setTimeout(() => {
       renderTimer = undefined
+      // Captured inside the frame, not per call: schedule() fires on every
+      // keystroke and stream frame, and the draft snapshot only needs to be
+      // as fresh as the last paint.
+      captureSessionState()
       render()
     }, 33)
   }
@@ -674,32 +684,45 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   const sampleSpeed = (view: SessionView): void => {
     if (view.status !== 'running') {
       state.speedPrevious = undefined
+      speedStreamLen = view.streamText.length
       return
     }
-    const turn = `${view.sessionId}:${currentMetrics().turnStartedAt ?? ''}`
+    const metrics = currentMetrics()
+    const turn = `${view.sessionId}:${metrics.turnStartedAt ?? ''}`
     if (speedTurn !== turn || state.speedPrevious === undefined) {
       state.tpsSamples = []
       state.speedPrevious = undefined
       speedTurn = turn
     }
     const now = Date.now()
+    const len = view.streamText.length
+    const restarted = len < speedStreamLen
+    speedStreamLen = len
+    // nextSpeedSample only learns something every SPEED_SAMPLE_MS; between
+    // windows (and while the stream keeps growing) skip the sample entirely.
+    // A shrunken stream means a restart, which must reset the baseline.
+    if (!restarted && state.speedPrevious !== undefined && now - state.speedPrevious.at < SPEED_SAMPLE_MS) return
+    // liveTokens comes from the projector's incremental estimate — a full
+    // estimateTokens() here re-segmented the whole CJK answer per window.
     const next = nextSpeedSample(
       state.tpsSamples,
       state.speedPrevious,
       now,
-      estimateTokens(view.streamText),
+      metrics.liveTokens,
+      SPEED_SAMPLE_MS,
     )
     state.tpsSamples = next.samples
     state.speedPrevious = next.previous
   }
 
-  const currentMetrics = (): SessionMetrics => {
-    const view = state.view
-    if (view === undefined) return collectMetrics(undefined)
-    const key = `${view.sessionId}:${view.cursor}:${view.streamText.length}:${view.status}:${view.pendingApproval?.requestId ?? ''}:${state.clearedAtSeq}`
-    if (metricsCache?.key !== key) metricsCache = { key, value: collectMetrics(view) }
-    return metricsCache.value
-  }
+  /**
+   * Footer metrics through the durable-cache projector: stream frames change
+   * the view many times a second, but only `liveTokens` depends on them —
+   * the O(history) passes must not rerun per frame (DS-007's sibling fix).
+   */
+  const metricsProjector = new MetricsProjector()
+
+  const currentMetrics = (): SessionMetrics => metricsProjector.project(state.view)
 
   const refreshGit = (): void => {
     const cwd = state.view?.header.cwd ?? options.cwd
@@ -3645,7 +3668,26 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
   }
 
   /** Cached transcript layout for the durable prefix (DS-007). */
-  let transcriptCache: { key: string; lines: string[]; ranges: BlockRange[] } | undefined
+  let transcriptCache: {
+    key: string
+    /** Session the fold and render cache belong to; seqs alone cannot tell
+     *  sessions apart (each session numbers its events from 1), so a switch
+     *  must drop both instead of resuming across sessions. */
+    sessionId: string
+    lines: string[]
+    ranges: BlockRange[]
+    /** Resumable fold, so a new durable event only folds the events after it. */
+    fold?: BlockFold
+    /** Per-block line cache; unchanged blocks skip re-wrapping entirely. */
+    render?: BlockRenderCache
+  } | undefined
+
+  /**
+   * Incremental render state for the streaming answer tail. Keyed by session:
+   * each session streams its own text, and a stale state from another session
+   * would fail its prefix check anyway but at the cost of one full re-render.
+   */
+  let streamState: { sessionId: string; md: MarkdownStreamState } | undefined
 
   const transcript = (): { lines: string[]; live: boolean; ranges: BlockRange[] } => {
     const view = state.view
@@ -3656,19 +3698,32 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     // The durable layout only changes when a durable event lands, the view
     // is cleared, folding changes, or the terminal resizes — never on a
     // stream frame. Rebuilding it per frame made long sessions cost
-    // O(history) on every streamed token.
+    // O(history) on every streamed token. The resumable fold and the
+    // per-block render cache take it further: a durable event now folds and
+    // re-renders only what it added or mutated, not the whole history.
     const cacheKey = `${view.sessionId}|${view.cursor}|${state.clearedAtSeq}|${state.verbose ? 1 : 0}|${width}|${screen.size.columns}`
     if (transcriptCache?.key !== cacheKey) {
       const events = view.events.filter((event) => event.seq > state.clearedAtSeq)
+      const sameSession = transcriptCache?.sessionId === view.sessionId
+      const fold = foldBlocks(events, sameSession ? transcriptCache?.fold : undefined, state.verbose)
       // Todos live in the footer strip and the session panel; keeping their
       // historical snapshots inline would repeat the same list after every
       // update.
-      const blocks = buildBlocks(events, state.verbose).filter((block) => block.kind !== 'todo')
+      const blocks = fold.visible.filter((block) => block.kind !== 'todo')
+      const render = sameSession ? transcriptCache?.render : undefined
+      const nextRender = render ?? createBlockRenderCache()
       const rendered = renderBlocksWithRanges(blocks, width, theme, {
         expandTools: state.verbose,
         surfaceWidth: screen.size.columns,
-      })
-      transcriptCache = { key: cacheKey, lines: rendered.lines, ranges: rendered.ranges }
+      }, nextRender)
+      transcriptCache = {
+        key: cacheKey,
+        sessionId: view.sessionId,
+        lines: rendered.lines,
+        ranges: rendered.ranges,
+        fold,
+        render: nextRender,
+      }
     }
     // The live tails below append to a shallow copy: the cached base stays
     // untouched for the next frame.
@@ -3691,7 +3746,12 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
     if (view.streamText.length > 0 && view.status === 'running') {
       lines.push('')
       lines.push(`${paint(theme, 'accent', 'dshell')} ${paint(theme, 'muted', '· live')}`)
-      lines.push(...renderMarkdown(view.streamText, width, theme))
+      // Only the unstable tail (partial last line, still-extendable tables) is
+      // re-rendered per frame; the frozen prefix rides in `streamState`.
+      const md = streamState?.sessionId === view.sessionId ? streamState.md : undefined
+      const streamed = renderMarkdownStream(view.streamText, width, theme, md)
+      streamState = { sessionId: view.sessionId, md: streamed.state }
+      lines.push(...streamed.lines)
       lines.push(paint(theme, 'accent', '▌'))
     }
     return { lines, live: view.status === 'running', ranges }

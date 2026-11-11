@@ -14,7 +14,7 @@
   <img alt="node" src="https://img.shields.io/badge/node-%5E22.19_%7C_%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.2-4d6bfe?style=flat-square">
   <a href="https://github.com/Landasika/dshell/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/Landasika/dshell/ci.yml?branch=main&style=flat-square&label=ci"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-272_passing-2ea043?style=flat-square">
+  <a href="https://www.npmjs.com/package/@landasika/dshell"><img alt="npm version" src="https://img.shields.io/npm/v/@landasika/dshell?style=flat-square"></a>
   <img alt="platform" src="https://img.shields.io/badge/platform-linux-FCC624?style=flat-square&logo=linux&logoColor=black">
 </p>
 
@@ -35,7 +35,7 @@ without adding a second brain:
 
 - it never starts another Host, never copies durable events into a second
   truth, and never owns an Agent;
-- quitting the terminal only closes a view — the turn keeps running;
+- detaching from the TUI closes the view and lets the Host keep running the turn;
 - the Web UI, a TUI and a scripted CLI can watch and drive the **same live
   session at the same time**, and approvals resolve first-answer-wins.
 
@@ -75,9 +75,9 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
 
 ## Highlights
 
-- **Streaming markdown** — headings, lists, quotes, fenced code, diffs and
-  boxed **tables** with per-column alignment; CJK and emoji count as two cells
-  so borders stay square.
+- **Streaming Markdown** — headings, lists, quotes, fenced code, diffs and
+  boxed tables with per-column alignment. Wrapping and alignment account for
+  wide characters and emoji.
 - **Folded tool calls** — one line each, Claude Code style
   (`✓ Bash(rg --files -g "*.ts")`). `Ctrl-O` expands arguments and output;
   `Alt-↑/↓` + `Enter` opens a scrollable detail panel.
@@ -87,10 +87,9 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
   prompt for the next one, `Alt-Backspace` drops a queued prompt.
 - **Approvals you can trust** — answered by a Host bridge that races the Web UI
   fairly: first valid answer wins, everything else fails closed.
-- **Questions in the terminal** — `ask_user_question` renders as a wizard:
-  single-select is radio (the row under the cursor is the pick), and every
-  question ends in a `Submit`/`Next` row, so `Enter` mid-list never sends by
-  accident. Timed-out questions stay answerable instead of dying with the turn.
+- **Questions in the terminal** — `ask_user_question` renders as a wizard.
+  `Enter` picks a single answer or toggles a choice in a multi-select question.
+  Timed-out questions can still be answered while they remain pending.
 - **Subagents** — `⇢ agent started` cards that settle to `✓ finished` / `✗
   failed`; `Ctrl-G` lists children and opens their transcripts read-only.
 - **Model & provider control** — `/model` switches in one `Enter` (`e` picks
@@ -107,13 +106,14 @@ re-recording notes: [docs/promo/STORYBOARD.md](docs/promo/STORYBOARD.md).
   hook to install.
 - **Reconnects itself** — a Host restart or plugin reload shows
   `host connection lost · reconnecting`, then `host back · reattached`.
+  Drafts are saved per session, so you can pick up where you left off.
 
 ## Status
 
-`0.5.2` is current: Linux only, DSH `0.2.1-rc.2` tested. The P0–P6
-plan (TUI, scriptable CLI, sessions/workspaces, approval bridge,
-models/providers, subagents, terminal questions) is complete — see the
-[changelog](CHANGELOG.md) and [supported versions](docs/SUPPORTED-VERSIONS.md).
+Version [`0.7.1`](https://www.npmjs.com/package/@landasika/dshell/v/0.7.1)
+includes a [fix for stuttering during streamed answers](#streaming-performance).
+See the [compatibility and verification records](docs/SUPPORTED-VERSIONS.md)
+and the [changelog](CHANGELOG.md).
 
 ## Install
 
@@ -121,7 +121,7 @@ models/providers, subagents, terminal questions) is complete — see the
 
 - Linux (x64 tested)
 - Node `^22.19.0 || >=24.0.0`
-- A running DSH Host, `0.2.1-rc.2` tested
+- DeepSeek Harness (DSH `0.2.1-rc.2` is the reference runtime)
 - pnpm 11.x if you build from source
 
 ### 1. Load the Host plugin
@@ -156,9 +156,12 @@ Look for:
 
 ```bash
 npm install -g @landasika/dshell
-# or run the built binary directly while developing:
-node dist/bin/dshell.js doctor
+dshell doctor
+dshell
 ```
+
+If you built the checkout in step 1, you can run `node dist/bin/dshell.js`
+directly. Add `doctor` to check the Host connection.
 
 ### No global `dsh`? Use the dev wrappers
 
@@ -206,6 +209,28 @@ Inside a session you get the transcript, the composer and the footer rail:
 deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑12.4k ↓840
 ```
 
+### Streaming performance
+
+Long Chinese answers could stutter in `0.7.0` because the TUI wraps the
+unfinished paragraph again as text arrives. Version `0.7.1` speeds up width
+calculation for common CJK text and reuses the last layout when the answer
+has not changed. Emoji and combining characters still use Unicode grapheme
+boundaries.
+
+In a local stress test that appended text to a 40,000-character Chinese
+paragraph, the 95th-percentile event loop delay fell from about 231 ms to
+13 ms. The test used a simulated terminal.
+
+To update the CLI and use it with your existing Host:
+
+```bash
+npm install -g @landasika/dshell@0.7.1
+dshell
+```
+
+If your session is already open, press `Ctrl-Z` to detach and select the same
+session in the new TUI. The Host keeps the turn running while you switch.
+
 ## Keyboard
 
 | Key | Action |
@@ -227,8 +252,9 @@ deepseek-relay/deepseek-v4.1-flash  ~/dshell  main [↑10]  ✓ agents 1/1  ↑1
 | `Esc` (turn running) | stop this turn and continue queued prompts in order; subagents keep running, TUI stays; outranks Esc's other duties (scroll-to-tail, close menu, clear draft) |
 | `Esc` (idle) | close menu / clear draft / jump to tail; `Esc` `Esc` rewinds to a previous prompt |
 | `Ctrl-C` (panel open) | close the panel / dismiss a pending question — never quits, so an ask cannot be aborted by reflex |
-| `Ctrl-C` `Ctrl-C` | quit — the first press only warns, the second (within 2s) leaves; if a turn runs it is cancelled **with its subagents**. Any other key in between disarms it |
-| `Ctrl-Z` / `Ctrl-D` / `/quit` | detach — quit now, the turn keeps running; `/sessions` reattaches |
+| `Ctrl-C` `Ctrl-C` (empty composer) | quit — the first press warns and the second (within 2s) leaves. If a turn is running, it is cancelled **with its subagents**. Any key in between disarms it |
+| `Ctrl-Z` / `/quit` | detach and leave the turn running; reopen `dshell` to reattach |
+| `Ctrl-D` (empty composer) | detach, just like `Ctrl-Z` |
 
 In `/provider`: `Enter` edits a field (paste works; a `sk-…` pasted into
 `apiKeyEnv` is stored in `~/.dsh/.credentials.yaml` and the field keeps only its
@@ -285,6 +311,11 @@ change an answer behind your back. `Esc` leaves the ask pending for the Web UI.
 | `/workspaces` | switch workspace |
 | `/new` | create a session |
 | `/attach <id>` | attach by id |
+| `/rename <title>` | rename the current session |
+| `/pin` | pin or unpin the current session |
+| `/archive` / `/archived` | archive the current session or browse and restore archived sessions |
+| `/fork` | fork the current session and open the new one |
+| `/compact` | ask the Host to compact the current session's context |
 | `/cancel` | stop the running turn and continue queued prompts in order |
 | `/continue` | resume a task the Host restart interrupted (also happens automatically on reconnect: once per interrupted turn, ≤3 per TUI run) |
 | `/clear` | clear the local transcript view |
@@ -339,6 +370,9 @@ dshell attach <sessionId>
 dshell prompt <sessionId> '…'
 dshell steer <sessionId> '…'
 dshell cancel <sessionId>
+dshell install --dry-run    # preview profile and user service setup
+dshell remote --port 8792   # show a phone pairing QR code (requires Host wsPort)
+dshell restart              # confirm before restarting the Host and stopping active turns
 ```
 
 ```text
@@ -472,7 +506,7 @@ that the confirmation offers.
 pnpm install
 pnpm typecheck   # tsc --noEmit
 pnpm lint        # alias of typecheck
-pnpm test        # build + node --test (272 tests)
+pnpm test        # build + run the test suite
 ./scripts/ci.sh  # full local gate, including a clean pack/install
 ```
 

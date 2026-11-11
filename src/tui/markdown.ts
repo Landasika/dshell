@@ -155,22 +155,35 @@ function isDiff(text: string): boolean {
   return /^(diff --git |--- a\/|\+\+\+ b\/|@@ )/m.test(text)
 }
 
-/** Render a markdown-ish assistant/user message into terminal lines. */
-export function renderMarkdown(text: string, width: number, theme: Theme): string[] {
-  const safe = sanitizeText(text)
-  if (safe.trim().length === 0) return []
-  if (isDiff(safe)) return renderDiff(safe, width, theme)
+/** One rendered chunk of source: which lines it consumed, how many rows it
+ *  produced, and the fence state after it. Only used by the stream renderer. */
+interface SourceMark {
+  end: number
+  count: number
+  inFence: boolean
+}
 
-  const lines: string[] = []
-  let inFence = false
-  const source = safe.split('\n')
-
-  for (let index = 0; index < source.length; index += 1) {
+/**
+ * Render source lines [from, source.length) into `lines`, starting from the
+ * given fence state. This is the shared core of `renderMarkdown` and the
+ * streaming renderer — behaviour must stay byte-identical between them.
+ */
+function renderSourceLines(
+  source: readonly string[],
+  from: number,
+  width: number,
+  theme: Theme,
+  lines: string[],
+  inFence: boolean,
+  marks?: SourceMark[],
+): boolean {
+  for (let index = from; index < source.length; index += 1) {
     const raw = source[index] ?? ''
     const line = raw.replace(/\s+$/, '')
     const fence = /^\s*```/.test(line)
     if (fence) {
       inFence = !inFence
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
@@ -178,11 +191,13 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
       // Code blocks print verbatim: no language label row, no gutter, no
       // styling — the raw source is the most faithful rendering.
       lines.push(truncate(line, width))
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
     if (line.trim().length === 0) {
       lines.push('')
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
@@ -190,6 +205,7 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
     if (table !== null) {
       lines.push(...table.lines)
       index = table.end
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
@@ -198,12 +214,14 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
       const title = heading[2] ?? ''
       const style = heading[1]?.length === 1 ? 'bold' : 'cyan'
       lines.push(paint(theme, style, truncate(title, width)))
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
     const rule = /^\s*([-*_])\1{2,}\s*$/.test(line)
     if (rule) {
       lines.push(paint(theme, 'gray', '─'.repeat(Math.max(1, width))))
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
@@ -216,6 +234,7 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
       for (const continuation of body.slice(1)) {
         lines.push(`${' '.repeat(indent + 2)}${continuation}`)
       }
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
@@ -228,6 +247,7 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
       for (const continuation of body.slice(1)) {
         lines.push(`${' '.repeat(indent + marker.length)}${continuation}`)
       }
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
@@ -236,6 +256,7 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
       for (const part of wrapText(quote[1] ?? '', Math.max(1, width - 2))) {
         lines.push(paint(theme, 'gray', `│ ${part}`))
       }
+      marks?.push({ end: index, count: lines.length, inFence })
       continue
     }
 
@@ -248,9 +269,132 @@ export function renderMarkdown(text: string, width: number, theme: Theme): strin
       .replace(/`([^`]+)`/g, '$1')
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
     for (const part of wrapText(cleaned, width)) lines.push(part)
+    marks?.push({ end: index, count: lines.length, inFence })
   }
 
+  return inFence
+}
+
+/** Render a markdown-ish assistant/user message into terminal lines. */
+export function renderMarkdown(text: string, width: number, theme: Theme): string[] {
+  const safe = sanitizeText(text)
+  if (safe.trim().length === 0) return []
+  if (isDiff(safe)) return renderDiff(safe, width, theme)
+
+  const lines: string[] = []
+  renderSourceLines(safe.split('\n'), 0, width, theme, lines, false)
   return lines
+}
+
+/**
+ * Resumable state for streaming markdown: everything before `frozen` is
+ * already rendered into `lines` and never re-scanned while the text only
+ * appends. The streaming hot path used to re-run the full markdown pass on
+ * every frame, making long answers cost O(answer) per streamed chunk.
+ */
+export interface MarkdownStreamState {
+  width: number
+  theme: Theme
+  /** Sanitized text whose rendered form is frozen into `lines`. */
+  frozen: string
+  lines: string[]
+  /** Fence state at the end of the frozen prefix. */
+  inFence: boolean
+  /** Whether the text rendered as a diff when the state was built. */
+  diff: boolean
+  /** Per frozen source unit: the last source line it consumed. */
+  unitEnds: number[]
+  /** Last complete result, reused for spinner ticks and editor-only paints. */
+  lastText?: string
+  lastLines?: string[]
+}
+
+/** A line is unstable while more rows could still join a table through it. */
+function tableExtendable(line: string): boolean {
+  return line.includes('|') || TABLE_SEPARATOR.test(line)
+}
+
+/**
+ * Render streaming markdown incrementally. Output is byte-identical to
+ * `renderMarkdown` at every checkpoint; only the unstable tail (the trailing
+ * partial line and any table that could still gain rows) is re-rendered.
+ */
+export function renderMarkdownStream(
+  text: string,
+  width: number,
+  theme: Theme,
+  previous?: MarkdownStreamState,
+): { lines: string[]; state: MarkdownStreamState } {
+  if (previous?.width === width && previous.theme === theme
+    && previous.lastText === text && previous.lastLines !== undefined) {
+    return { lines: previous.lastLines.slice(), state: previous }
+  }
+  const safe = sanitizeText(text)
+  const diff = safe.trim().length > 0 && isDiff(safe)
+  let state = previous
+  if (
+    state === undefined
+    || state.width !== width
+    || state.theme !== theme
+    || state.diff !== diff
+    || !safe.startsWith(state.frozen)
+  ) {
+    state = { width, theme, frozen: '', lines: [], inFence: false, diff, unitEnds: [] }
+  }
+  state.lastText = text
+  if (safe.trim().length === 0) {
+    state.lastLines = []
+    return { lines: [], state }
+  }
+  // Diffs are line-local but rare as top-level answer text: not worth the
+  // bookkeeping. Re-render fully; the state stays reset so a later flip back
+  // to prose restarts the incremental path.
+  if (diff) {
+    state.frozen = ''
+    state.lines = []
+    state.unitEnds = []
+    const lines = renderDiff(safe, width, theme)
+    state.lastLines = lines
+    return { lines: lines.slice(), state }
+  }
+
+  const source: string[] = []
+  const offsets: number[] = [0]
+  for (let index = 0; index < safe.length; index += 1) {
+    if (safe.charCodeAt(index) === 10) {
+      source.push(safe.slice(offsets[offsets.length - 1] ?? 0, index))
+      offsets.push(index + 1)
+    }
+  }
+  source.push(safe.slice(offsets[offsets.length - 1] ?? 0))
+
+  // Complete lines minus the trailing run that a future row could still turn
+  // into (or extend) a table: those stay in the re-rendered tail.
+  let stableCount = source.length - 1
+  while (stableCount > 0 && tableExtendable(source[stableCount - 1] ?? '')) stableCount -= 1
+
+  const tailFrom = state.unitEnds.length > 0 ? (state.unitEnds[state.unitEnds.length - 1] ?? -1) + 1 : 0
+  const tail: string[] = []
+  const marks: SourceMark[] = []
+  renderSourceLines(source, tailFrom, width, theme, tail, state.inFence, marks)
+
+  const lines = [...state.lines]
+  let consumed = 0
+  for (const mark of marks) {
+    if (mark.end >= stableCount) break
+    lines.push(...tail.slice(consumed, mark.count))
+    consumed = mark.count
+    state.unitEnds.push(mark.end)
+    state.inFence = mark.inFence
+  }
+  const frozenLines = state.unitEnds.length > 0 ? (state.unitEnds[state.unitEnds.length - 1] ?? -1) + 1 : 0
+  state.frozen = safe.slice(0, offsets[frozenLines] ?? 0)
+  // `lines` (the frozen rows) must not absorb the unstable tail: the state
+  // owns it by reference, so the per-frame result is a fresh copy.
+  state.lines = lines
+  const result = [...lines, ...tail.slice(consumed)]
+  state.lastLines = result
+  return { lines: result.slice(), state }
 }
 
 /** Render a unified diff with line-level colors. */

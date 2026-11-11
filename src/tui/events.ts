@@ -41,6 +41,12 @@ export interface Block {
   headline?: string
   /** Raw call arguments, kept for viewers that render them structurally. */
   input?: unknown
+  /**
+   * Bumped every time a later event mutates this block in place (a tool
+   * result settling its call, a reasoning merge, an agent settlement), so a
+   * per-block render cache knows the cached lines went stale.
+   */
+  rev?: number
 }
 
 /** Local `HH:MM`, the finish time shown next to a turn's duration. */
@@ -329,16 +335,65 @@ export function pendingQuestions(events: readonly SessionEvent[]): PendingAsk | 
   return pending === undefined ? undefined : { callId: pending[0], questions: pending[1] }
 }
 
-export function buildBlocks(events: readonly SessionEvent[], verbose = false): Block[] {
-  const blocks: Block[] = []
-  const callBlocks = new Map<string, Block>()
-  const agentBlocks = new Map<string, Block>()
-  const reasoningByTurn = new Map<string, Block>()
-  let userTurns = 0
-  // Wall-clock start of the open turn, so the footer can report how long it ran.
-  let turnStartedAt: number | undefined
+/**
+ * Incremental state of the event→block fold. `foldBlocks` resumes from a
+ * previous fold when the event prefix still matches (append-only growth), so
+ * long sessions do not rebuild every Block object — and the render cache keyed
+ * on those objects — on each durable event.
+ */
+export interface BlockFold {
+  blocks: Block[]
+  /**
+   * Blocks after the trailing subagent-dedup filter; recomputed each fold.
+   * Stable block objects, fresh array.
+   */
+  visible: Block[]
+  callBlocks: Map<string, Block>
+  agentBlocks: Map<string, Block>
+  reasoningByTurn: Map<string, Block>
+  userTurns: number
+  /** Wall-clock start of the open turn, so the footer can report duration. */
+  turnStartedAt: number | undefined
+  /** Events already folded. */
+  count: number
+  /** `seq` of the last folded event, to detect a shifted prefix. */
+  lastSeq: number
+  verbose: boolean
+}
 
-  for (const event of events) {
+export function foldBlocks(
+  events: readonly SessionEvent[],
+  previous?: BlockFold,
+  verbose = false,
+): BlockFold {
+  const resume = previous !== undefined
+    && previous.verbose === verbose
+    && previous.count <= events.length
+    && (previous.count === 0 || events[previous.count - 1]?.seq === previous.lastSeq)
+  const fold: BlockFold = resume
+    ? previous
+    : {
+        blocks: [],
+        visible: [],
+        callBlocks: new Map(),
+        agentBlocks: new Map(),
+        reasoningByTurn: new Map(),
+        userTurns: 0,
+        turnStartedAt: undefined,
+        count: 0,
+        lastSeq: 0,
+        verbose,
+      }
+  const blocks = fold.blocks
+  const callBlocks = fold.callBlocks
+  const agentBlocks = fold.agentBlocks
+  const reasoningByTurn = fold.reasoningByTurn
+  let userTurns = fold.userTurns
+  let turnStartedAt = fold.turnStartedAt
+
+  for (let index = resume ? fold.count : 0; index < events.length; index += 1) {
+    const event = events[index]
+    if (event === undefined) continue
     const data = dataOf(event)
     switch (event.type) {
       case 'user/message': {
@@ -376,6 +431,7 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
             existing.full = `${existing.full ?? existing.body}\n\n${reasoning}`
             existing.body = verbose ? existing.full : ''
             existing.steps = (existing.steps ?? 1) + 1
+            existing.rev = (existing.rev ?? 0) + 1
           }
         }
         if (text.length > 0) blocks.push({ kind: 'assistant', body: text })
@@ -412,6 +468,7 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
         if (target !== undefined) {
           target.failed = failed
           target.detail = output
+          target.rev = (target.rev ?? 0) + 1
         } else {
           // The call was cleared or never seen. An answer batch still names
           // itself instead of dumping JSON under a generic "tool result".
@@ -458,6 +515,7 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
           if (target !== undefined) {
             target.title = failed ? '✗ agent failed' : '✓ agent finished'
             target.failed = failed
+            target.rev = (target.rev ?? 0) + 1
           }
         }
         break
@@ -477,6 +535,7 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
         if (target !== undefined) {
           target.title = `${failed ? '✗' : settled ? '✓' : '⇢'} agent ${failed ? 'failed' : settled ? 'finished' : 'running'}`
           target.failed = failed
+          target.rev = (target.rev ?? 0) + 1
         } else if (verbose) {
           blocks.push({ kind: 'notice', title: `subagent ${event.type.split('/')[1] ?? 'event'}`, body: id })
         }
@@ -544,12 +603,21 @@ export function buildBlocks(events: readonly SessionEvent[], verbose = false): B
     }
   }
 
+  fold.userTurns = userTurns
+  fold.turnStartedAt = turnStartedAt
+  fold.count = events.length
+  fold.lastSeq = events[events.length - 1]?.seq ?? 0
   // A spawn call and its catalog row describe the same event; when the roster
   // exists, the agent card replaces the generic tool card.
-  if (agentBlocks.size > 0) {
-    return blocks.filter((block) => !(block.kind === 'tool' && block.toolName === 'subagent'))
-  }
-  return blocks
+  fold.visible = agentBlocks.size > 0
+    ? blocks.filter((block) => !(block.kind === 'tool' && block.toolName === 'subagent'))
+    : blocks
+  return fold
+}
+
+/** One-shot fold for callers that render a snapshot once. */
+export function buildBlocks(events: readonly SessionEvent[], verbose = false): Block[] {
+  return foldBlocks(events, undefined, verbose).visible
 }
 
 export interface RenderOptions {
@@ -607,15 +675,175 @@ export function renderBlocks(
   return renderBlocksWithRanges(blocks, width, theme, options).lines
 }
 
+interface CachedBlockLines {
+  rev: number
+  width: number
+  expandTools: boolean
+  surfaceWidth: number
+  theme: Theme
+  /** True when these lines carry the `dshell` attribution header. */
+  labeled: boolean
+  lines: string[]
+}
+
+/** Per-block line cache; only useful alongside an incremental `BlockFold`. */
+export interface BlockRenderCache {
+  hits: number
+  misses: number
+  readonly entries: WeakMap<Block, CachedBlockLines>
+}
+
+export function createBlockRenderCache(): BlockRenderCache {
+  return { hits: 0, misses: 0, entries: new WeakMap() }
+}
+
+function cacheLookup(
+  cache: BlockRenderCache,
+  block: Block,
+  width: number,
+  options: RenderOptions,
+  theme: Theme,
+): CachedBlockLines | undefined {
+  const hit = cache.entries.get(block)
+  if (hit === undefined) return undefined
+  if (hit.rev !== (block.rev ?? 0)) return undefined
+  if (hit.width !== width) return undefined
+  if (hit.expandTools !== (options.expandTools === true)) return undefined
+  if (hit.surfaceWidth !== (options.surfaceWidth ?? width)) return undefined
+  if (hit.theme !== theme) return undefined
+  return hit
+}
+
+/** Render one block's own rows; the caller adds separators and ranges. */
+function renderBlockLines(
+  block: Block,
+  width: number,
+  theme: Theme,
+  options: RenderOptions,
+  separatorWidth: number,
+  withLabel: boolean,
+): string[] {
+  const lines: string[] = []
+  switch (block.kind) {
+    case 'user': {
+      // Quote-style prompt on a light-grey bubble: `> hello`, continuation
+      // lines aligned under the marker and the band spanning the transcript.
+      const bandWidth = Math.max(width, options.surfaceWidth ?? width)
+      const body = renderBody(block, Math.max(8, width - 4), theme, options)
+      body.forEach((line, index) => {
+        const row = pad(`${index === 0 ? '> ' : '  '}${line}`, bandWidth)
+        lines.push(paintBand(theme, theme.bgUser, theme.userText, row))
+      })
+      break
+    }
+    case 'assistant': {
+      // One attribution per turn: only the first assistant block after a user
+      // prompt carries the `dshell` header, later steps stay label-free.
+      if (withLabel) {
+        lines.push(`${paint(theme, 'accent', BRAND_ICON)} ${paint(theme, 'bold', paint(theme, 'accentSoft', BRAND_NAME))}`)
+      }
+      lines.push(...renderBody(block, width, theme, options))
+      break
+    }
+    case 'reasoning': {
+      // Folded to one header per turn. Ctrl-O rebuilds the blocks with the
+      // full text in `body`, so the rail only appears when expanded.
+      const full = block.full ?? block.body
+      const head = `${paint(theme, 'info', '⚓')} ${paint(theme, 'dim', block.title ?? 'thinking')}`
+      const tokens = Math.max(1, Math.round(full.length / 4))
+      const steps = block.steps ?? 1
+      const parts = [`${tokens} tok`]
+      if (steps > 1) parts.push(`${steps} steps`)
+      parts.push(block.body.length > 0 ? 'ctrl+o fold' : 'ctrl+o expand')
+      lines.push(`${head} ${paint(theme, 'dim', `· ${parts.join(' · ')}`)}`)
+      if (block.body.length > 0) {
+        for (const line of block.body.split('\n')) {
+          for (const wrapped of wrapText(line, Math.max(1, width - 2))) {
+            lines.push(paint(theme, 'dim', `│ ${wrapped}`))
+          }
+        }
+      }
+      break
+    }
+    case 'tool': {
+      // Folded to one line like Claude Code: the call and its arguments, with
+      // the output left for Ctrl-O or the Enter detail panel. A failure keeps
+      // a short excerpt so the reason is visible without expanding.
+      const failed = block.failed === true
+      const marker = failed ? '✗' : block.detail === undefined ? '▸' : '✓'
+      const color = failed ? 'red' : block.detail === undefined ? 'yellow' : 'green'
+      const label =
+        block.headline ?? `${block.title ?? block.toolName ?? 'tool'}${block.body.length > 0 ? ` · ${block.body}` : ''}`
+      lines.push(truncate(`${paint(theme, color, `${marker} ${label}`)}`, width))
+      if (options.expandTools === true) {
+        if (block.body.length > 0) {
+          for (const line of wrapText(block.body, Math.max(1, width - 2))) {
+            lines.push(paint(theme, 'dim', `  ${line}`))
+          }
+        }
+        if (block.detail !== undefined && block.detail.length > 0) {
+          for (const line of renderBody({ ...block, body: block.detail }, width, theme, options)) {
+            lines.push(line)
+          }
+        }
+      } else if (failed && block.detail !== undefined && block.detail.length > 0) {
+        for (const line of block.detail.split('\n').slice(0, 2)) {
+          lines.push(paint(theme, 'red', truncate(`  ${line}`, width)))
+        }
+      }
+      break
+    }
+    case 'todo': {
+      lines.push(paint(theme, 'bold', `☐ ${block.title ?? 'todos'}`))
+      for (const line of wrapText(block.body, Math.max(1, width - 2))) {
+        lines.push(`  ${line}`)
+      }
+      break
+    }
+    case 'notice': {
+      const title = block.title ?? ''
+      if (title.startsWith('⇢') || title.startsWith('✓') || title.startsWith('✗')) {
+        const style = block.failed === true || title.startsWith('✗') ? 'red' : title.startsWith('✓') ? 'green' : 'magenta'
+        lines.push(`${paint(theme, style, title)} ${paint(theme, 'dim', block.body)}`)
+      } else {
+        lines.push(paint(theme, 'dim', `· ${title}${block.body.length > 0 ? ` ${block.body}` : ''}`))
+      }
+      break
+    }
+    case 'error': {
+      lines.push(paint(theme, 'red', `! ${block.title ?? 'error'}: ${block.body}`))
+      break
+    }
+    case 'turn': {
+      lines.push(paint(theme, 'dim', paint(theme, 'gray', '─'.repeat(separatorWidth))))
+      if (block.title !== undefined) lines.push(paint(theme, 'dim', block.title))
+      break
+    }
+    case 'turnend': {
+      lines.push(`${paint(theme, 'accentSoft', '✻')} ${paint(theme, 'dim', block.title ?? '')}`)
+      break
+    }
+  }
+  return lines
+}
+
 /**
  * Render blocks and report where each one landed, so the UI can move a
  * selection from block to block without re-measuring the transcript.
+ *
+ * `cache` memoizes each block's rows (keyed by block identity + `rev`, so a
+ * late tool result re-renders only the block it settled). With the
+ * append-only fold the transcript's cost per durable event drops from
+ * O(history) to O(new blocks). Only pass a long-lived cache for block lists
+ * produced by resumable `foldBlocks` calls — a cache shared across unrelated
+ * block lists would replay stale attribution labels.
  */
 export function renderBlocksWithRanges(
   blocks: readonly Block[],
   width: number,
   theme: Theme,
   options: RenderOptions = {},
+  cache?: BlockRenderCache,
 ): RenderedBlocks {
   const out: string[] = []
   const ranges: BlockRange[] = []
@@ -625,107 +853,32 @@ export function renderBlocksWithRanges(
     if (block.kind === 'user') assistantLabelShown = false
     if (out.length > 0) out.push('')
     const start = out.length
-    switch (block.kind) {
-      case 'user': {
-        // Quote-style prompt on a light-grey bubble: `> hello`, continuation
-        // lines aligned under the marker and the band spanning the transcript.
-        const bandWidth = Math.max(width, options.surfaceWidth ?? width)
-        const body = renderBody(block, Math.max(8, width - 4), theme, options)
-        body.forEach((line, index) => {
-          const row = pad(`${index === 0 ? '> ' : '  '}${line}`, bandWidth)
-          out.push(paintBand(theme, theme.bgUser, theme.userText, row))
-        })
-        break
-      }
-      case 'assistant': {
-        // One attribution per turn: only the first assistant block after a user
-        // prompt carries the `dshell` header, later steps stay label-free.
-        if (!assistantLabelShown) {
-          out.push(`${paint(theme, 'accent', BRAND_ICON)} ${paint(theme, 'bold', paint(theme, 'accentSoft', BRAND_NAME))}`)
-          assistantLabelShown = true
-        }
-        out.push(...renderBody(block, width, theme, options))
-        break
-      }
-      case 'reasoning': {
-        // Folded to one header per turn. Ctrl-O rebuilds the blocks with the
-        // full text in `body`, so the rail only appears when expanded.
-        const full = block.full ?? block.body
-        const head = `${paint(theme, 'info', '⚓')} ${paint(theme, 'dim', block.title ?? 'thinking')}`
-        const tokens = Math.max(1, Math.round(full.length / 4))
-        const steps = block.steps ?? 1
-        const parts = [`${tokens} tok`]
-        if (steps > 1) parts.push(`${steps} steps`)
-        parts.push(block.body.length > 0 ? 'ctrl+o fold' : 'ctrl+o expand')
-        out.push(`${head} ${paint(theme, 'dim', `· ${parts.join(' · ')}`)}`)
-        if (block.body.length > 0) {
-          for (const line of block.body.split('\n')) {
-            for (const wrapped of wrapText(line, Math.max(1, width - 2))) {
-              out.push(paint(theme, 'dim', `│ ${wrapped}`))
-            }
-          }
-        }
-        break
-      }
-      case 'tool': {
-        // Folded to one line like Claude Code: the call and its arguments, with
-        // the output left for Ctrl-O or the Enter detail panel. A failure keeps
-        // a short excerpt so the reason is visible without expanding.
-        const failed = block.failed === true
-        const marker = failed ? '✗' : block.detail === undefined ? '▸' : '✓'
-        const color = failed ? 'red' : block.detail === undefined ? 'yellow' : 'green'
-        const label =
-          block.headline ?? `${block.title ?? block.toolName ?? 'tool'}${block.body.length > 0 ? ` · ${block.body}` : ''}`
-        out.push(truncate(`${paint(theme, color, `${marker} ${label}`)}`, width))
-        if (options.expandTools === true) {
-          if (block.body.length > 0) {
-            for (const line of wrapText(block.body, Math.max(1, width - 2))) {
-              out.push(paint(theme, 'dim', `  ${line}`))
-            }
-          }
-          if (block.detail !== undefined && block.detail.length > 0) {
-            for (const line of renderBody({ ...block, body: block.detail }, width, theme, options)) {
-              out.push(line)
-            }
-          }
-        } else if (failed && block.detail !== undefined && block.detail.length > 0) {
-          for (const line of block.detail.split('\n').slice(0, 2)) {
-            out.push(paint(theme, 'red', truncate(`  ${line}`, width)))
-          }
-        }
-        break
-      }
-      case 'todo': {
-        out.push(paint(theme, 'bold', `☐ ${block.title ?? 'todos'}`))
-        for (const line of wrapText(block.body, Math.max(1, width - 2))) {
-          out.push(`  ${line}`)
-        }
-        break
-      }
-      case 'notice': {
-        const title = block.title ?? ''
-        if (title.startsWith('⇢') || title.startsWith('✓') || title.startsWith('✗')) {
-          const style = block.failed === true || title.startsWith('✗') ? 'red' : title.startsWith('✓') ? 'green' : 'magenta'
-          out.push(`${paint(theme, style, title)} ${paint(theme, 'dim', block.body)}`)
-        } else {
-          out.push(paint(theme, 'dim', `· ${title}${block.body.length > 0 ? ` ${block.body}` : ''}`))
-        }
-        break
-      }
-      case 'error': {
-        out.push(paint(theme, 'red', `! ${block.title ?? 'error'}: ${block.body}`))
-        break
-      }
-      case 'turn': {
-        out.push(paint(theme, 'dim', paint(theme, 'gray', '─'.repeat(separatorWidth))))
-        if (block.title !== undefined) out.push(paint(theme, 'dim', block.title))
-        break
-      }
-      case 'turnend': {
-        out.push(`${paint(theme, 'accentSoft', '✻')} ${paint(theme, 'dim', block.title ?? '')}`)
-        break
+    if (cache !== undefined) {
+      const hit = cacheLookup(cache, block, width, options, theme)
+      if (hit !== undefined) {
+        if (block.kind === 'assistant' && hit.labeled) assistantLabelShown = true
+        out.push(...hit.lines)
+        ranges.push({ block, start, end: out.length })
+        cache.hits += 1
+        continue
       }
     }
+    const withLabel = block.kind === 'assistant' && !assistantLabelShown
+    const lines = renderBlockLines(block, width, theme, options, separatorWidth, withLabel)
+    if (withLabel) assistantLabelShown = true
+    if (cache !== undefined) {
+      cache.entries.set(block, {
+        rev: block.rev ?? 0,
+        width,
+        expandTools: options.expandTools === true,
+        surfaceWidth: options.surfaceWidth ?? width,
+        theme,
+        labeled: withLabel,
+        lines,
+      })
+      cache.misses += 1
+    }
+    out.push(...lines)
     ranges.push({ block, start, end: out.length })
   }
   return { lines: out, ranges }

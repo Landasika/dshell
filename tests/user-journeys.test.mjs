@@ -286,6 +286,23 @@ test('switching sessions during reconnect cannot take the user back to the disco
   assert.equal(ui.backend.handleCount, 1)
 })
 
+test('switching sessions must not reuse the previous session transcript fold', async t => {
+  const ui = await journey(t, { events: [
+    { type: 'user/message', seq: 0, data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 's1-prompt' }] } } },
+    { type: 'assistant/message', seq: 1, data: { message: { content: [{ type: 'text', text: 's1-answer' }] } } },
+  ] })
+  await until(() => ui.output.text.includes('s1-answer'), 's1 rendered')
+  // Both sessions number events from 0, so s2 reaching the same length makes
+  // the seq-prefix check alone look like an append: the fold (and the render
+  // cache) must be dropped on the session switch, not resumed.
+  ui.emit('s2', 'user/message', { message: { source: { kind: 'user' }, content: [{ type: 'text', text: 's2-prompt' }] } })
+  ui.emit('s2', 'assistant/message', { message: { content: [{ type: 'text', text: 's2-answer' }] } })
+  ui.input.push('/attach s2\r')
+  await until(() => ui.output.text.includes('s2-answer'), 's2 rendered')
+  await pause(80)
+  assert.ok(!ui.output.lines.join('\n').includes('s1-answer'), 'the previous session fold must not leak into the new session')
+})
+
 test('an explicit reconnect reopens the control connection as well as the session view', async t => {
   const ui = await journey(t)
   ui.dropAll()
