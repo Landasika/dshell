@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   ProviderEditError,
   addProvider,
+  hasProviderConfig,
   readProviderDetail,
   syncProviderModels,
   clearProviderField,
@@ -45,6 +46,7 @@ test('readProviders reads ids, scalar fields and model counts', () => {
       id: 'kimi-relay',
       apiKeyEnv: 'KIMI_RELAY_API_KEY',
       displayName: 'Kimi 中转站',
+      api: 'anthropic-messages',
       baseURL: 'http://192.168.8.77:8180',
       models: 2,
     },
@@ -56,6 +58,19 @@ test('readProviders reads ids, scalar fields and model counts', () => {
     },
   ])
   assert.deepEqual(readProviders('- id: llm-pi-ai\n  config: {}\n'), [])
+})
+
+test('metadata-only engine patches do not own or obscure provider configuration', () => {
+  const metadata = '- id: llm-pi-ai\n  disabled: false\n'
+  assert.equal(hasProviderConfig(metadata), false)
+  assert.equal(hasProviderConfig('- id: llm-pi-ai\n  config: {}\n'), true)
+  for (const text of [metadata + PATCH, PATCH + metadata]) {
+    assert.equal(hasProviderConfig(text), true)
+    assert.deepEqual(readProviders(text), readProviders(PATCH))
+    const next = addProvider(text, { id: 'new', baseURL: 'https://new.example/v1', models: ['m'] })
+    assert.deepEqual(readProviders(next).map(row => row.id), ['kimi-relay', 'glm-sa', 'new'])
+    assert.ok(next.includes(metadata))
+  }
 })
 
 test('setProviderField rewrites one line and leaves everything else intact', () => {
@@ -73,6 +88,28 @@ test('setProviderField inserts a missing key under the provider id', () => {
   const next = setProviderField(PATCH, 'glm-sa', 'displayName', 'GLM 直连')
   assert.equal(readProviders(next)[1].displayName, 'GLM 直连')
   assert.match(next, /      glm-sa:\n {8}displayName: 'GLM 直连'\n {8}apiKeyEnv: GLM_SA_API_KEY/)
+})
+
+test('editing the API persists only a supported wire protocol and preserves other fields', () => {
+  for (const api of ['openai-completions', 'openai-responses', 'anthropic-messages']) {
+    const next = setProviderField(PATCH, 'kimi-relay', 'api', api)
+    assert.equal(next, PATCH.replace('api: anthropic-messages', `api: ${api}`))
+    assert.equal(readProviders(next)[0].api, api)
+  }
+  assert.throws(() => setProviderField(PATCH, 'kimi-relay', 'api', 'made-up'), /wire protocol/)
+})
+
+test('adding the first provider initializes the engine map and preserves its other configuration', () => {
+  const text = '# engine\n- id: llm-pi-ai\n  name: "@deepseek-ai/dsh-llm-pi-ai"\n  config:\n    timeoutMs: 9000\n- id: other\n  config: {}\n'
+  const spec = { id: 'first', baseURL: 'https://example.test/v1', api: 'openai-responses', models: ['model-a'] }
+  const next = addProvider(text, spec)
+  assert.equal(readProviders(next)[0].api, spec.api)
+  assert.deepEqual(readProviderDetail(next, 'first').modelIds, ['model-a'])
+  assert.match(next, /timeoutMs: 9000/)
+  assert.match(next, /# engine/)
+  assert.match(next, /- id: other\n  config: \{\}/)
+  assert.equal(readProviders(addProvider('- id: llm-pi-ai\n', spec))[0].id, 'first')
+  assert.throws(() => addProvider('- id: llm-pi-ai\n  config: {providers: []}\n', spec), /providers must be a YAML map/)
 })
 
 test('setProviderField quotes values a plain scalar would misread', () => {

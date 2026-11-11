@@ -341,6 +341,56 @@ async function fakeJourney(t, { events = [], columns = 100, rows = 30, setup } =
   return { backend, input, output }
 }
 
+test('provider creation chooses an API and masks pasted credentials throughout editing', async t => {
+  const ui = await fakeJourney(t)
+  const screen = () => ui.output.lines.join('\n')
+  ui.input.push('/provider\r')
+  await until(() => screen().includes('/fake/cordis.patch.yml'), 'provider list')
+  ui.input.push('a')
+  await until(() => screen().includes('add provider'), 'create panel')
+  ui.input.push('\rmy-relay\r\u001b[B\u001b[B\rhttps://example.test/v1\r\u001b[B\r')
+  await until(() => screen().includes('choose API'), 'API chooser')
+  for (const api of ['openai-completions', 'openai-responses', 'anthropic-messages']) assert.ok(screen().includes(api))
+  assert.match(screen(), /▸ anthropic-messages/)
+  // Moving the selection does not commit until Enter.
+  ui.input.push('\u001b[A\r')
+  await until(() => /api\s+openai-responses/.test(screen()), 'selected Responses API')
+  assert.ok(!screen().includes('choose API'))
+  ui.input.push('\u001b[B\r')
+  const key = 'sk-test-create-key-kept-out-of-terminal'
+  ui.output.text = ''
+  ui.input.push(`\u001b[200~${key}\n\u001b[201~`)
+  await until(() => screen().includes('••••'), 'masked paste')
+  assert.ok(!ui.output.text.includes(key))
+  ui.input.push('\r\u001b[B\rmodel-a\rs')
+  await until(() => screen().includes('Restart it now to load this provider?'), 'saved provider')
+  const row = (await ui.backend.providerList()).providers.find(row => row.id === 'my-relay')
+  assert.equal(row.api, 'openai-responses')
+  assert.equal(row.models, 1)
+  assert.equal(ui.backend.storedKeys.get(row.apiKeyEnv), key)
+  assert.ok(!ui.output.text.includes(key))
+})
+
+test('editing a provider preselects the current API, cancels a draft choice, and saves the confirmed protocol', async t => {
+  const ui = await fakeJourney(t)
+  await ui.backend.updateProvider('fake', 'api', 'openai-responses')
+  const screen = () => ui.output.lines.join('\n')
+  ui.input.push('/provider\r')
+  await until(() => screen().includes('/fake/cordis.patch.yml'), 'provider list')
+  ui.input.push('\r\u001b[B\u001b[B\u001b[B\r')
+  await until(() => screen().includes('choose API'), 'API chooser')
+  assert.match(screen(), /▸ openai-responses/)
+  ui.input.push('\u001b[B')
+  ui.input.push('\u001b')
+  await until(() => !screen().includes('choose API'), 'cancel choice')
+  assert.match(screen(), /api\s+openai-responses/)
+  ui.input.push('\r\u001b[A\r')
+  await until(() => /api\s+openai-completions/.test(screen()), 'confirm completion API')
+  ui.input.push('s')
+  await until(() => screen().includes('Restart it now to load this change?'), 'save API change')
+  assert.equal((await ui.backend.providerList()).providers.find(row => row.id === 'fake').api, 'openai-completions')
+})
+
 test('history search scrolls the selected prompt into view beyond the first page', async t => {
   const ui = await fakeJourney(t, { events: Array.from({ length: 25 }, (_, seq) => ({ type: 'user/message', seq,
     data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: `prompt-${String(seq).padStart(2, '0')}` }] } } })) })

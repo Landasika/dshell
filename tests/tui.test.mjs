@@ -1118,6 +1118,23 @@ test('tool output is truncated and summarizeTool uses common arguments', () => {
   assert.match(summarizeTool('bash', '{"command":"echo hi","description":"Echo"}'), /Echo/)
 })
 
+test('long tool commands wrap completely at each viewport width without expanding output', () => {
+  const command = `printf '${'中文😀longargument'.repeat(32)}'\nprintf 'END_OF_COMMAND'`
+  const blocks = buildBlocks([
+    { type: 'tool/call', seq: 1, data: { name: 'bash', callId: 'long', arguments: { command } } },
+    { type: 'tool/result', seq: 2, data: { message: { toolCallId: 'long', content: [{ type: 'text', text: 'hidden output' }] } } },
+  ])
+  assert.equal(blocks[0].headline, `Bash(${command})`)
+  for (const width of [24, 60, 120]) {
+    const lines = renderBlocks(blocks, width, theme).map(stripAnsi)
+    assert.ok(lines.length > 2)
+    assert.ok(lines.every(line => displayWidth(line) <= width))
+    const call = lines.filter(line => line.trim().length > 0).map(line => line.slice(2)).join('')
+    assert.equal(call.replace(/\s/g, ''), `Bash(${command})`.replace(/\s/g, ''))
+    assert.ok(!lines.join('\n').includes('hidden output'))
+  }
+})
+
 test('tool renderer registry extends labels and summaries without changing the reducer', () => {
   const unregister = registerToolRenderer('deploy_preview', {
     label: 'Preview',
@@ -3185,7 +3202,7 @@ test('TUI adds and removes providers like the Web UI models page', async () => {
   input.push('n')
   await pause()
   const added = (await backend.providerList()).providers.find((row) => row.id === 'test-relay')
-  assert.deepEqual(added, { id: 'test-relay', baseURL: 'https://t.example/v1', models: 2 })
+  assert.deepEqual(added, { id: 'test-relay', baseURL: 'https://t.example/v1', api: 'anthropic-messages', models: 2 })
 
   // Remove: last row, confirm, then decline the restart.
   input.push('/provider')

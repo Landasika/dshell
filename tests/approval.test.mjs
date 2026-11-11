@@ -77,7 +77,7 @@ test('timeout and abort end as unavailable, never allowed', async () => {
   assert.equal(aborted.broadcasts.at(-1).message.source, 'disconnect')
 })
 
-test('losing the last watcher closes only once the other frontends are out too', async () => {
+test('losing the last watcher preserves the approval for a reconnecting answerer', async () => {
   const { coordinator, state } = rig(2)
   const outcome = coordinator.begin(request({ next: async () => 'unavailable' }))
   await new Promise((resolve) => setTimeout(resolve, 10))
@@ -87,7 +87,12 @@ test('losing the last watcher closes only once the other frontends are out too',
   assert.equal(coordinator.has('a1'), true, 'one watcher still online keeps the approval open')
   state.watchers = 0
   coordinator.watchersChanged()
-  assert.equal(await outcome, 'unavailable')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(coordinator.has('a1'), true, 'disconnect keeps the request available')
+  state.watchers = 1
+  coordinator.watchersChanged()
+  assert.equal(coordinator.answer('a1', 'allowed-once'), true)
+  assert.equal(await outcome, 'allowed-once')
 })
 
 test('a watcher leaving while the web answerer still works does not close', async () => {

@@ -1,6 +1,6 @@
 {
   "name": "@landasika/dshell",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "A Claude Code-style terminal frontend for DeepSeek Harness",
   "type": "module",
   "private": false,
@@ -36,6 +36,7 @@
   },
   "files": [
     "dist/",
+    "skills/",
     "cordis.patch.yml",
     "README.md"
   ],

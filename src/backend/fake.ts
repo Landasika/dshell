@@ -320,7 +320,7 @@ export class FakeBackend implements DshellBackend {
       this.storedKeys.set(ref, apiKey)
       row.apiKeyEnv = ref
     }
-    for (const field of ['baseURL', 'apiKeyEnv', 'displayName'] as const) {
+    for (const field of ['baseURL', 'apiKeyEnv', 'displayName', 'api'] as const) {
       if (!(field in changes) || (field === 'apiKeyEnv' && apiKey !== undefined)) continue
       const value = changes[field]?.trim() ?? ''
       if (value.length === 0) delete row[field]
@@ -376,6 +376,7 @@ export class FakeBackend implements DshellBackend {
     }
     this.providerRows.push({
       id: spec.id,
+      ...(spec.api === undefined ? {} : { api: spec.api }),
       ...(spec.displayName === undefined ? {} : { displayName: spec.displayName }),
       ...(spec.apiKeyEnv === undefined ? {} : { apiKeyEnv: spec.apiKeyEnv }),
       baseURL: spec.baseURL,

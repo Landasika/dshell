@@ -22,13 +22,17 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import type { SkillEntry } from '../protocol/index.js'
 
 /** Wins over user roots (400/500) but never over project roots (100/200). */
 const HUB_RANK = 350
 export const HUB_PROVIDER = 'dshell-hub'
-const HUB_SOURCE = 'dshell-hub'
+export const BUNDLED_PROVIDER = 'dshell-bundled'
+// Local project, custom and user skills all take precedence over defaults.
+const BUNDLED_RANK = 1000
+const BUNDLED_SKILL_DIR = fileURLToPath(new URL('../../skills/', import.meta.url))
 const SKILL_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/
 
 export interface SkillSummaryLike {
@@ -176,15 +180,24 @@ export function scanSkillDirs(dirs: readonly string[]): HubSkill[] {
 }
 
 /** The `ctx.skills` provider the hub registers. */
-export function createHubProvider(dirs: readonly string[]): {
+export function createHubProvider(dirs: readonly string[]): ReturnType<typeof createDirectoryProvider> {
+  return createDirectoryProvider(dirs, HUB_PROVIDER, HUB_RANK)
+}
+
+/** Defaults shipped in the npm package, independent of cwd and hub settings. */
+export function createBundledProvider(): ReturnType<typeof createDirectoryProvider> {
+  return createDirectoryProvider([BUNDLED_SKILL_DIR], BUNDLED_PROVIDER, BUNDLED_RANK)
+}
+
+function createDirectoryProvider(dirs: readonly string[], provider: string, rank: number): {
   name: string
   list(options: { cwd?: string }): Promise<readonly unknown[]>
   get(candidate: any, options: { cwd?: string }): Promise<unknown>
 } {
   return {
-    name: HUB_PROVIDER,
+    name: provider,
     async list() {
-      return scanSkillDirs(dirs).map((skill) => candidateOf(skill))
+      return scanSkillDirs(dirs).map((skill) => ({ ...summaryOf(skill, provider), rank, locator: skill.path }))
     },
     async get(candidate: any) {
       const path = (candidate as SkillCandidateLike | undefined)?.locator
@@ -192,27 +205,23 @@ export function createHubProvider(dirs: readonly string[]): {
       const skill = readSkillFile(path)
       if (skill === undefined) return undefined
       return {
-        ...summaryOf(skill),
+        ...summaryOf(skill, provider),
         content: skill.content,
       }
     },
   }
 }
 
-function summaryOf(skill: HubSkill): SkillSummaryLike & { invocation: { modelInvocable: boolean; userInvocable: boolean } } {
+function summaryOf(skill: HubSkill, provider: string): SkillSummaryLike & { invocation: { modelInvocable: boolean; userInvocable: boolean } } {
   return {
     name: skill.name,
     description: skill.description,
     ...(skill.whenToUse === undefined ? {} : { whenToUse: skill.whenToUse }),
-    source: HUB_SOURCE,
-    provider: HUB_PROVIDER,
+    source: provider,
+    provider,
     path: skill.path,
     invocation: { modelInvocable: skill.modelInvocable, userInvocable: skill.userInvocable },
   }
-}
-
-function candidateOf(skill: HubSkill): unknown {
-  return { ...summaryOf(skill), rank: HUB_RANK, locator: skill.path }
 }
 
 /**

@@ -124,6 +124,6 @@ export function renderToolCall(name: string, rawArguments: unknown): { label: st
     : typeof renderer.label === 'string' ? renderer.label : renderer.label(context)
   const summary = truncate(renderer?.summary?.(context) ?? genericSummary(context), 180)
   const fallbackPrimary = Object.values(context.arguments).find(value => typeof value === 'string' && value.trim().length > 0)
-  const primary = (renderer?.primary?.(context) ?? (typeof fallbackPrimary === 'string' ? fallbackPrimary : '')).replace(/\s+/g, ' ').trim()
-  return { label, summary, signature: primary.length === 0 ? label : `${label}(${truncate(primary, 300)})` }
+  const primary = (renderer?.primary?.(context) ?? (typeof fallbackPrimary === 'string' ? fallbackPrimary : '')).trim()
+  return { label, summary, signature: primary.length === 0 ? label : `${label}(${primary})` }
 }

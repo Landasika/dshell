@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict'
 import { connect } from 'node:net'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -238,7 +238,7 @@ class NdjClient {
 async function startHarness(t, config = {}, services = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dshell-plugin-'))
   const socketPath = join(directory, 'dshell.sock')
-  const harness = createFakeCtx(services)
+  const harness = createFakeCtx({ dshHomePath: directory, ...services })
   // 三条测试隔离（都是踩过的坑）：
   //
   // 1. warmSessionList: false —— 预热会在 apply 返回后自己去查列表，抢在
@@ -256,6 +256,7 @@ async function startHarness(t, config = {}, services = {}) {
     ...config,
   })
   t.after(async () => {
+    await harness.emit('dispose')
     for (const disposer of harness.disposers) await disposer?.()
     await rm(directory, { recursive: true, force: true })
   })
@@ -405,21 +406,122 @@ test('provider/save commits all fields once and reports config-editor source met
   client.send({
     type: 'provider/save',
     providerId: 'relay',
-    changes: { displayName: 'Relay Two', baseURL: 'https://new.example/v1', apiKeyEnv: 'RELAY_TWO_API_KEY' },
+    changes: { displayName: 'Relay Two', baseURL: 'https://new.example/v1', apiKeyEnv: 'RELAY_TWO_API_KEY', api: 'openai-responses' },
   })
   const saved = await client.next()
   assert.equal(saved.type, 'provider-saved')
   assert.equal(fixture.state.editCalls, 1)
-  assert.deepEqual(saved.fields, ['displayName', 'baseURL', 'apiKeyEnv'])
+  assert.deepEqual(saved.fields, ['displayName', 'baseURL', 'apiKeyEnv', 'api'])
   assert.deepEqual(saved.source, { kind: 'config-editor', layer: 'entry', inherited: true, overridden: true })
   assert.equal(saved.providers[0].displayName, 'Relay Two')
   assert.equal(saved.providers[0].baseURL, 'https://new.example/v1')
   assert.equal(saved.providers[0].apiKeyEnv, 'RELAY_TWO_API_KEY')
+  assert.equal(saved.providers[0].api, 'openai-responses')
+  assert.equal(fixture.row.entry.options.config.providers.relay.api, 'openai-responses')
 
   client.send({ type: 'provider/list' })
   const listed = await client.next()
   assert.equal(listed.type, 'provider-list')
   assert.deepEqual(listed.source, saved.source)
+})
+
+test('provider/create uses the home provider owner when the config editor points at another profile', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dshell-provider-home-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const homePatch = join(home, 'cordis.patch.yml')
+  const profilePatch = join(home, 'profile.patch.yml')
+  const before = '# home owns providers\n- id: llm-pi-ai\n  config:\n    providers:\n      existing:\n        api: anthropic-messages\n        baseURL: https://old.example/v1\n        models: [{id: old-model}]\n'
+  await writeFile(homePatch, before)
+  await writeFile(profilePatch, '# profile owns no providers\n[]\n')
+  const editor = makeProviderEditor({ documentPath: profilePatch })
+  const harness = await startHarness(t, {}, { dshHomePath: home, configEditor: editor.editor })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'provider/create', providerId: 'new', baseURL: 'https://new.example/v1', api: 'openai-responses', models: ['new-model'] })
+  const reply = await client.next()
+  assert.equal(reply.type, 'provider-created', JSON.stringify(reply))
+  assert.equal(reply.file, homePatch)
+  assert.equal(reply.providers.find(row => row.id === 'new').api, 'openai-responses')
+  assert.match(await readFile(homePatch, 'utf8'), /api: openai-responses/)
+  assert.ok((await readFile(homePatch, 'utf8')).startsWith(before))
+  assert.equal(await readFile(profilePatch, 'utf8'), '# profile owns no providers\n[]\n')
+  assert.equal(editor.state.editCalls, 0)
+})
+
+test('metadata-only home patches preserve the profile provider owner and settings', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dshell-provider-metadata-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const homePatch = join(home, 'cordis.patch.yml')
+  const metadata = '- id: llm-pi-ai\n  disabled: false\n'
+  await writeFile(homePatch, metadata)
+  const fixture = makeProviderEditor({ documentPath: join(home, 'profile.patch.yml') })
+  fixture.row.entry.options.config.timeoutMs = 12000
+  const harness = await startHarness(t, {}, { dshHomePath: home, configEditor: fixture.editor })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'provider/list' })
+  const listed = await client.next()
+  assert.equal(listed.type, 'provider-list', JSON.stringify(listed))
+  assert.deepEqual(listed.providers.map(row => row.id), ['relay'])
+  client.send({ type: 'provider/create', providerId: 'new', baseURL: 'https://new.example/v1', models: ['new-model'] })
+  const reply = await client.next()
+  assert.equal(reply.type, 'provider-created', JSON.stringify(reply))
+  assert.equal(fixture.state.editCalls, 1)
+  assert.deepEqual(reply.providers.map(row => row.id), ['relay', 'new'])
+  assert.equal(fixture.row.entry.options.config.timeoutMs, 12000)
+  assert.equal(await readFile(homePatch, 'utf8'), metadata)
+})
+
+test('provider/create initializes an empty config-editor provider map', async t => {
+  const fixture = makeProviderEditor()
+  fixture.row.entry.options.config = { timeoutMs: 12000 }
+  const harness = await startHarness(t, {}, { configEditor: fixture.editor })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'provider/create', providerId: 'first', baseURL: 'https://first.example/v1', api: 'openai-completions', models: ['model-a'] })
+  const reply = await client.next()
+  assert.equal(reply.type, 'provider-created', JSON.stringify(reply))
+  assert.equal(fixture.row.entry.options.config.timeoutMs, 12000)
+  assert.equal(fixture.row.entry.options.config.providers.first.api, 'openai-completions')
+})
+
+test('Host registers the bundled skill with an empty custom hub', async t => {
+  const providers = []
+  const skills = {
+    registerProvider(create) {
+      const provider = create({ invalidate() {} })
+      providers.push(provider)
+      return () => {}
+    },
+    async list(options) {
+      return (await Promise.all(providers.map(provider => provider.list(options)))).flat()
+    },
+    async get(name, options) {
+      for (const provider of providers) {
+        const candidate = (await provider.list(options)).find(skill => skill.name === name)
+        if (candidate) return provider.get(candidate, options)
+      }
+    },
+  }
+  const harness = await startHarness(t, {}, { skills })
+  const client = new NdjClient(harness.socketPath)
+  t.after(() => client.destroy())
+  client.send({ type: 'hello', protocol: 2 })
+  await client.next()
+  client.send({ type: 'skills/list' })
+  const listed = await client.next()
+  assert.equal(listed.type, 'skills')
+  assert.ok(listed.skills.some(skill => skill.name === 'dsh-config' && skill.modelInvocable && skill.userInvocable))
+  client.send({ type: 'skills/get', name: 'dsh-config' })
+  const loaded = await client.next()
+  assert.equal(loaded.type, 'skill')
+  assert.ok(loaded.content.length > 0)
 })
 
 test('provider/save rejects config-editor revision conflicts and rolls back a staged key', async (t) => {
@@ -1539,12 +1641,13 @@ test('a web decision settles first and a late CLI answer is not-pending (DS-002)
   assert.equal(late.code, 'APPROVAL_NOT_PENDING')
 })
 
-test('losing the last watcher settles the approval unavailable (DS-002)', async (t) => {
+test('losing the last watcher preserves the approval for reconnect (DS-002)', async (t) => {
   const harness = await startHarness(t)
   makeSession(harness, 's1', [])
   const first = new NdjClient(harness.socketPath)
   const second = new NdjClient(harness.socketPath)
   t.after(() => first.destroy())
+  t.after(() => second.destroy())
   for (const client of [first, second]) {
     client.send({ type: 'hello', protocol: 2 })
     await client.next()
@@ -1553,19 +1656,37 @@ test('losing the last watcher settles the approval unavailable (DS-002)', async 
     await client.next()
   }
 
-  const never = new Promise(() => {})
   const outcomes = harness.emit('approval/request', {
     agent: { session: { id: 's1' } },
     toolName: 'bash',
   }, async () => 'unavailable')
-  await first.next() // approval-request
+  const request = await first.next()
+  assert.equal(request.type, 'approval-request')
 
   second.destroy()
-  await new Promise((resolve) => setTimeout(resolve, 30))
-  assert.equal(Array.isArray(await Promise.race([outcomes, new Promise((resolve) => setTimeout(() => resolve('pending'), 5))])), false, 'one watcher still online')
+  await second.closed
+  assert.equal(await Promise.race([outcomes, new Promise((resolve) => setTimeout(() => resolve('pending'), 5))]), 'pending', 'one watcher still online')
 
   first.destroy()
-  assert.equal((await outcomes)[0], 'unavailable')
+  await first.closed
+  assert.equal(await Promise.race([outcomes, new Promise((resolve) => setTimeout(() => resolve('pending'), 5))]), 'pending', 'disconnect must preserve the pending approval')
+
+  const reconnected = new NdjClient(harness.socketPath)
+  t.after(() => reconnected.destroy())
+  reconnected.send({ type: 'hello', protocol: 2 })
+  await reconnected.next()
+  reconnected.send({ type: 'attach', sessionId: 's1' })
+  const attached = await reconnected.next()
+  assert.equal(attached.type, 'attached')
+  assert.equal(attached.approvals.length, 1)
+  assert.equal(attached.approvals[0].requestId, request.requestId)
+  await reconnected.next()
+  reconnected.send({ type: 'approval/answer', requestId: request.requestId, outcome: 'allowed-once' })
+  const resolved = await reconnected.next()
+  assert.equal(resolved.type, 'approval-resolved')
+  assert.equal(resolved.outcome, 'allowed-once')
+  assert.equal(resolved.source, 'cli')
+  assert.equal((await outcomes)[0], 'allowed-once')
 })
 
 test('close() releases the socket path for the replacement Host (DS-009)', async (t) => {
@@ -1891,7 +2012,7 @@ test('子会话没有 header 标题时，从日志的 session/title 事件补上
   const { zstdCompressSync } = await import('node:zlib')
   writeFileSync(join(dir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(jsonl)))
 
-  const harness = await startHarness(t)
+  const harness = await startHarness(t, {}, { dshHomePath: home })
   makeSession(harness, 'parent')
   makeSession(harness, 'kid', [], { origin: 'subagent', parentSession: 'parent', cwd: '/work', delegationDepth: 1 })
 
@@ -2194,7 +2315,7 @@ test('audit: malformed user log records do not hide a later child session title'
     else process.env.DSH_HOME = previous
     await rm(directory, { recursive: true, force: true })
   })
-  const harness = await startHarness(t)
+  const harness = await startHarness(t, {}, { dshHomePath: directory })
   makeSession(harness, 'child', [], { origin: 'subagent', parentSession: 'parent', cwd: '/work' })
   const logDir = join(directory, 'sessions', '--work--', 'child')
   await mkdir(logDir, { recursive: true })

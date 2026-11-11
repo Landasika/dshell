@@ -1,8 +1,9 @@
 import { isMap, isSeq, isScalar, parseDocument, type Node, type YAMLMap } from 'yaml'
+import { PROVIDER_APIS } from '../protocol/index.js'
 
-export const PROVIDER_FIELDS = ['baseURL', 'apiKeyEnv', 'displayName'] as const
+export const PROVIDER_FIELDS = ['baseURL', 'apiKeyEnv', 'displayName', 'api'] as const
 export type ProviderField = (typeof PROVIDER_FIELDS)[number]
-export interface ProviderRecord { id: string; displayName?: string; baseURL?: string; apiKeyEnv?: string; models: number }
+export interface ProviderRecord { id: string; displayName?: string; baseURL?: string; apiKeyEnv?: string; api?: string; models: number }
 export type ProviderEditCode = 'PROVIDERS_NOT_FOUND' | 'PROVIDER_NOT_FOUND' | 'PROVIDER_EXISTS' | 'EMPTY_PROVIDERS' | 'BAD_FIELD'
 export class ProviderEditError extends Error {
   constructor(readonly code: ProviderEditCode, message: string) { super(message); this.name = 'ProviderEditError' }
@@ -11,28 +12,41 @@ export interface NewProviderSpec { id: string; baseURL: string; api?: string; ap
 export interface ProviderDetail { id: string; baseURL?: string; api?: string; apiKeyEnv?: string; modelIds: string[] }
 function bad(message: string): never { throw new ProviderEditError('BAD_FIELD', message) }
 function scalar(value: unknown): string | undefined { return isScalar(value) && typeof value.value === 'string' ? value.value : undefined }
-function providers(text: string): YAMLMap | undefined {
-  const doc = parseDocument(text, { keepSourceTokens: true, uniqueKeys: true })
-  if (doc.errors.length) bad('invalid YAML: ' + doc.errors[0]?.message)
+function providerRows(node: unknown): YAMLMap[] {
   const found: YAMLMap[] = []
   const walk = (node: unknown): void => {
     if (isSeq(node)) { for (const item of node.items) walk(item); return }
     if (!isMap(node)) return
     if (node.get('id') === 'llm-pi-ai' || node.get('name') === '@deepseek-ai/dsh-llm-pi-ai') {
-      const map = node.getIn(['config', 'providers'], true)
-      if (isMap(map)) found.push(map)
+      found.push(node)
       return
     }
     for (const pair of node.items) if (String(pair.key) !== 'config') walk(pair.value)
   }
-  walk(doc.contents)
-  if (found.length > 1) bad('multiple llm-pi-ai provider blocks; choose one configuration source before editing')
-  return found[0]
+  walk(node)
+  // Metadata-only patches do not replace an engine's inherited config.
+  // Prefer the config-bearing row, while refusing ambiguous config owners.
+  const configured = found.filter(row => row.has('config'))
+  if (configured.length > 1) bad('multiple llm-pi-ai provider blocks; choose one configuration source before editing')
+  return configured.length > 0 ? configured : found.slice(-1)
+}
+function providers(text: string): YAMLMap | undefined {
+  const doc = parseDocument(text, { keepSourceTokens: true, uniqueKeys: true })
+  if (doc.errors.length) bad('invalid YAML: ' + doc.errors[0]?.message)
+  const map = providerRows(doc.contents)[0]?.getIn(['config', 'providers'], true)
+  if (map !== undefined && !(isScalar(map) && map.value === null) && !isMap(map)) bad('providers must be a YAML map')
+  return isMap(map) ? map : undefined
 }
 function requireProviders(text: string): YAMLMap {
   const map = providers(text)
   if (!map) throw new ProviderEditError('PROVIDERS_NOT_FOUND', 'no llm-pi-ai providers block in this patch file')
   return map
+}
+/** A config-bearing engine row owns providers even before its map is initialized. */
+export function hasProviderConfig(text: string): boolean {
+  const doc = parseDocument(text, { uniqueKeys: true })
+  if (doc.errors.length) bad('invalid YAML: ' + doc.errors[0]?.message)
+  return providerRows(doc.contents).some(row => row.has('config'))
 }
 function provider(text: string, id: string): YAMLMap {
   const map = requireProviders(text).get(id, true)
@@ -83,6 +97,7 @@ export function readProviderDetail(text: string, id: string): ProviderDetail {
 export function setProviderField(text: string, id: string, field: ProviderField, raw: string): string {
   if (!isProviderField(field)) bad('field cannot be edited from the TUI')
   const map = provider(text, id), value = raw.trim(), pair = pairFor(map, field)
+  if (field === 'api' && !(PROVIDER_APIS as readonly string[]).includes(value)) bad('api is not a wire protocol this build knows')
   if (map.flow) return flowEdit(text, map, object => { object[field] = value })
   if (pair?.value) {
     const [start, end] = range(pair.value)
@@ -98,12 +113,25 @@ export function clearProviderField(text: string, id: string, field: ProviderFiel
   return splice(text, lineStart(text, range(pair.key)[0]), range(pair.value ?? pair.key)[2], '')
 }
 export function addProvider(text: string, spec: NewProviderSpec): string {
-  const map = requireProviders(text), id = spec.id.trim(), api = spec.api?.trim()
+  const map = providers(text)
+  if (!map) {
+    // A fresh installation can mount llm-pi-ai without any custom providers.
+    // Initialize its map while preserving the rest of the engine config.
+    const doc = parseDocument(text, { keepSourceTokens: true, uniqueKeys: true })
+    const row = providerRows(doc.contents)[0]
+    if (!row) throw new ProviderEditError('PROVIDERS_NOT_FOUND', 'no llm-pi-ai row in this configuration source')
+    const config = row.get('config', true)
+    if (config !== undefined && !(isScalar(config) && config.value === null) && !isMap(config)) bad('llm-pi-ai config must be a YAML map')
+    if (isMap(config)) config.set('providers', doc.createNode({}))
+    else row.set('config', doc.createNode({ providers: {} }))
+    return addProvider(doc.toString(), spec)
+  }
+  const id = spec.id.trim(), api = spec.api?.trim()
   if (!/^[A-Za-z0-9_][A-Za-z0-9_.:-]*$/.test(id)) bad('provider id is not a safe YAML key')
   if (map.has(id)) throw new ProviderEditError('PROVIDER_EXISTS', 'provider ' + id + ' already exists')
   const models = [...new Set(spec.models.map(id => id.trim()).filter(Boolean))]
   if (!models.length) bad('a provider needs at least one model id')
-  if (api && !['openai-completions', 'openai-responses', 'anthropic-messages'].includes(api)) bad('api is not a wire protocol this build knows')
+  if (api && !(PROVIDER_APIS as readonly string[]).includes(api)) bad('api is not a wire protocol this build knows')
   const object = {
     ...(api ? { api } : {}),
     ...(spec.apiKeyEnv?.trim() ? { apiKeyEnv: spec.apiKeyEnv.trim() } : {}),

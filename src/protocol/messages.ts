@@ -171,6 +171,7 @@ export interface ModelCatalog {
 /** One provider row of the Host's active patch file. */
 export interface ProviderEntry {
   id: string
+  api?: string
   displayName?: string
   baseURL?: string
   apiKeyEnv?: string
@@ -179,7 +180,9 @@ export interface ProviderEntry {
 }
 
 /** Fields the TUI may rewrite; credentials never live in the patch file. */
-export type ProviderField = 'baseURL' | 'apiKeyEnv' | 'displayName'
+export type ProviderField = 'baseURL' | 'apiKeyEnv' | 'displayName' | 'api'
+
+export const PROVIDER_APIS = ['openai-completions', 'openai-responses', 'anthropic-messages'] as const
 
 export interface WorkspaceSummary {
   id: string

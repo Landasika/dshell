@@ -5,12 +5,32 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 
 import {
+  createBundledProvider,
+  createHubProvider,
   parseFrontmatter,
   readSkillFile,
   resolveHubDirs,
   scanSkillDirs,
   toSkillEntry,
 } from '../dist/plugin/skills.js'
+
+test('bundled dsh-config can be discovered and loaded while user hub overrides take precedence', async () => {
+  const bundled = createBundledProvider()
+  const candidates = await bundled.list({ cwd: tmpdir() })
+  const candidate = candidates.find(skill => skill.name === 'dsh-config')
+  assert.ok(candidate)
+  const skill = await bundled.get(candidate, { cwd: tmpdir() })
+  assert.equal(skill.name, 'dsh-config')
+  assert.ok(skill.content.length > 0)
+  assert.deepEqual(skill.invocation, { modelInvocable: true, userInvocable: true })
+
+  const root = await mkdtemp(join(tmpdir(), 'dshell-skill-override-'))
+  await writeFile(join(root, 'dsh-config.md'), '---\nname: dsh-config\ndescription: My local configuration guide\n---\nUse my local conventions.\n')
+  const hub = createHubProvider([root])
+  const overrides = await hub.list({})
+  assert.ok(overrides[0].rank < candidate.rank)
+  assert.equal((await hub.get(overrides[0], {})).content, 'Use my local conventions.')
+})
 
 test('frontmatter splits data from the body and keeps block scalars', () => {
   const parsed = parseFrontmatter('---\nname: demo\ndescription: >-\n  a folded\n  description\n---\n# Body\n')

@@ -15,6 +15,7 @@ import type {
 } from '../backend/index.js'
 import { BackendError } from '../backend/index.js'
 import { sameModelSelection } from '../shared/model-selection.js'
+import { PROVIDER_APIS } from '../protocol/index.js'
 import type {
   AskedQuestion,
   ModelCatalog,
@@ -163,12 +164,14 @@ type Overlay =
       draft: Record<ProviderField, string>
       original: Record<ProviderField, string>
       dirty: Set<ProviderField>
+      apiIndex?: number
       editing?: { field: ProviderField; value: string }
     }
   | {
       kind: 'providerCreate'
       index: number
       draft: Record<ProviderCreateField, string>
+      apiIndex?: number
       editing?: { field: ProviderCreateField; value: string }
     }
   | { kind: 'confirm'; title: string; lines: string[]; index: number; onYes: () => void }
@@ -288,7 +291,7 @@ interface QueueEntry {
   local: boolean
 }
 
-const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 'displayName']
+const PROVIDER_FIELD_ORDER: readonly ProviderField[] = ['baseURL', 'apiKeyEnv', 'displayName', 'api']
 
 /** How long a first `Ctrl-C` stays armed before it has to be pressed again. */
 const CTRL_C_WINDOW_MS = 2_000
@@ -311,6 +314,7 @@ const PROVIDER_FIELD_LABEL: Record<ProviderField, string> = {
   baseURL: 'baseURL',
   apiKeyEnv: 'apiKeyEnv',
   displayName: 'displayName',
+  api: 'api',
 }
 
 function maskSecret(value: string): string {
@@ -1638,6 +1642,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
 
   const openProviderEditor = (entry: ProviderEntry): void => {
     const values = {
+      api: entry.api ?? '',
       baseURL: entry.baseURL ?? '',
       apiKeyEnv: entry.apiKeyEnv ?? '',
       displayName: entry.displayName ?? '',
@@ -2648,10 +2653,14 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         reopenModelPicker(overlay.back)
       } else if (overlay.kind === 'providerSync') {
         state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
+      } else if ((overlay.kind === 'providerEdit' || overlay.kind === 'providerCreate') && overlay.apiIndex !== undefined) {
+        overlay.apiIndex = undefined
       } else if (overlay.kind === 'providerEdit' && overlay.editing !== undefined) {
         overlay.editing = undefined
       } else if (overlay.kind === 'providerEdit') {
         state.overlay = { kind: 'providers', index: providerIndex(overlay.providerId) }
+      } else if (overlay.kind === 'providerCreate' && overlay.editing !== undefined) {
+        overlay.editing = undefined
       } else if (overlay.kind === 'providerCreate') {
         state.overlay = { kind: 'providers', index: Math.max(0, (state.providers?.providers.length ?? 1) - 1) }
       } else if (overlay.kind === 'questions') {
@@ -3147,6 +3156,17 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
       schedule()
       return
     }
+    if ((overlay.kind === 'providerCreate' || overlay.kind === 'providerEdit') && overlay.apiIndex !== undefined) {
+      if (key.type === 'up' || key.type === 'ctrl-p') overlay.apiIndex = Math.max(0, overlay.apiIndex - 1)
+      else if (key.type === 'down' || key.type === 'ctrl-n') overlay.apiIndex = Math.min(PROVIDER_APIS.length - 1, overlay.apiIndex + 1)
+      else if (key.type === 'enter' || key.type === 'tab') {
+        overlay.draft.api = PROVIDER_APIS[overlay.apiIndex]!
+        if (overlay.kind === 'providerEdit') overlay.dirty.add('api')
+        overlay.apiIndex = undefined
+      }
+      schedule()
+      return
+    }
     if (overlay.kind === 'providerCreate') {
       if (overlay.editing !== undefined) {
         const editing = overlay.editing
@@ -3174,7 +3194,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.index = Math.min(PROVIDER_CREATE_FIELDS.length - 1, overlay.index + 1)
       } else if (key.type === 'enter') {
         const field = PROVIDER_CREATE_FIELDS[overlay.index]
-        if (field !== undefined) overlay.editing = { field, value: overlay.draft[field] }
+        if (field === 'api') overlay.apiIndex = Math.max(0, PROVIDER_APIS.findIndex(api => api === overlay.draft.api))
+        else if (field !== undefined) overlay.editing = { field, value: overlay.draft[field] }
       } else if (key.type === 'text' && key.text.toLowerCase() === 's') {
         void submitNewProvider(overlay)
         return
@@ -3211,7 +3232,8 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         overlay.index = Math.min(PROVIDER_FIELD_ORDER.length - 1, overlay.index + 1)
       } else if (key.type === 'enter') {
         const field = PROVIDER_FIELD_ORDER[overlay.index]
-        if (field !== undefined) overlay.editing = { field, value: overlay.draft[field] }
+        if (field === 'api') overlay.apiIndex = Math.max(0, PROVIDER_APIS.findIndex(api => api === overlay.draft.api))
+        else if (field !== undefined) overlay.editing = { field, value: overlay.draft[field] }
       } else if (key.type === 'text' && key.text.toLowerCase() === 's') {
         void saveProvider(overlay)
         return
@@ -4431,6 +4453,11 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const visible = field === 'apiKeyEnv' && !/^[A-Z][A-Z0-9_]*$/.test(raw) ? maskSecret(raw) : raw
         const shown = visible.length === 0 ? paint(theme, 'muted', '(unset)') : paint(theme, selected ? 'text' : 'muted', visible)
         body.push(`${marker} ${paint(theme, 'muted', pad(PROVIDER_FIELD_LABEL[field], 12))} ${editing ? `${shown}${paint(theme, 'accent', '▏')}` : shown}${dirty}`)
+        if (field === 'api' && overlay.apiIndex !== undefined) {
+          for (const [apiIndex, api] of PROVIDER_APIS.entries()) {
+            body.push(`    ${paint(theme, apiIndex === overlay.apiIndex ? 'accent' : 'muted', `${apiIndex === overlay.apiIndex ? '▸' : ' '} ${api}`)}`)
+          }
+        }
       }
       body.push('')
       body.push(paint(theme, 'muted', 'secrets live in the environment, never in the patch file'))
@@ -4439,7 +4466,7 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         : 'enter commit field · esc cancel field'))
       return panelRule(theme, `provider · ${overlay.providerId}`, body, width, {
         footer: [paint(theme, 'muted', overlay.editing === undefined
-          ? 'enter edit · s save · esc back'
+          ? overlay.apiIndex === undefined ? 'enter edit / choose · s save · esc back' : '↑/↓ choose API · enter confirm · esc cancel'
           : 'type to edit · enter commit · esc cancel')],
       })
     }
@@ -4450,17 +4477,23 @@ export async function runTui(backend: DshellBackend, options: TuiOptions): Promi
         const marker = selected ? paint(theme, 'accent', '▸') : ' '
         const editing = overlay.editing?.field === field
         const raw = editing ? overlay.editing?.value ?? '' : overlay.draft[field]
-        const shown = raw.length === 0
+        const visible = field === 'apiKeyEnv' ? maskSecret(raw) : raw
+        const shown = visible.length === 0
           ? paint(theme, 'muted', PROVIDER_CREATE_HINTS[field])
-          : paint(theme, selected ? 'text' : 'muted', raw)
+          : paint(theme, selected ? 'text' : 'muted', visible)
         body.push(`${marker} ${paint(theme, 'muted', pad(field, 12))} ${editing ? `${shown}${paint(theme, 'accent', '▏')}` : shown}`)
+        if (field === 'api' && overlay.apiIndex !== undefined) {
+          for (const [apiIndex, api] of PROVIDER_APIS.entries()) {
+            body.push(`    ${paint(theme, apiIndex === overlay.apiIndex ? 'accent' : 'muted', `${apiIndex === overlay.apiIndex ? '▸' : ' '} ${api}`)}`)
+          }
+        }
       }
       body.push('')
       body.push(paint(theme, 'muted', 'the new block is appended to the providers map'))
       body.push(paint(theme, 'muted', 'apiKeyEnv: a NAME like MY_RELAY_KEY, or paste sk-… to store it'))
       return panelRule(theme, 'add provider', body, width, {
         footer: [paint(theme, 'muted', overlay.editing === undefined
-          ? 'enter edit · f fetch models · s add · esc back'
+          ? overlay.apiIndex === undefined ? 'enter edit / choose · f fetch models · s add · esc back' : '↑/↓ choose API · enter confirm · esc cancel'
           : 'type to edit · enter commit · esc cancel')],
       })
     }

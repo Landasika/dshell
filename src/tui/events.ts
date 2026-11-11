@@ -766,15 +766,18 @@ function renderBlockLines(
       break
     }
     case 'tool': {
-      // Folded to one line like Claude Code: the call and its arguments, with
-      // the output left for Ctrl-O or the Enter detail panel. A failure keeps
-      // a short excerpt so the reason is visible without expanding.
+      // Keep the complete call visible, wrapping arguments to the viewport.
+      // Output remains available through Ctrl-O or the Enter detail panel.
+      // A failure keeps a short excerpt visible without expanding.
       const failed = block.failed === true
       const marker = failed ? '✗' : block.detail === undefined ? '▸' : '✓'
       const color = failed ? 'red' : block.detail === undefined ? 'yellow' : 'green'
       const label =
         block.headline ?? `${block.title ?? block.toolName ?? 'tool'}${block.body.length > 0 ? ` · ${block.body}` : ''}`
-      lines.push(truncate(`${paint(theme, color, `${marker} ${label}`)}`, width))
+      const callLines = wrapText(sanitizeText(label), Math.max(1, width - 2))
+      for (const [index, line] of callLines.entries()) {
+        lines.push(paint(theme, color, `${index === 0 ? marker : ' '} ${line}`))
+      }
       if (options.expandTools === true) {
         if (block.body.length > 0) {
           for (const line of wrapText(block.body, Math.max(1, width - 2))) {

@@ -97,8 +97,8 @@ See the [storyboard and recording notes](docs/promo/STORYBOARD.md).
   surgically, stores pasted `sk-…` keys in the Host credential store, lists a
   gateway's models (`f`) and syncs them against the upstream (`u`).
 - **Skills** — `/skills` browses the Host catalog; the composer's `$` opens a
-  menu and sends the `/name` gesture. The `dsh-config` skill documents the
-  whole patch-file harness.
+  menu and sends the `/name` gesture. The bundled `dsh-config` skill is
+  available by default for providers, models, prompts, tools, and agent presets.
 - **Harness viewer** — `/harness` shows the agent presets a session composes:
   persona, tool rows and which layer overrode them.
 - **Herdr aware** — inside a [Herdr](https://herdr.dev) pane it reports
@@ -295,6 +295,18 @@ composer's shorthand — `$dsh` lists user-invocable skills, `Tab` completes it
 to a `$dsh-config` mention, and the send path rewrites `$name` into the
 `/name` gesture, so the composer keeps showing what you typed while the Host
 still receives the syntax it parses.
+
+The Host plugin ships `dsh-config` in the npm package and registers it on
+startup, so no separate skill installation is needed. Open `/skills dsh-config`
+to read it, or send `$dsh-config` with your configuration request. The model
+can also discover it through the Host skill catalog. A project or user skill
+with the same name takes precedence over the bundled default.
+
+In `/provider`, select `api` and press `Enter` to choose
+`openai-completions`, `openai-responses`, or `anthropic-messages` with `↑/↓`.
+`Enter` confirms the choice and `Esc` cancels it. This works when adding a
+provider or editing an existing one; press `s` to save the form. Pasted API
+keys are masked and stored through the Host credential service.
 
 In an `ask_user_question` card: `↑/↓` only move — they never change an
 answer, so a pick survives the cursor. `Enter` answers a one-choice question

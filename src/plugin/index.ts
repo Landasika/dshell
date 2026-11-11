@@ -69,6 +69,7 @@ import {
 } from './session-index.js'
 import {
   HUB_PROVIDER,
+  createBundledProvider,
   createHubProvider,
   readSkillFile,
   resolveHubDirs,
@@ -80,6 +81,7 @@ import {
   ProviderEditError,
   addProvider,
   clearProviderField,
+  hasProviderConfig,
   isProviderField,
   readProviderDetail,
   syncProviderModels,
@@ -363,7 +365,7 @@ interface PluginContext {
 /** Stable fingerprint of a provider list, compared before and after a write. */
 function providerSignature(rows: readonly ProviderEntry[]): string[] {
   return rows.map((row) =>
-    [row.id, row.displayName ?? '', row.baseURL ?? '', row.apiKeyEnv ?? '', String(row.models)].join('\u0000'))
+    [row.id, row.displayName ?? '', row.baseURL ?? '', row.api ?? '', row.apiKeyEnv ?? '', String(row.models)].join('\u0000'))
 }
 
 function readProviderEntries(text: string): ProviderEntry[] {
@@ -371,6 +373,7 @@ function readProviderEntries(text: string): ProviderEntry[] {
     id: record.id,
     ...(record.displayName === undefined ? {} : { displayName: record.displayName }),
     ...(record.baseURL === undefined ? {} : { baseURL: record.baseURL }),
+    ...(record.api === undefined ? {} : { api: record.api }),
     ...(record.apiKeyEnv === undefined ? {} : { apiKeyEnv: record.apiKeyEnv }),
     models: record.models,
   }))
@@ -1880,6 +1883,11 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   {
     const registry = skillRegistry()
     if (registry?.registerProvider !== undefined) {
+      try {
+        registry.registerProvider(() => createBundledProvider())
+      } catch {
+        // Keep the Host usable when an older registry cannot mount providers.
+      }
       // Create the shelves up front: `fs.watch` cannot watch a path that does
       // not exist yet, and a hub that only starts watching after a restart is
       // exactly the surprise this feature is meant to remove.
@@ -2000,20 +2008,26 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     const home = dshHome()
     if (home === undefined) return []
     const candidates: string[] = []
+    candidates.push(join(home, 'cordis.patch.yml'))
     const profile = process.env.DSH_PROFILE
     if (profile !== undefined && profile.length > 0) {
       candidates.push(join(home, 'profiles', profile, 'cordis.patch.yml'))
     }
-    candidates.push(join(home, 'cordis.patch.yml'))
+    const owned = configEditor()?.documentPath
+    if (owned !== undefined && !candidates.includes(owned)) candidates.push(owned)
     return candidates.filter((path) => existsSync(path))
   }
 
   const providerFile = (): string | undefined => {
     const owned = configEditor()?.documentPath
-    if (owned) return owned
     const candidates = providerFileCandidates()
-    // A file that declares no providers cannot be the one the Host routes.
-    return candidates.find((path) => readProviders(safeRead(path)).length > 0) ?? candidates[0]
+    // Home patches outrank profiles. configEditor may own a profile that has
+    // no llm-pi-ai row (nested includes are independently owned).
+    const home = dshHome()
+    const homePatch = home === undefined ? undefined : join(home, 'cordis.patch.yml')
+    if (homePatch !== undefined && candidates.includes(homePatch) && hasProviderConfig(safeRead(homePatch))) return homePatch
+    if (owned && providerOwner()) return owned
+    return candidates.find((path) => hasProviderConfig(safeRead(path))) ?? candidates[0] ?? owned
   }
 
   const providerOwner = (): ConfigRowLike | undefined => {
@@ -2034,7 +2048,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
     return file === undefined ? [] : readProviderEntries(providerText(file))
   }
   const providerSource = () => {
-    const owner = providerOwner()
+    const owner = configEditor()?.documentPath === providerFile() ? providerOwner() : undefined
     return owner === undefined
       ? { kind: 'file' as const, layer: 'entry' as const, inherited: false, overridden: false }
       : {
@@ -2204,7 +2218,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       sendError(channel, {
         type: 'error',
         code: 'BAD_REQUEST',
-        message: 'provider/update needs providerId and one of baseURL, apiKeyEnv, displayName',
+        message: 'provider/update needs providerId and one of baseURL, apiKeyEnv, displayName, api',
       })
       return
     }
@@ -2530,6 +2544,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
       id: providerId,
       baseURL,
       models: models.length,
+      ...(api.length === 0 ? {} : { api }),
       ...(apiKeyEnv.length === 0 ? {} : { apiKeyEnv }),
       ...(displayName.length === 0 ? {} : { displayName }),
     }

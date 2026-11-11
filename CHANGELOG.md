@@ -3,6 +3,28 @@
 All notable changes to `@landasika/dshell` are documented here.
 The project follows [Semantic Versioning](https://semver.org/) independently of DSH.
 
+## Unreleased
+
+## [0.7.2] — 2026-11-11
+
+### Added
+
+- Bundle `dsh-config` as a default Host skill, available in `/skills`, the `$`
+  menu, and the model's skill catalog. Project and user skills can override it.
+- Choose the provider API protocol from the three supported options when
+  adding or editing a provider. Editing starts with the current protocol.
+
+### Fixed
+
+- Select the provider configuration owner before editing: a profile without
+  provider rows no longer hides providers declared in the home patch.
+- Preserve inherited providers and engine settings when a home patch only
+  changes engine metadata, and allow metadata patches beside a provider row.
+- Initialize the first custom provider map when the engine row has no map.
+- Mask pasted API keys in the provider creation form.
+- Wrap complete tool commands to the terminal width instead of clipping them
+  to one line or truncating long arguments.
+
 ## [0.7.1] — 2026-11-11
 
 ### Fixed

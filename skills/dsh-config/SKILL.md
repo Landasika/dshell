@@ -1,7 +1,7 @@
 ---
 name: dsh-config
 description: >-
-  Edit this DSH installation's real configuration: add or change a model provider
+  Configure a DeepSeek Harness (DSH) installation: add or change a model provider
   (baseURL, apiKeyEnv, models), change the default model, and add or rewrite an
   agent preset (persona prompt, tool rows, skills) in the profile patch files.
   Use when the user asks to "add a model", "add a provider/relay", "change the
@@ -30,7 +30,15 @@ Layer order, weakest to strongest:
 | home rows | `$DSH_HOME/cordis.patch.yml` | every profile; **outranks** the profile layer |
 | `--patch` | `dsh --patch ./try.yml …` | one-off experiments, highest |
 
-`$DSH_HOME` defaults to `~/.dsh`; the running profile is usually `web`.
+`$DSH_HOME` defaults to `~/.dsh`. Determine the active Host's `DSH_HOME`
+and profile from its environment, startup command or service definition;
+do not assume the profile is `web` or use the CLI's working directory as the
+configuration root. The dshell quick-start guide uses `web`.
+
+Check the installed DSH version and effective configuration before editing.
+The examples describe the `0.2.1-rc.2` reference runtime; use the installed
+schema and bundle rows if another version differs. Apply the requested change
+to the owning patch, preserving unrelated settings.
 
 Bundle presets live in
 `.../node_modules/@deepseek-ai/dsh-web-app/presets/{standard,ptc,minimal,cordis}.patch.yml`.
@@ -70,8 +78,9 @@ Rules the loader enforces:
 ## 3. Add a model provider
 
 Providers live in the `llm-pi-ai` row's `config.providers` dict, keyed by the
-route name you then use as `provider`. On this machine that row is in the
-**home** patch, `~/.dsh/cordis.patch.yml`.
+route name you then use as `provider`. Inspect the home and active profile
+patches to locate its existing owner. The home patch takes precedence over
+profile overrides; edit the owning block instead of adding a weaker override.
 
 ```yaml
 - id: llm-pi-ai
@@ -80,7 +89,7 @@ route name you then use as `provider`. On this machine that row is in the
     providers:
       my-relay:                       # provider route id
         api: anthropic-messages       # openai-completions | openai-responses | anthropic-messages
-        baseURL: http://192.168.8.77:8180
+        baseURL: https://api.example.com/v1
         apiKeyEnv: MY_RELAY_API_KEY   # a NAME, never the secret
         displayName: My relay
         models:
@@ -102,7 +111,7 @@ Provider fields: `api`, `baseURL`, `apiKeyEnv`, `displayName`, `models`,
 The secret itself:
 
 - `apiKeyEnv` is only a credential **reference**. The value is resolved by the
-  credentials service (`~/.dsh/.credentials.yaml`, written by the Web Models
+  credentials service (`$DSH_HOME/.credentials.yaml`, written by the Web Models
   page) or from the Host process environment under that exact name.
 - Never write a key into a patch file or a session.
 - After adding a route, pick it with `/model` (Web: the model picker) or make it
@@ -112,15 +121,12 @@ The secret itself:
 `llm-pi-ai` in a stronger layer, because `config` replaces wholesale. Prefer
 editing the existing block in place over adding a second override.
 
-**Getting the ids**: `curl -s H 'Authorization: Bearer …' {baseURL}/models` (or
-the Anthropic spelling `/v1/models`) lists what an upstream serves. The Web
-Models page's "fetch available models" action and the TUI provider panel's `f`
-key do the same through the Host — but discovery is **adoption, not sync**: a
-listing carries no capacities or compat, so the ids land in a draft and
-`contextWindow`/`maxTokens` still come from the catalog or hand entry. When an
-upstream changes what it serves, the TUI's `u` (sync models) on a provider row
-diffs the declared list against the listing: adopt what appeared, optionally
-drop what vanished — kept rows keep their tuned fields byte-identical.
+**Getting the ids**: use the Web Models page's "fetch available models" action
+or the TUI provider panel's `f` key to query the upstream through the Host.
+Discovery returns ids, not reliable capacities or compatibility: inspect the
+installed catalog or provider documentation for those fields. The TUI's `u`
+(sync models) compares the declared list with the upstream and lets the user
+adopt additions or remove missing models while preserving existing tuning.
 
 ## 4. Add a model to an existing provider
 
@@ -148,11 +154,11 @@ entries disappear if you omit them. `modelOverrides` may not sit beside a
 `models` list; declare the fields on the entries directly.
 
 Then pick it per session (`/model`) or make it the default — next section.
-Verify the route resolves: `dsh --dump-config --profile web | grep -A3 the-model-id`.
+Verify the route resolves: `dsh --dump-config --profile PROFILE_NAME | rg -A3 the-model-id`.
 
 ## 5. Change the default model
 
-`~/.dsh/profiles/<profile>/cordis.patch.yml`:
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml`:
 
 ```yaml
 - id: agent-default-model
@@ -261,17 +267,19 @@ Host unless `failOnStartupError` is set.
 
 ```bash
 # Effective composition, after all layers are applied:
-dsh --dump-config --profile web | grep -nB2 -A12 'preset-standard'
+dsh --dump-config --profile PROFILE_NAME | rg -nB2 -A12 'preset-standard'
 
 # Warnings the loader logged while composing (mismatched ids/names land here):
-dsh --dump-config --profile web 2>&1 | grep -i 'patch:'
+dsh --dump-config --profile PROFILE_NAME 2>&1 | rg -i 'patch:'
 
 # The patch/entry JSON Schema, when you are unsure a field name exists:
 dsh --dump-config-schema | head -c 2000
 
 # How the tree looks without your overrides (to diff against):
-dsh --dump-default-config --profile web | grep -nA12 'preset-standard'
+dsh --dump-default-config --profile PROFILE_NAME | rg -nA12 'preset-standard'
 ```
+
+Replace `PROFILE_NAME` with the active profile name in the commands above.
 
 `--dump-config` rewrites the generated `cordis.yml` — that file is a build
 artifact, never edit it.
@@ -292,4 +300,4 @@ by default"), so a save applies without a restart:
 - Never put secrets in patches; never edit bundle files (upgrades overwrite
   them); never edit `cordis.yml`.
 - To test a change without touching the real config:
-  `dsh --profile web --patch /tmp/try.patch.yml`.
+  `dsh --profile PROFILE_NAME --patch /tmp/try.patch.yml`.
